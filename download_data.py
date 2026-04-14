@@ -103,7 +103,12 @@ def ensure_default_branch(repo_dir: Path) -> str:
 
     code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "origin", default_branch)
     if code != 0:
-        raise RuntimeError(f"No se pudo sincronizar {default_branch}: {(err or out).strip()}")
+        # Si hay cambios sin commitear, hacer stash → pull → pop
+        run_git(repo_dir, "git", "stash", "--include-untracked")
+        code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "origin", default_branch)
+        run_git(repo_dir, "git", "stash", "pop")
+        if code != 0:
+            raise RuntimeError(f"No se pudo sincronizar {default_branch}: {(err or out).strip()}")
     print(f"  ✅ Rama {default_branch} sincronizada con origin/{default_branch}")
     return default_branch
 
