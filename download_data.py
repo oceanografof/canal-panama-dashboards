@@ -1,19 +1,19 @@
 """
-download_data.py — Descarga datos de Aquatic Informatics, los guarda en /data/
-y los sube a GitHub automáticamente.
+download_data_fixed.py — Descarga datos de Aquatic Informatics, los guarda en /data/
+y los sube a la rama principal correcta de GitHub automáticamente.
 
 Corre desde tu PC dentro de la red ACP:
-    python download_data.py
+    python download_data_fixed.py
 """
 from __future__ import annotations
-import io, sys, time, zipfile, subprocess, urllib.request, urllib.error
+import io, sys, time, zipfile, subprocess, urllib.request
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
 
 # ── Configuración ──────────────────────────────────────────────────────────
 OUTPUT_DIR   = Path(__file__).resolve().parent / "data"
-REPO_DIR     = Path(__file__).resolve().parent   # raíz del repositorio git
+REPO_DIR     = Path(__file__).resolve().parent
 DATE_RANGE   = "Custom&Period=P90D"        # últimos 90 días (rápido)
 # DATE_RANGE = "EntirePeriodOfRecord"      # histórico completo (lento)
 
@@ -46,6 +46,68 @@ TIMEOUT_READ = 600
 CHUNK_SIZE   = 65536
 
 
+def run_git(repo_dir: Path, *cmd: str) -> tuple[int, str, str]:
+    result = subprocess.run(
+        list(cmd),
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def ensure_default_branch(repo_dir: Path) -> str:
+    """Sincroniza el repo local con la rama por defecto del remoto (main o master)."""
+    print("\n── Verificando rama remota ───────────────────")
+
+    code, out, err = run_git(repo_dir, "git", "fetch", "origin")
+    if code != 0:
+        raise RuntimeError(f"No se pudo hacer git fetch origin: {(err or out).strip()}")
+
+    default_branch = ""
+    code, out, err = run_git(repo_dir, "git", "symbolic-ref", "refs/remotes/origin/HEAD")
+    if code == 0 and out.strip():
+        # refs/remotes/origin/main -> main
+        default_branch = out.strip().split("/")[-1]
+
+    if not default_branch:
+        for candidate in ("main", "master"):
+            code, _, _ = run_git(repo_dir, "git", "show-ref", f"refs/remotes/origin/{candidate}")
+            if code == 0:
+                default_branch = candidate
+                break
+
+    if not default_branch:
+        raise RuntimeError("No pude identificar la rama principal del remoto (main/master).")
+
+    code, current_branch, err = run_git(repo_dir, "git", "branch", "--show-current")
+    if code != 0:
+        raise RuntimeError(f"No pude leer la rama actual: {(err or current_branch).strip()}")
+    current_branch = current_branch.strip()
+
+    print(f"  Rama local actual : {current_branch or '(detached)'}")
+    print(f"  Rama remota usada : {default_branch}")
+
+    if current_branch != default_branch:
+        # Crear o cambiar a la rama correcta
+        code, _, _ = run_git(repo_dir, "git", "show-ref", f"refs/heads/{default_branch}")
+        if code == 0:
+            code, out, err = run_git(repo_dir, "git", "checkout", default_branch)
+        else:
+            code, out, err = run_git(repo_dir, "git", "checkout", "-B", default_branch, f"origin/{default_branch}")
+        if code != 0:
+            raise RuntimeError(f"No se pudo cambiar a la rama {default_branch}: {(err or out).strip()}")
+        print(f"  ✅ Cambiado a la rama {default_branch}")
+
+    code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "origin", default_branch)
+    if code != 0:
+        raise RuntimeError(f"No se pudo sincronizar {default_branch}: {(err or out).strip()}")
+    print(f"  ✅ Rama {default_branch} sincronizada con origin/{default_branch}")
+    return default_branch
+
+
 # ── Descarga ───────────────────────────────────────────────────────────────
 def download_bytes(url: str) -> bytes:
     headers = {
@@ -57,14 +119,16 @@ def download_bytes(url: str) -> bytes:
     print("  Conectando...", flush=True)
     with urllib.request.urlopen(req, timeout=TIMEOUT_CONN) as resp:
         print(f"  HTTP {resp.status}")
-        print(f"  Descargando", end="", flush=True)
+        print("  Descargando", end="", flush=True)
         deadline = time.time() + TIMEOUT_READ
         while True:
             if time.time() > deadline:
                 raise TimeoutError(f"Timeout ({TIMEOUT_READ}s)")
             chunk = resp.read(CHUNK_SIZE)
-            if not chunk: break
-            chunks.append(chunk); total += len(chunk)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
             print(".", end="", flush=True)
     print(f" {total/1024:.0f} KB en {time.time()-t0:.1f}s")
     return b"".join(chunks)
@@ -81,8 +145,11 @@ def extract_csvs_from_zip(raw_bytes: bytes) -> dict[str, str]:
             with zf.open(name) as f:
                 raw = f.read()
                 for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
-                    try: results[name] = raw.decode(enc); break
-                    except: continue
+                    try:
+                        results[name] = raw.decode(enc)
+                        break
+                    except Exception:
+                        continue
     return results
 
 
@@ -98,33 +165,45 @@ def match_dataset(filename: str) -> dict | None:
 # ── Normalizar CSV ─────────────────────────────────────────────────────────
 def normalize_csv(text: str) -> str:
     lines = [l for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
-    if not lines: return ""
+    if not lines:
+        return ""
     header = lines[0]
     sep = "," if header.count(",") >= header.count(";") else ";"
+
     def split_row(line):
         return [p.strip().strip('"').strip("'") for p in line.split(sep)]
+
     h = [x.lower() for x in split_row(header)]
-    TS_KW  = ("time","stamp","fecha","iso","utc","start","inicio")
-    VAL_KW = ("value","valor","°c","degc","m/s","ft","temp","wind","speed","nivel")
-    ts_cols  = [i for i,x in enumerate(h) if any(k in x for k in TS_KW)]
-    val_cols = [i for i,x in enumerate(h) if any(k in x for k in VAL_KW)]
-    if not ts_cols:  ts_cols  = [0]
-    if not val_cols: val_cols = [2 if len(ts_cols)>=2 else 1]
+    ts_kw  = ("time", "stamp", "fecha", "iso", "utc", "start", "inicio")
+    val_kw = ("value", "valor", "°c", "degc", "m/s", "ft", "temp", "wind", "speed", "nivel")
+    ts_cols  = [i for i, x in enumerate(h) if any(k in x for k in ts_kw)]
+    val_cols = [i for i, x in enumerate(h) if any(k in x for k in val_kw)]
+    if not ts_cols:
+        ts_cols = [0]
+    if not val_cols:
+        val_cols = [2 if len(ts_cols) >= 2 else 1]
     ts1 = ts_cols[0]
-    ts2 = ts_cols[1] if len(ts_cols)>=2 else None
+    ts2 = ts_cols[1] if len(ts_cols) >= 2 else None
     vi  = val_cols[0]
     out = ["fecha_inicio,fecha_fin,valor_raw"]
     for line in lines[1:]:
-        if not line.strip(): continue
-        parts = split_row(line); n = len(parts)
-        if n <= max(ts1, vi): continue
+        if not line.strip():
+            continue
+        parts = split_row(line)
+        n = len(parts)
+        if n <= max(ts1, vi):
+            continue
         val = parts[vi] if vi < n else ""
-        if not val or val.lower() in ("","nan","null","none","--"): continue
-        try: float(val.replace(",",".").replace(" ",""))
-        except ValueError: continue
+        if not val or val.lower() in ("", "nan", "null", "none", "--"):
+            continue
+        try:
+            float(val.replace(",", ".").replace(" ", ""))
+        except ValueError:
+            continue
         t1 = parts[ts1] if ts1 < n else ""
-        if not t1: continue
-        t2 = parts[ts2] if (ts2 is not None and ts2<n and parts[ts2].strip()) else t1
+        if not t1:
+            continue
+        t2 = parts[ts2] if (ts2 is not None and ts2 < n and parts[ts2].strip()) else t1
         out.append(f"{t1},{t2},{val}")
     return "\n".join(out)
 
@@ -156,18 +235,19 @@ def print_summary(saved: list[Path]) -> None:
         try:
             df = pd.read_csv(path)
             df["fecha_inicio"] = pd.to_datetime(df["fecha_inicio"], errors="coerce")
-            last  = df["fecha_inicio"].max()
+            last = df["fecha_inicio"].max()
             first = df["fecha_inicio"].min()
             n = df["valor_raw"].notna().sum()
-            print(f"  {path.stem:<25} {n:>6} registros  "
-                  f"{first.strftime('%Y-%m-%d')} → {last.strftime('%Y-%m-%d %H:%M')}")
+            print(
+                f"  {path.stem:<25} {n:>6} registros  "
+                f"{first.strftime('%Y-%m-%d')} → {last.strftime('%Y-%m-%d %H:%M')}"
+            )
         except Exception as e:
             print(f"  {path.stem}: error ({e})")
 
 
 # ── Git: verificar .gitignore y hacer push ─────────────────────────────────
 def fix_gitignore(repo_dir: Path) -> None:
-    """Asegura que data/*.csv NO esté en .gitignore."""
     gitignore = repo_dir / ".gitignore"
     if not gitignore.exists():
         return
@@ -176,64 +256,50 @@ def fix_gitignore(repo_dir: Path) -> None:
     found = [p for p in problematic if p in content]
     if found:
         print(f"\n  ⚠️  .gitignore tiene reglas que bloquean los CSV: {found}")
-        print(f"  Eliminando esas reglas automáticamente...")
+        print("  Eliminando esas reglas automáticamente...")
         lines = content.splitlines()
         new_lines = [l for l in lines if l.strip() not in problematic]
         gitignore.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-        print(f"  ✅  .gitignore corregido")
+        print("  ✅  .gitignore corregido")
     else:
-        print(f"  ✅  .gitignore OK (no bloquea CSV)")
+        print("  ✅  .gitignore OK (no bloquea CSV)")
 
 
-def git_push(repo_dir: Path, saved: list[Path]) -> bool:
-    """Hace git add + commit + push automáticamente."""
-    def run(cmd):
-        result = subprocess.run(
-            cmd, cwd=str(repo_dir),
-            capture_output=True, text=True, encoding="utf-8", errors="replace"
-        )
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
-
+def git_push(repo_dir: Path, saved: list[Path], branch: str) -> bool:
     print("\n── Subiendo a GitHub ──────────────────────────")
 
-    # git add — data/ + cualquier archivo .py o .bat modificado
-    for target in ["data/", "download_data.py", "app_temperatura.py",
-                   "requirements.txt", "actualizar.bat"]:
-        p = repo_dir / target.rstrip("/")
+    for target in ["data/", Path(__file__).name, "app_temperatura.py", "requirements.txt", "actualizar.bat"]:
+        p = repo_dir / str(target).rstrip("/")
         if p.exists():
-            run(["git", "add", target])
-    # también .gitignore si existe
+            run_git(repo_dir, "git", "add", str(target))
     if (repo_dir / ".gitignore").exists():
-        run(["git", "add", ".gitignore"])
+        run_git(repo_dir, "git", "add", ".gitignore")
     print("  ✅ git add OK")
 
-    # git status
-    code, out, err = run(["git", "status", "--short"])
+    code, out, err = run_git(repo_dir, "git", "status", "--short")
     if not out.strip():
         print("  ℹ️  Sin cambios nuevos — GitHub ya está actualizado.")
         return True
     print(f"  Cambios:\n    {out}")
 
-    # git commit — mensaje sin tildes para evitar problemas en Windows
     msg = f"Datos {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    code, out, err = run(["git", "commit", "-m", msg])
+    code, out, err = run_git(repo_dir, "git", "commit", "-m", msg)
     if code != 0:
         full_msg = (out + " " + err).strip()
         if "nothing to commit" in full_msg or "nada para hacer commit" in full_msg:
             print("  ℹ️  Sin cambios nuevos — GitHub ya está actualizado.")
             return True
-        print(f"  ❌ git commit fallo: {full_msg}")
+        print(f"  ❌ git commit falló: {full_msg}")
         return False
     print(f"  ✅ git commit OK: '{msg}'")
 
-    # git push
-    code, out, err = run(["git", "push"])
+    code, out, err = run_git(repo_dir, "git", "push", "origin", branch)
     if code != 0:
-        print(f"  ❌ git push falló:\n    {err}")
-        print("  → Asegúrate que tu token de GitHub esté configurado.")
-        print("    Corre una vez: git push   (te pedirá usuario + token)")
+        print(f"  ❌ git push falló:\n    {err or out}")
+        print("  → Revisa si tu token de GitHub sigue vigente o si la rama está protegida.")
         return False
-    print("  ✅ git push OK — GitHub actualizado")
+
+    print(f"  ✅ git push OK hacia origin/{branch}")
     print("  ⏳ Streamlit Cloud se actualizará en 1-2 minutos")
     return True
 
@@ -245,38 +311,44 @@ def main() -> None:
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
-    # 1. Descargar
+    try:
+        branch = ensure_default_branch(REPO_DIR)
+    except Exception as e:
+        print(f"\n❌ Error de Git: {e}")
+        sys.exit(1)
+
     try:
         print("\n[1/4] Descargando BulkExport...")
         raw_bytes = download_bytes(BASE_URL)
     except Exception as e:
-        print(f"\n❌ Error: {e}"); sys.exit(1)
+        print(f"\n❌ Error: {e}")
+        sys.exit(1)
 
-    # 2. Verificar formato
     is_zip = raw_bytes[:2] == b"PK"
     print(f"\n  Formato: {'ZIP ✅' if is_zip else 'texto plano (inesperado)'}")
     if not is_zip:
         (OUTPUT_DIR / "_raw.bin").write_bytes(raw_bytes)
-        print("  Guardado como _raw.bin para diagnóstico."); sys.exit(1)
+        print("  Guardado como _raw.bin para diagnóstico.")
+        sys.exit(1)
 
-    # 3. Extraer y guardar
     print("\n[2/4] Extrayendo CSVs del ZIP...")
     try:
         csv_map = extract_csvs_from_zip(raw_bytes)
     except zipfile.BadZipFile as e:
-        print(f"\n❌ ZIP inválido: {e}"); sys.exit(1)
+        print(f"\n❌ ZIP inválido: {e}")
+        sys.exit(1)
 
     print(f"\n[3/4] Normalizando y guardando en: {OUTPUT_DIR}")
     saved = save_and_summarize(csv_map, OUTPUT_DIR)
     if not saved:
-        print("\n❌ No se guardó ningún archivo."); sys.exit(1)
+        print("\n❌ No se guardó ningún archivo.")
+        sys.exit(1)
 
     print_summary(saved)
 
-    # 4. Verificar .gitignore y hacer push
     print("\n[4/4] Verificando .gitignore y subiendo a GitHub...")
     fix_gitignore(REPO_DIR)
-    git_push(REPO_DIR, saved)
+    git_push(REPO_DIR, saved, branch)
 
 
 if __name__ == "__main__":
