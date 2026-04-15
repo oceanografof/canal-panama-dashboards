@@ -986,6 +986,51 @@ with st.sidebar.expander("Ver rutas detectadas"):
 if not wind_frames:
     st.sidebar.info("No se detectó archivo de viento. Colócalo dentro de /data o /fuentes para activarlo automáticamente.")
 
+# ── Indicador de último dato y extensión de cada serie ────────────────────
+import datetime as _dt
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🕐 Estado de las series")
+
+_now_pan = _dt.datetime.utcnow() - _dt.timedelta(hours=5)  # UTC-5 Panamá
+
+def _serie_card(label: str, df_s: pd.DataFrame, fecha_col: str = "fecha") -> None:
+    """Muestra último dato, extensión temporal, total de registros y semáforo."""
+    try:
+        fechas = df_s[fecha_col].dropna()
+        if fechas.empty:
+            st.sidebar.caption(f"**{label}** — sin datos")
+            return
+        ultimo  = fechas.max()
+        primero = fechas.min()
+        n_total = len(fechas)
+        lag_h   = max(0, (_now_pan - ultimo.replace(tzinfo=None)).total_seconds() / 3600)
+        anos    = (ultimo - primero).days / 365.25
+        dot     = "🟢" if lag_h < 6 else ("🟡" if lag_h < 48 else "🔴")
+        color   = "#27ae60" if lag_h < 6 else ("#e67e22" if lag_h < 48 else "#e74c3c")
+        lag_str = f"{int(lag_h)} h atrás" if lag_h < 48 else f"{lag_h/24:.1f} días atrás"
+        st.sidebar.markdown(
+            f"{dot} **{label}**  \n"
+            f"<span style='font-size:0.88rem;color:{color};font-weight:600;'>"
+            f"Último: {ultimo.strftime('%Y-%m-%d  %H:%M')} &nbsp;·&nbsp; {lag_str}"
+            f"</span>  \n"
+            f"<span style='font-size:0.78rem;color:#5d6d7e;'>"
+            f"Desde {primero.strftime('%Y-%m-%d')} &nbsp;·&nbsp; "
+            f"{anos:.1f} años &nbsp;·&nbsp; {n_total:,} registros"
+            f"</span>",
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        st.sidebar.caption(f"**{label}** — error al leer")
+
+# Temperatura — todas las fuentes
+for _k, _df_k in temp_frames.items():
+    _serie_card(f"🌡️ Temp · {_k}", _df_k, "fecha")
+
+# Viento — todas las series
+for _wk, _df_w in wind_frames.items():
+    _serie_card(f"💨 Viento · {_wk}", _df_w, "fecha")
+
 
 # ============================================================
 # HEADER
