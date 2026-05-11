@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 streamlit
 pandas
 numpy
@@ -8,3 +9,16 @@ statsmodels
 xlrd>=2.0.1
 msoffcrypto-tool
 python-docx>=1.1.0
+=======
+<<<<<<< Updated upstream
+streamlit
+pandas
+numpy
+plotly
+scipy
+openpyxl
+statsmodels
+xlrd>=2.0.1
+msoffcrypto-tool
+python-docx>=1.1.0
+>>>>>>> Stashed changes
