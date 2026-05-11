@@ -2916,6 +2916,10 @@ if st.session_state.get("_hist_range_seed_key") != _hist_range_seed_key:
     st.session_state["hist_neto_year_end"] = int(_hist_netfl_default_end)
     st.session_state["_hist_range_seed_key"] = _hist_range_seed_key
 
+def _reset_chcp():
+    st.session_state["hist_year_start"] = int(_hist_default_start)
+    st.session_state["hist_year_end"] = int(_hist_default_end)
+
 with st.sidebar.expander("📈 Rango histórico CHCP total", expanded=True):
     st.caption("Escoge manualmente desde qué año hasta qué año quieres calcular el histórico total CHCP.")
     st.caption("Valor por defecto: 1898 hasta el año del cálculo seleccionado (inclusive).")
@@ -2927,18 +2931,16 @@ with st.sidebar.expander("📈 Rango histórico CHCP total", expanded=True):
                                         step=1, key="hist_year_end"))
     _c1, _c2 = st.columns(2)
     with _c1:
-        if st.button("Usar rango por defecto · CHCP", key="btn_hist_reset_chcp"):
-            hist_year_start = int(_hist_default_start)
-            hist_year_end = int(_hist_default_end)
-            st.session_state["hist_year_start"] = hist_year_start
-            st.session_state["hist_year_end"] = hist_year_end
-            st.rerun()
+        st.button("Usar rango por defecto · CHCP", key="btn_hist_reset_chcp", on_click=_reset_chcp)
     with _c2:
         st.markdown(f"**Rango activo:** {hist_year_start}-{hist_year_end}")
     if hist_year_end < hist_year_start:
         st.warning("El año final es menor que el inicial. Se ajustará automáticamente.")
         hist_year_end = hist_year_start
-        st.session_state["hist_year_end"] = hist_year_end
+
+def _reset_netfl():
+    st.session_state["hist_neto_year_start"] = int(_hist_netfl_default_start)
+    st.session_state["hist_neto_year_end"] = int(_hist_netfl_default_end)
 
 with st.sidebar.expander("📉 Rango histórico GATNETFL (netos)", expanded=True):
     st.caption("Escoge manualmente desde qué año hasta qué año quieres calcular el histórico neto.")
@@ -2951,18 +2953,12 @@ with st.sidebar.expander("📉 Rango histórico GATNETFL (netos)", expanded=True
                                              step=1, key="hist_neto_year_end"))
     _c3, _c4 = st.columns(2)
     with _c3:
-        if st.button("Usar rango por defecto · netos", key="btn_hist_reset_netfl"):
-            hist_neto_year_start = int(_hist_netfl_default_start)
-            hist_neto_year_end = int(_hist_netfl_default_end)
-            st.session_state["hist_neto_year_start"] = hist_neto_year_start
-            st.session_state["hist_neto_year_end"] = hist_neto_year_end
-            st.rerun()
+        st.button("Usar rango por defecto · netos", key="btn_hist_reset_netfl", on_click=_reset_netfl)
     with _c4:
         st.markdown(f"**Rango activo:** {hist_neto_year_start}-{hist_neto_year_end}")
     if hist_neto_year_end < hist_neto_year_start:
         st.warning("El año final de netos es menor que el inicial. Se ajustará automáticamente.")
         hist_neto_year_end = hist_neto_year_start
-        st.session_state["hist_neto_year_end"] = hist_neto_year_end
 
 current_source_signature = "|".join([
     str(tipo), str(anio_sel), str(mes_sel), str(trimestre or ""), str(semestre or ""),
