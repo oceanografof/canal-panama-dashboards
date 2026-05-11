@@ -1,4 +1,3 @@
-<<<<<<< Updated upstream
 streamlit
 pandas
 numpy
@@ -9,5 +8,3 @@ statsmodels
 xlrd>=2.0.1
 msoffcrypto-tool
 python-docx>=1.1.0
-# python-docx es OPCIONAL — la exportación DOCX funciona sin él
-# pip install python-docx
