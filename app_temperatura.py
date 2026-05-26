@@ -38,7 +38,7 @@ C = {
 
 MESES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
 SECA_MESES = {12, 1, 2, 3, 4}
-AUTHOR_FOOTER = "JFRodriguez Hidrologo/Oceanografo Fisico"
+AUTHOR_FOOTER = "HIMH por JFRodriguez Hidrologo/Oceanografo Fisico"
 RHO_AIR = 1.225
 CD_BULK = 1.3e-3
 
@@ -1085,7 +1085,7 @@ with header_col2:
             <div style="text-align:right; color:#5d6d7e; font-size:0.95rem;">
                 <div><b>Período:</b> {f_ini} → {f_fin}</div>
                 <div><b>Registros:</b> {len(df):,}</div>
-                <div><b>Creador:</b> {AUTHOR_FOOTER}</div>
+                <div><b>Elaborado para:</b> {AUTHOR_FOOTER}</div>
             </div>
         </div>
         """,
