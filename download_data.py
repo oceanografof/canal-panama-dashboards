@@ -1,12 +1,12 @@
 """
-download_data_fixed.py — Descarga datos de Aquatic Informatics, los guarda en /data/
-y los sube a la rama principal correcta de GitHub automáticamente.
+download_data.py — Descarga datos de Aquatic Informatics, los guarda en /data/,
+sube LakeHouse_Data.xlsx cuando cambie y sincroniza GitHub sin conflictos comunes.
 
 Corre desde tu PC dentro de la red ACP:
-    python download_data_fixed.py
+    python download_data.py
 """
 from __future__ import annotations
-import io, sys, time, zipfile, subprocess, urllib.request
+import io, sys, time, zipfile, subprocess, urllib.request, shutil, os
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
@@ -45,8 +45,26 @@ TIMEOUT_CONN = 300
 TIMEOUT_READ = 600
 CHUNK_SIZE   = 65536
 
+# Archivos que el proceso puede subir automáticamente.
+# Incluye LakeHouse_Data.xlsx para que se actualice en GitHub/Streamlit cuando cambie.
+AUTO_ADD_TARGETS = [
+    "data/",
+    "LakeHouse_Data.xlsx",
+    "download_data.py",
+    "actualizar.bat",
+    "requirements.txt",
+    ".gitignore",
+]
 
-def run_git(repo_dir: Path, *cmd: str) -> tuple[int, str, str]:
+# En conflictos durante rebase, estos archivos se consideran generados/locales;
+# se conserva la versión local más reciente.
+PREFER_LOCAL_PATTERNS = ("LakeHouse_Data.xlsx", "data/")
+
+
+def run_git(repo_dir: Path, *cmd: str, env: dict | None = None) -> tuple[int, str, str]:
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
     result = subprocess.run(
         list(cmd),
         cwd=str(repo_dir),
@@ -54,13 +72,142 @@ def run_git(repo_dir: Path, *cmd: str) -> tuple[int, str, str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=full_env,
     )
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
+def cleanup_temp_files(repo_dir: Path) -> None:
+    """Elimina archivos temporales que no deben bloquear git pull/rebase."""
+    pycache = repo_dir / "__pycache__"
+    if pycache.exists():
+        shutil.rmtree(pycache, ignore_errors=True)
+        print("  ✅ __pycache__/ eliminado")
+
+
+def ensure_gitignore_temp(repo_dir: Path) -> None:
+    """Evita que __pycache__ y .pyc vuelvan a aparecer como archivos sin seguimiento."""
+    gitignore = repo_dir / ".gitignore"
+    existing = gitignore.read_text(encoding="utf-8", errors="replace") if gitignore.exists() else ""
+    lines = existing.splitlines()
+    changed = False
+    for rule in ("__pycache__/", "*.pyc"):
+        if rule not in [line.strip() for line in lines]:
+            lines.append(rule)
+            changed = True
+    if changed:
+        gitignore.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        print("  ✅ .gitignore actualizado para temporales Python")
+
+
+def git_add_existing(repo_dir: Path, targets: list[str] | tuple[str, ...] = AUTO_ADD_TARGETS) -> None:
+    """Agrega al índice solo los archivos/carpetas existentes. Usa -f para datos aunque .gitignore los bloquee."""
+    for target in targets:
+        clean = target.rstrip("/")
+        p = repo_dir / clean
+        if p.exists():
+            # -f permite agregar LakeHouse_Data.xlsx o data/ aunque alguna regla del .gitignore los ignore.
+            run_git(repo_dir, "git", "add", "-f", "--", target)
+
+
+def git_status_short(repo_dir: Path) -> str:
+    code, out, err = run_git(repo_dir, "git", "status", "--short")
+    if code != 0:
+        return (err or out).strip()
+    return out.strip()
+
+
+def commit_auto_changes(repo_dir: Path, message: str) -> bool:
+    """Hace commit de LakeHouse/data/scripts si hay cambios. No falla cuando no hay cambios."""
+    cleanup_temp_files(repo_dir)
+    ensure_gitignore_temp(repo_dir)
+    git_add_existing(repo_dir)
+
+    status = git_status_short(repo_dir)
+    if not status:
+        return False
+
+    print("  Cambios para commit automático:")
+    for line in status.splitlines():
+        print(f"    {line}")
+
+    code, out, err = run_git(repo_dir, "git", "commit", "-m", message)
+    if code != 0:
+        full_msg = (out + " " + err).strip()
+        if "nothing to commit" in full_msg or "nada para hacer commit" in full_msg:
+            return False
+        raise RuntimeError(f"git commit falló: {full_msg}")
+    print(f"  ✅ git commit OK: '{message}'")
+    return True
+
+
+def is_prefer_local_path(path: str) -> bool:
+    path = path.replace("\\", "/")
+    return any(path == pat.rstrip("/") or path.startswith(pat) for pat in PREFER_LOCAL_PATTERNS)
+
+
+def resolve_generated_rebase_conflicts(repo_dir: Path) -> bool:
+    """Resuelve conflictos de archivos generados conservando la versión local durante rebase."""
+    status = git_status_short(repo_dir)
+    if not status:
+        return False
+
+    conflicted = []
+    for line in status.splitlines():
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        path = line[3:].strip()
+        if any(c in xy for c in ("U", "A", "D")) and is_prefer_local_path(path):
+            conflicted.append(path)
+
+    if not conflicted:
+        return False
+
+    print("  ⚠️  Conflicto detectado en archivos generados. Se conservará la versión local:")
+    for path in conflicted:
+        print(f"    · {path}")
+        # Durante rebase, --theirs corresponde al commit local que se está reaplicando.
+        run_git(repo_dir, "git", "checkout", "--theirs", "--", path)
+        run_git(repo_dir, "git", "add", "--", path)
+    return True
+
+
+def pull_rebase_with_generated_resolution(repo_dir: Path, branch: str) -> None:
+    """Ejecuta pull --rebase y resuelve automáticamente conflictos de LakeHouse/data."""
+    code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "origin", branch)
+    if code == 0:
+        return
+
+    print(f"  ⚠️  pull --rebase encontró un problema:\n    {(err or out).strip()}")
+
+    for _ in range(10):
+        if not resolve_generated_rebase_conflicts(repo_dir):
+            raise RuntimeError(f"No se pudo sincronizar {branch}: {(err or out).strip()}")
+
+        code, out, err = run_git(
+            repo_dir, "git", "rebase", "--continue", env={"GIT_EDITOR": "true"}
+        )
+        if code == 0:
+            print("  ✅ Rebase continuado después de resolver archivos generados")
+            return
+
+        msg = (out + " " + err).strip()
+        if "No changes" in msg or "no changes" in msg:
+            code, out, err = run_git(repo_dir, "git", "rebase", "--skip")
+            if code == 0:
+                return
+        # Puede haber otro conflicto generado en el siguiente commit; el loop lo atiende.
+
+    raise RuntimeError("No se pudo completar el rebase después de varios intentos.")
+
+
 def ensure_default_branch(repo_dir: Path) -> str:
-    """Sincroniza el repo local con la rama por defecto del remoto (main o master)."""
+    """Sincroniza con la rama principal y evita conflictos por LakeHouse_Data.xlsx sin guardar."""
     print("\n── Verificando rama remota ───────────────────")
+
+    cleanup_temp_files(repo_dir)
+    ensure_gitignore_temp(repo_dir)
 
     code, out, err = run_git(repo_dir, "git", "fetch", "origin")
     if code != 0:
@@ -69,7 +216,6 @@ def ensure_default_branch(repo_dir: Path) -> str:
     default_branch = ""
     code, out, err = run_git(repo_dir, "git", "symbolic-ref", "refs/remotes/origin/HEAD")
     if code == 0 and out.strip():
-        # refs/remotes/origin/main -> main
         default_branch = out.strip().split("/")[-1]
 
     if not default_branch:
@@ -91,7 +237,6 @@ def ensure_default_branch(repo_dir: Path) -> str:
     print(f"  Rama remota usada : {default_branch}")
 
     if current_branch != default_branch:
-        # Crear o cambiar a la rama correcta
         code, _, _ = run_git(repo_dir, "git", "show-ref", f"refs/heads/{default_branch}")
         if code == 0:
             code, out, err = run_git(repo_dir, "git", "checkout", default_branch)
@@ -101,14 +246,14 @@ def ensure_default_branch(repo_dir: Path) -> str:
             raise RuntimeError(f"No se pudo cambiar a la rama {default_branch}: {(err or out).strip()}")
         print(f"  ✅ Cambiado a la rama {default_branch}")
 
-    code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "origin", default_branch)
-    if code != 0:
-        # Si hay cambios sin commitear, hacer stash → pull → pop
-        run_git(repo_dir, "git", "stash", "--include-untracked")
-        code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "origin", default_branch)
-        run_git(repo_dir, "git", "stash", "pop")
-        if code != 0:
-            raise RuntimeError(f"No se pudo sincronizar {default_branch}: {(err or out).strip()}")
+    # Si LakeHouse_Data.xlsx o data/ quedaron modificados de una corrida previa,
+    # se guardan primero para que git pull --rebase no falle por cambios sin staged.
+    commit_auto_changes(
+        repo_dir,
+        f"Actualiza LakeHouse/data antes de sincronizar {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    )
+
+    pull_rebase_with_generated_resolution(repo_dir, default_branch)
     print(f"  ✅ Rama {default_branch} sincronizada con origin/{default_branch}")
     return default_branch
 
@@ -273,36 +418,33 @@ def fix_gitignore(repo_dir: Path) -> None:
 def git_push(repo_dir: Path, saved: list[Path], branch: str) -> bool:
     print("\n── Subiendo a GitHub ──────────────────────────")
 
-    for target in ["data/", Path(__file__).name, "app_temperatura.py", "requirements.txt", "actualizar.bat"]:
-        p = repo_dir / str(target).rstrip("/")
-        if p.exists():
-            run_git(repo_dir, "git", "add", str(target))
-    if (repo_dir / ".gitignore").exists():
-        run_git(repo_dir, "git", "add", ".gitignore")
-    print("  ✅ git add OK")
-
-    code, out, err = run_git(repo_dir, "git", "status", "--short")
-    if not out.strip():
-        print("  ℹ️  Sin cambios nuevos — GitHub ya está actualizado.")
-        return True
-    print(f"  Cambios:\n    {out}")
-
-    msg = f"Datos {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    code, out, err = run_git(repo_dir, "git", "commit", "-m", msg)
-    if code != 0:
-        full_msg = (out + " " + err).strip()
-        if "nothing to commit" in full_msg or "nada para hacer commit" in full_msg:
-            print("  ℹ️  Sin cambios nuevos — GitHub ya está actualizado.")
-            return True
-        print(f"  ❌ git commit falló: {full_msg}")
+    try:
+        commit_auto_changes(
+            repo_dir,
+            f"Datos LakeHouse {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        )
+    except Exception as e:
+        print(f"  ❌ git commit falló: {e}")
         return False
-    print(f"  ✅ git commit OK: '{msg}'")
+
+    status = git_status_short(repo_dir)
+    if status:
+        print(f"  ⚠️  Aún quedan cambios sin confirmar:\n    {status}")
 
     code, out, err = run_git(repo_dir, "git", "push", "origin", branch)
     if code != 0:
-        print(f"  ❌ git push falló:\n    {err or out}")
-        print("  → Revisa si tu token de GitHub sigue vigente o si la rama está protegida.")
-        return False
+        print(f"  ⚠️  git push falló inicialmente:\n    {err or out}")
+        print("  → Intentando sincronizar con rebase y volver a subir...")
+        try:
+            pull_rebase_with_generated_resolution(repo_dir, branch)
+        except Exception as e:
+            print(f"  ❌ No se pudo hacer rebase automático: {e}")
+            return False
+        code, out, err = run_git(repo_dir, "git", "push", "origin", branch)
+        if code != 0:
+            print(f"  ❌ git push falló:\n    {err or out}")
+            print("  → Revisa si tu token de GitHub sigue vigente o si la rama está protegida.")
+            return False
 
     print(f"  ✅ git push OK hacia origin/{branch}")
     print("  ⏳ Streamlit Cloud se actualizará en 1-2 minutos")
