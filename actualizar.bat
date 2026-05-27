@@ -6,4 +6,5 @@ git add LakeHouse_Data.xlsx
 git add app_demandas.py
 git commit -m "Auto %date% %time%"
 git push
-pause
+timeout /t 5 /nobreak >nul
+exit
