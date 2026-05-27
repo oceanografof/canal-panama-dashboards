@@ -3594,11 +3594,53 @@ with tabs[10]:
     st.markdown("""
     1. Coloque el archivo **LakeHouse*.xlsx** en la misma carpeta del app, o súbalo en **📂 Datos Lake House**.  
     2. Confirme que la hoja seleccionada sea la correcta.  
-    3. Revise el rango de fechas leído por la app.  
+    3. Revise el rango de fechas leído por la app y el **último registro disponible**.  
     4. Compare promedios de **5, 7 y 10 días** cuando necesite validar estabilidad de los datos.  
-    5. Use la sección de **salidas por embalse** para verificar que Alhajuela y Gatún estén separados correctamente.  
-    6. Si necesita soporte externo, descargue el CSV del período seleccionado.
+    5. Recuerde que el selector **5 / 7 / 10 días** recalcula las tarjetas de promedios, salidas por embalse, consumos operativos y descarga CSV del período seleccionado.  
+    6. Use la sección de **salidas por embalse** para verificar que Alhajuela y Gatún estén separados correctamente.  
+    7. Si necesita soporte externo, descargue el CSV del período seleccionado.
     """)
+
+    st.markdown("### 🆕 Criterios técnicos incorporados en esta versión")
+    criterios_lkh = pd.DataFrame([
+        {
+            "Elemento": "Promedio 5 / 7 / 10 días",
+            "Criterio aplicado": "La app usa exactamente los últimos N registros disponibles del LakeHouse, no una ventana inclusiva por fecha.",
+            "Dónde verificar": "📂 Datos Lake House · Promedios operativos y Salidas de agua por embalse.",
+        },
+        {
+            "Elemento": "Niveles de Gatún y Alhajuela",
+            "Criterio aplicado": "Los niveles se toman del último día disponible; no se promedian, porque representan condición operativa inicial.",
+            "Dónde verificar": "Tarjetas superiores de 📂 Datos Lake House y sidebar de niveles operativos.",
+        },
+        {
+            "Elemento": "Evaporación",
+            "Criterio aplicado": "No se toma del LakeHouse. Siempre se calcula en el app con lámina mm/día × área km² × 0.001 por embalse.",
+            "Dónde verificar": "📊 Balance · Detalle operativo del balance y ☀️ Evaporación aplicada.",
+        },
+        {
+            "Elemento": "Potabilización",
+            "Criterio aplicado": "Cuando hay LakeHouse, se priorizan columnas MCF/MPC (`munic_mad` y `munic_gat`) y se convierten a hm³/d, cfs y m³/s.",
+            "Dónde verificar": "📊 Balance · Detalle operativo del balance y 📂 Datos Lake House.",
+        },
+        {
+            "Elemento": "Fugas",
+            "Criterio aplicado": "Cuando hay LakeHouse, se priorizan columnas MCF/MPC (`leak_mad` y `leak_gat`) para evitar valores *_hm3 desajustados.",
+            "Dónde verificar": "📊 Balance · Detalle operativo del balance y 📂 Datos Lake House.",
+        },
+        {
+            "Elemento": "Esclusajes",
+            "Criterio aplicado": "El consumo se muestra una sola vez y se calcula con PNX + NPX según el período seleccionado y la fuente de consumo activa.",
+            "Dónde verificar": "Tarjeta Consumo esclusajes y pestaña 🚢 Esclusajes.",
+        },
+    ])
+    st.dataframe(criterios_lkh, use_container_width=True, hide_index=True)
+
+    st.warning(
+        "Para control de calidad: si cambia de 5 a 7 o 10 días, los promedios del LakeHouse deben cambiar en las tarjetas "
+        "de consumo, potabilización, fugas, generación y salidas por embalse. La evaporación puede mantenerse igual si no cambia "
+        "la lámina o el nivel, porque se calcula desde el app y no desde el LakeHouse."
+    )
 
     st.markdown("### 📏 Unidades principales")
     unidades = pd.DataFrame([
@@ -3619,8 +3661,9 @@ with tabs[10]:
         **Datos base**
         - Archivo LakeHouse correcto.
         - Hoja correcta.
-        - Rango de fechas revisado.
-        - Últimos 5 días validados.
+        - Rango de fechas y último registro revisados.
+        - Promedio seleccionado (**5, 7 o 10 días**) validado.
+        - Confirmar que la evaporación proviene del **App calculado**, no del LakeHouse.
         """)
     with chk2:
         st.markdown("""
@@ -3643,6 +3686,9 @@ with tabs[10]:
     problemas = pd.DataFrame([
         {"Situación": "No carga el LakeHouse", "Solución": "Use un archivo llamado LakeHouse*.xlsx, colóquelo junto al app o súbalo desde Datos Lake House."},
         {"Situación": "Los valores cambiaron al abrir la app", "Solución": "La app usa el LakeHouse como punto inicial; luego puede editar manualmente en el sidebar."},
+        {"Situación": "Cambio 5/7/10 días y algunos valores no cambian", "Solución": "Revise si ese campo proviene del último día, como niveles, o si es calculado por el app, como evaporación. Los promedios LakeHouse sí deben actualizarse."},
+        {"Situación": "Evaporación aparece como LakeHouse", "Solución": "No debe usarse LakeHouse para evaporación; verifique que la fuente indique App calculado y que use lámina × área."},
+        {"Situación": "Potabilización o fugas salen muy altas", "Solución": "Revise que se estén usando columnas MCF/MPC (`munic_*` y `leak_*`) y no valores *_hm3 desajustados del LakeHouse."},
         {"Situación": "Alhajuela tiene la misma evaporación que Gatún", "Solución": "Es el valor inicial por defecto. Edite directamente Lámina Alhajuela (mm/día) si requiere una lámina diferente."},
         {"Situación": "El área espejo no parece correcta", "Solución": "Revise el nivel operativo y la curva hipsométrica seleccionada: Estándar o Daily."},
         {"Situación": "El consumo de esclusajes no coincide", "Solución": "Revise la fuente del balance principal: manual, manual con ahorro, modelo físico o modelo físico con ahorro."},
