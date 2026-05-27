@@ -192,6 +192,26 @@ def hrs_to_hm(hrs):
     return f"{h:02d}:{m:02d}"
 
 
+def frac_to_hms(frac):
+    """Fracción de día → HH:MM:SS (precisión de segundos)."""
+    try:
+        if math.isnan(frac) or not (0 <= frac <= 1): return "N/A"
+    except TypeError:
+        return "N/A"
+    total_sec = round(frac * 86400)
+    h, rem = divmod(total_sec, 3600)
+    m, s   = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def dur_to_hms(minutes):
+    """Minutos decimales → H:MM:SS (precisión de segundos)."""
+    if not minutes: return ""
+    total_sec = round(float(minutes) * 60)
+    h, rem = divmod(total_sec, 3600)
+    m, s   = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
 # Mapa de nombres español (clave interna → etiqueta)
 ES = {
     "date"                : "Fecha",
@@ -926,47 +946,68 @@ else:
     idx_max_el  = df_y["solar_elevation_corr"].idxmax()
 
     # ── KPI anuales: valor principal + sub-valor + etiqueta ─────────
+    # Duraciones con precisión de segundos
+    _dur_max_hms   = dur_to_hms(df_y.loc[idx_max_dur, "sunlight_duration"])
+    _dur_min_hms   = dur_to_hms(df_y.loc[idx_min_dur, "sunlight_duration"])
+    _night_max_hms = dur_to_hms(1440 - df_y.loc[idx_min_dur, "sunlight_duration"])
+    _night_min_hms = dur_to_hms(1440 - df_y.loc[idx_max_dur, "sunlight_duration"])
+    _sr_max = frac_to_hms(df_y.loc[idx_max_dur, "sunrise"])
+    _ss_max = frac_to_hms(df_y.loc[idx_max_dur, "sunset"])
+    _sr_min = frac_to_hms(df_y.loc[idx_min_dur, "sunrise"])
+    _ss_min = frac_to_hms(df_y.loc[idx_min_dur, "sunset"])
+
+    # Fila 1: Día más largo / corto / Noche más larga / corta / Elevación
     _kpi_anual = [
         {
             "lbl"  : "☀️ Día más largo",
-            "main" : f"{df_y.loc[idx_max_dur,'sunlight_duration']/60:.2f} h",
-            "sub"  : df_y.loc[idx_max_dur,'date'].strftime('%d %b'),
-            "color": "#00C9A7",   # teal
+            "main" : _dur_max_hms,
+            "sub"  : df_y.loc[idx_max_dur,"date"].strftime("%d %b"),
+            "extra": f"↑ {_sr_max}  ↓ {_ss_max}",
+            "color": "#00C9A7",
         },
         {
             "lbl"  : "🌑 Día más corto",
-            "main" : f"{df_y.loc[idx_min_dur,'sunlight_duration']/60:.2f} h",
-            "sub"  : df_y.loc[idx_min_dur,'date'].strftime('%d %b'),
-            "color": "#4A90D9",   # azul
+            "main" : _dur_min_hms,
+            "sub"  : df_y.loc[idx_min_dur,"date"].strftime("%d %b"),
+            "extra": f"↑ {_sr_min}  ↓ {_ss_min}",
+            "color": "#4A90D9",
+        },
+        {
+            "lbl"  : "🌙 Noche más larga",
+            "main" : _night_max_hms,
+            "sub"  : df_y.loc[idx_min_dur,"date"].strftime("%d %b"),
+            "extra": "= 24 h − día más corto",
+            "color": "#9B59B6",
+        },
+        {
+            "lbl"  : "🌟 Noche más corta",
+            "main" : _night_min_hms,
+            "sub"  : df_y.loc[idx_max_dur,"date"].strftime("%d %b"),
+            "extra": "= 24 h − día más largo",
+            "color": "#F5A623",
         },
         {
             "lbl"  : "🔆 Elevación máx.",
             "main" : f"{df_y.loc[idx_max_el,'solar_elevation_corr']:.2f}°",
-            "sub"  : df_y.loc[idx_max_el,'date'].strftime('%d %b'),
-            "color": "#F5A623",   # ámbar
-        },
-        {
-            "lbl"  : "🌐 Declinación máx.",
-            "main" : f"{df_y['sun_declin'].max():.3f}°",
-            "sub"  : df_y.loc[df_y['sun_declin'].idxmax(),'date'].strftime('%d %b'),
-            "color": "#7ED321",   # verde lima
-        },
-        {
-            "lbl"  : "🌐 Declinación mín.",
-            "main" : f"{df_y['sun_declin'].min():.3f}°",
-            "sub"  : df_y.loc[df_y['sun_declin'].idxmin(),'date'].strftime('%d %b'),
-            "color": "#E74C3C",   # rojo-naranja
+            "sub"  : df_y.loc[idx_max_el,"date"].strftime("%d %b"),
+            "extra": "",
+            "color": "#E74C3C",
         },
     ]
     for col, k in zip(st.columns(5), _kpi_anual):
         with col:
+            _extra_html = (f'<div style="font-size:0.62rem;color:{k["color"]};'
+                           f'opacity:0.85;margin-top:4px;">{k["extra"]}</div>'
+                           if k.get("extra") else "")
             st.markdown(
                 f"""<div class="kpi-anual" style="border-top-color:{k['color']}">
-  <div class="kpi-main" style="color:{k['color']}">{k['main']}</div>
-  <div class="kpi-sub"  style="color:{k['color']}bb">{k['sub']}</div>
+  <div class="kpi-main" style="color:{k['color']};font-size:1.55rem;">{k['main']}</div>
+  <div class="kpi-sub"  style="color:{k['color']}bb;">{k['sub']}</div>
   <div class="kpi-lbl">{k['lbl']}</div>
+  {_extra_html}
 </div>""",
                 unsafe_allow_html=True)
+
 
 
     # ── Eventos Astronómicos ─────────────────────────────────────────
