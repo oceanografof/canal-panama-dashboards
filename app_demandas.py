@@ -1054,13 +1054,31 @@ def _leer_defaults_operativos_lkh(path_o_bytes, source_id, n_dias=5):
                 if na is not None or nc is not None:
                     n_npx_vals.append(_mean([na, nc]))
 
-            # Conversión de consumos MCF/d → cfs; hm³/d → cfs cuando existe columna directa
+            # Conversión de consumos MCF/d → cfs; hm³/d → cfs cuando existe columna directa.
             def _cfs_from(mcf_key, hm3_key):
                 hm3 = _mean([_num(r.get(hm3_key)) for r in ult])
                 if hm3 is not None and hm3 > 0:
                     return hm3 / CFS2HM3
                 mcf = _mean([_num(r.get(mcf_key)) for r in ult])
                 return mcf * MCF_TO_CFS_LOCAL if mcf is not None else None
+
+            def _cfs_from_mcf_first(mcf_key, hm3_key, max_cfs=None):
+                """Prioriza la columna MCF/MPC del LakeHouse y usa hm³/día solo como respaldo validado.
+
+                Esto evita que el sidebar tome valores desajustados de columnas *_hm3
+                cuando el LakeHouse trae también la columna base en MCF/MPC por día.
+                """
+                mcf = _mean([_num(r.get(mcf_key)) for r in ult])
+                if mcf is not None and mcf >= 0:
+                    cfs = mcf * MCF_TO_CFS_LOCAL
+                    if max_cfs is None or cfs <= float(max_cfs):
+                        return cfs
+                hm3 = _mean([_num(r.get(hm3_key)) for r in ult])
+                if hm3 is not None and hm3 >= 0:
+                    cfs = hm3 / CFS2HM3
+                    if max_cfs is None or cfs <= float(max_cfs):
+                        return cfs
+                return None
 
             out = {
                 "hoja": hoja,
@@ -1070,10 +1088,10 @@ def _leer_defaults_operativos_lkh(path_o_bytes, source_id, n_dias=5):
                 "n_npx": _mean(n_npx_vals),
                 "gm_mw": (_mean([_num(r.get("mad_mwh")) for r in ult]) or 0) / 24.0 if _mean([_num(r.get("mad_mwh")) for r in ult]) is not None else None,
                 "gg_mw": (_mean([_num(r.get("gat_mwh")) for r in ult]) or 0) / 24.0 if _mean([_num(r.get("gat_mwh")) for r in ult]) is not None else None,
-                "pot_alh_cfs": _cfs_from("pot_a_mcf", "pot_a_hm3"),
-                "pot_gat_cfs": _cfs_from("pot_g_mcf", "pot_g_hm3"),
-                "fug_alh_cfs": _cfs_from("fug_a_mcf", "fug_a_hm3"),
-                "fug_gat_cfs": _cfs_from("fug_g_mcf", "fug_g_hm3"),
+                "pot_alh_cfs": _cfs_from_mcf_first("pot_a_mcf", "pot_a_hm3", max_cfs=800),
+                "pot_gat_cfs": _cfs_from_mcf_first("pot_g_mcf", "pot_g_hm3", max_cfs=600),
+                "fug_alh_cfs": _cfs_from_mcf_first("fug_a_mcf", "fug_a_hm3", max_cfs=300),
+                "fug_gat_cfs": _cfs_from_mcf_first("fug_g_mcf", "fug_g_hm3", max_cfs=400),
                 "evap_gat_mm": _mean([_num(r.get("evap_g_mm")) for r in ult]),
                 "evap_alh_mm": _mean([_num(r.get("evap_a_mm")) for r in ult]),
                 "evap_gat_hm3_lkh": _mean([_num(r.get("evap_g_hm3")) for r in ult]),
@@ -1130,6 +1148,191 @@ def _aplicar_defaults_operativos_lkh_si_corresponde(n_dias=5):
     except Exception:
         return None
 
+
+@st.cache_data(show_spinner=False)
+def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
+    """Lee promedios detallados de salidas por embalse desde LakeHouse.
+    Se usa solo para mostrar un resumen en la pestaña Balance; no altera los cálculos principales.
+    """
+    try:
+        import openpyxl
+        from io import BytesIO
+
+        MCF_TO_CFS_LOCAL = 1_000_000.0 / 86400.0
+
+        def _num(v):
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, str) and v.strip().startswith("#"):
+                    return None
+                return float(v)
+            except Exception:
+                return None
+
+        def _mean(vals):
+            vals = [float(x) for x in vals if x is not None and np.isfinite(float(x))]
+            return float(np.mean(vals)) if vals else None
+
+        def _find(header_l, *tokens, exact=None):
+            if exact:
+                exact_l = [str(e).lower() for e in exact]
+                for i, h in enumerate(header_l):
+                    if h in exact_l:
+                        return i
+            for i, h in enumerate(header_l):
+                if all(str(t).lower() in h for t in tokens):
+                    return i
+            return None
+
+        src = BytesIO(path_o_bytes) if isinstance(path_o_bytes, (bytes, bytearray)) else path_o_bytes
+        wb = openpyxl.load_workbook(src, read_only=True, data_only=True)
+        hojas = [x for x in wb.sheetnames if x not in ["Sheet1", "Para BalanceH"]] or wb.sheetnames
+
+        for hoja in hojas:
+            ws = wb[hoja]
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                header = next(rows_iter)
+            except StopIteration:
+                continue
+            header_l = [str(c).strip().lower() if c is not None else "" for c in header]
+
+            idx = {
+                "fecha": _find(header_l, "date"),
+                "gat_hm3": _find(header_l, exact=["gatlockhm3"]),
+                "pm_hm3": _find(header_l, exact=["pmlockhm3"]),
+                "acl_hm3": _find(header_l, exact=["aclockhm3"]),
+                "ccl_hm3": _find(header_l, exact=["ccllockhm3"]),
+                "gat_mcf": _find(header_l, "gatlockmcf"),
+                "pm_mcf": _find(header_l, "pmlockmcf"),
+                "acl_mcf": _find(header_l, "aclockmcf"),
+                "ccl_mcf": _find(header_l, "ccllockmcf"),
+                "gen_mad_hm3": _find(header_l, exact=["madhm3"]),
+                "gen_gat_hm3": _find(header_l, exact=["gathm3"]),
+                "pot_m_hm3": _find(header_l, exact=["munic_mad_hm3"]),
+                "pot_g_hm3": _find(header_l, exact=["munic_gat_hm3"]),
+                "pot_m_mcf": _find(header_l, exact=["munic_mad"]),
+                "pot_g_mcf": _find(header_l, exact=["munic_gat"]),
+                "fug_m_hm3": _find(header_l, exact=["leak_mad_hm3"]),
+                "fug_g_hm3": _find(header_l, exact=["leak_gat_hm3"]),
+                "fug_m_mcf": _find(header_l, exact=["leak_mad"]),
+                "fug_g_mcf": _find(header_l, exact=["leak_gat"]),
+                "vert_m_mcf": _find(header_l, exact=["madspill"]),
+                "vert_g_mcf": _find(header_l, exact=["gatspill"]),
+                "evap_m_hm3": _find(header_l, exact=["vol_evap_ala_hm3"]),
+                "evap_g_hm3": _find(header_l, exact=["vol_evap_gat_hm3"]),
+            }
+
+            ult = []
+            for row in rows_iter:
+                vals = list(row)
+                rec = {}
+                for k, i in idx.items():
+                    rec[k] = vals[i] if i is not None and i < len(vals) else None
+                if any(_num(rec.get(k)) is not None for k in rec if k != "fecha"):
+                    ult.append(rec)
+                    if len(ult) > max(int(n_dias), 1):
+                        ult.pop(0)
+            if not ult:
+                continue
+
+            def _hm3_component(hm3_keys=None, mcf_keys=None):
+                hm3_keys = hm3_keys or []
+                mcf_keys = mcf_keys or []
+                if hm3_keys:
+                    vals_hm3 = []
+                    for r in ult:
+                        vals = [_num(r.get(k)) for k in hm3_keys]
+                        vals = [v for v in vals if v is not None]
+                        if vals:
+                            vals_hm3.append(sum(vals))
+                    m = _mean(vals_hm3)
+                    if m is not None:
+                        return m
+                if mcf_keys:
+                    vals_mcf = []
+                    for r in ult:
+                        vals = [_num(r.get(k)) for k in mcf_keys]
+                        vals = [v for v in vals if v is not None]
+                        if vals:
+                            vals_mcf.append(sum(vals))
+                    mcf = _mean(vals_mcf)
+                    if mcf is not None:
+                        return mcf * MCF_TO_CFS_LOCAL * CFS2HM3
+                return None
+
+            def _hm3_component_mcf_first(mcf_keys=None, hm3_keys=None, max_hm3=None):
+                """Primero MCF/MPC por día del LakeHouse; hm³/día solo como respaldo validado."""
+                mcf_keys = mcf_keys or []
+                hm3_keys = hm3_keys or []
+                if mcf_keys:
+                    vals_mcf = []
+                    for r in ult:
+                        vals = [_num(r.get(k)) for k in mcf_keys]
+                        vals = [v for v in vals if v is not None]
+                        if vals:
+                            vals_mcf.append(sum(vals))
+                    mcf = _mean(vals_mcf)
+                    if mcf is not None:
+                        hm3 = mcf * MCF_TO_CFS_LOCAL * CFS2HM3
+                        if max_hm3 is None or hm3 <= float(max_hm3):
+                            return hm3
+                if hm3_keys:
+                    vals_hm3 = []
+                    for r in ult:
+                        vals = [_num(r.get(k)) for k in hm3_keys]
+                        vals = [v for v in vals if v is not None]
+                        if vals:
+                            vals_hm3.append(sum(vals))
+                    hm3 = _mean(vals_hm3)
+                    if hm3 is not None and (max_hm3 is None or hm3 <= float(max_hm3)):
+                        return hm3
+                return None
+
+            detalle = [
+                {"Embalse": "Alhajuela / Madden", "Uso": "Generación Madden", "hm3": _hm3_component(["gen_mad_hm3"])},
+                {"Embalse": "Alhajuela / Madden", "Uso": "Potabilización", "hm3": _hm3_component_mcf_first(["pot_m_mcf"], ["pot_m_hm3"], max_hm3=3.0)},
+                {"Embalse": "Alhajuela / Madden", "Uso": "Fugas", "hm3": _hm3_component_mcf_first(["fug_m_mcf"], ["fug_m_hm3"], max_hm3=1.5)},
+                {"Embalse": "Alhajuela / Madden", "Uso": "Vertido Madden", "hm3": _hm3_component([], ["vert_m_mcf"])},
+                {"Embalse": "Alhajuela / Madden", "Uso": "Evaporación", "hm3": _hm3_component(["evap_m_hm3"])},
+                {"Embalse": "Gatún", "Uso": "Esclusajes PNX", "hm3": _hm3_component(["gat_hm3", "pm_hm3"], ["gat_mcf", "pm_mcf"])},
+                {"Embalse": "Gatún", "Uso": "Esclusajes NPX", "hm3": _hm3_component(["acl_hm3", "ccl_hm3"], ["acl_mcf", "ccl_mcf"])},
+                {"Embalse": "Gatún", "Uso": "Generación Gatún", "hm3": _hm3_component(["gen_gat_hm3"])},
+                {"Embalse": "Gatún", "Uso": "Potabilización", "hm3": _hm3_component_mcf_first(["pot_g_mcf"], ["pot_g_hm3"], max_hm3=3.0)},
+                {"Embalse": "Gatún", "Uso": "Fugas", "hm3": _hm3_component_mcf_first(["fug_g_mcf"], ["fug_g_hm3"], max_hm3=1.5)},
+                {"Embalse": "Gatún", "Uso": "Vertido Gatún", "hm3": _hm3_component([], ["vert_g_mcf"])},
+                {"Embalse": "Gatún", "Uso": "Evaporación", "hm3": _hm3_component(["evap_g_hm3"])},
+            ]
+            if not any(x.get("hm3") is not None for x in detalle):
+                continue
+            return {
+                "hoja": hoja,
+                "n_dias": int(n_dias),
+                "fecha_ultimo": ult[-1].get("fecha"),
+                "detalle": detalle,
+            }
+    except Exception:
+        return None
+    return None
+
+
+def _obtener_balance_detallado_lkh(n_dias=5):
+    """Obtiene el resumen detallado del LakeHouse local o subido, respetando el período 5/7/10 días."""
+    src, sid = _lkh_sidebar_source()
+    if not src or not sid:
+        return None
+    try:
+        if hasattr(src, "getvalue"):
+            src.seek(0)
+            payload = src.getvalue()
+        else:
+            payload = src
+        sid_det = f"{sid}:balance_detalle:{int(n_dias)}"
+        return _leer_balance_detallado_lkh(payload, sid_det, int(n_dias))
+    except Exception:
+        return None
+
 _info_niveles_lkh = _aplicar_niveles_lkh_si_corresponde()
 # El período seleccionado en la pestaña 📂 Datos Lake House también alimenta
 # los valores iniciales/editables del sidebar y, por lo tanto, el balance principal.
@@ -1143,6 +1346,7 @@ if _dias_defaults_lkh not in (5, 7, 10):
     _dias_defaults_lkh = 5
 st.session_state.setdefault("dias_op", _dias_defaults_lkh)
 _info_defaults_lkh = _aplicar_defaults_operativos_lkh_si_corresponde(_dias_defaults_lkh)
+_info_balance_lkh = _obtener_balance_detallado_lkh(_dias_defaults_lkh)
 # Valores de respaldo si no existe LakeHouse; se definen antes de crear los widgets.
 st.session_state.setdefault("nivel_gat_op", 87.0)
 st.session_state.setdefault("nivel_alh_op", 252.0)
@@ -1637,6 +1841,100 @@ with tabs[0]:
                 gauge={"axis":{"range":[0,100]},"bar":{"color":cl}}))
             fig_gauge.update_layout(height=160, margin=dict(l=10,r=10,t=35,b=5))
             st.plotly_chart(fig_gauge, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("🧾 Detalle operativo del balance")
+
+    def _flow_card(label, hm3_val, fuente="Balance actual"):
+        hm3_val = 0.0 if hm3_val is None or pd.isna(hm3_val) else float(hm3_val)
+        cfs_val = hm3_val / CFS2HM3
+        m3s_val = hm3_val * HM3D2M3S
+        st.markdown(
+            f"""
+            <div class="lkh-card">
+                <div class="label">{label}</div>
+                <div class="value">{hm3_val:.3f} hm³/d</div>
+                <div class="sub">{cfs_val:.1f} cfs · {m3s_val:.2f} m³/s · {fuente}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    _balance_base_det = [
+        {"Embalse": "Alhajuela / Madden", "Uso": "Generación Madden", "hm3": gen_alh},
+        {"Embalse": "Alhajuela / Madden", "Uso": "Potabilización", "hm3": alh_pot},
+        {"Embalse": "Alhajuela / Madden", "Uso": "Fugas", "hm3": alh_fug},
+        {"Embalse": "Alhajuela / Madden", "Uso": "Vertido Madden", "hm3": alh_vert},
+        {"Embalse": "Alhajuela / Madden", "Uso": "Evaporación", "hm3": evap_alh},
+        {"Embalse": "Gatún", "Uso": "Esclusajes PNX", "hm3": dem_pnx},
+        {"Embalse": "Gatún", "Uso": "Esclusajes NPX", "hm3": dem_npx},
+        {"Embalse": "Gatún", "Uso": "Generación Gatún", "hm3": gen_gat},
+        {"Embalse": "Gatún", "Uso": "Potabilización", "hm3": gat_pot},
+        {"Embalse": "Gatún", "Uso": "Fugas", "hm3": gat_fug},
+        {"Embalse": "Gatún", "Uso": "Vertido Gatún", "hm3": gat_ver},
+        {"Embalse": "Gatún", "Uso": "ZZ-Flush", "hm3": dem_flush},
+        {"Embalse": "Gatún", "Uso": "Evaporación", "hm3": evap_gat},
+    ]
+    _lkh_lookup = {}
+    if _info_balance_lkh and _info_balance_lkh.get("detalle"):
+        for _r in _info_balance_lkh.get("detalle", []):
+            _lkh_lookup[(_r.get("Embalse"), _r.get("Uso"))] = _r.get("hm3")
+
+    _detalle_balance_rows = []
+    for _r in _balance_base_det:
+        _key = (_r["Embalse"], _r["Uso"])
+        _hm3_lkh = _lkh_lookup.get(_key, None)
+
+        # IMPORTANTE:
+        # La evaporación del detalle debe salir del cálculo activo del app por embalse
+        # (lámina mm/día × área km² × 0.001), no del LakeHouse. Esto evita mostrar
+        # 0.000 hm³/d cuando el LakeHouse trae la columna de evaporación vacía o en cero.
+        _uso_l = str(_r.get("Uso", "")).strip().lower()
+        _es_evaporacion = _uso_l == "evaporación"
+        _es_fugas = _uso_l == "fugas"
+        _es_potabilizacion = _uso_l == "potabilización"
+        _usar_lkh = (not _es_evaporacion) and (_hm3_lkh is not None) and (not pd.isna(_hm3_lkh))
+
+        _hm3_val = float(_hm3_lkh) if _usar_lkh else float(_r["hm3"])
+        if _es_evaporacion:
+            _fuente_row = "App calculado"
+        elif (_es_fugas or _es_potabilizacion) and _usar_lkh:
+            _fuente_row = "LakeHouse MCF"
+        else:
+            _fuente_row = "LakeHouse" if _usar_lkh else "Balance actual"
+
+        _detalle_balance_rows.append({
+            "Embalse": _r["Embalse"],
+            "Uso": _r["Uso"],
+            "hm³/día": round(_hm3_val, 4),
+            "cfs": round(_hm3_val / CFS2HM3, 1),
+            "m³/s": round(_hm3_val * HM3D2M3S, 2),
+            "Fuente": _fuente_row,
+        })
+
+    _det_alh = [r for r in _detalle_balance_rows if r["Embalse"] == "Alhajuela / Madden"]
+    _det_gat = [r for r in _detalle_balance_rows if r["Embalse"] == "Gatún"]
+    _fuente_det_txt = "LakeHouse local/subido + respaldo balance" if _lkh_lookup else "Balance actual del sidebar"
+    st.caption(
+        f"Valor principal en hm³/día; debajo se muestran cfs y m³/s. "
+        f"Se incluyen también los componentes en cero para que el balance no oculte salidas sin uso. "
+        f"Fuente general: **{_fuente_det_txt}**. La **evaporación** siempre se toma del cálculo activo del app por embalse; "
+        f"en **potabilización** y **fugas**, cuando hay LakeHouse, se priorizan las columnas MCF/MPC (`munic_mad` / `munic_gat` y `leak_mad` / `leak_gat`) para evitar valores desajustados de *_hm3."
+    )
+
+    st.markdown("**Alhajuela / Madden**")
+    _cols_alh = st.columns(5)
+    for _i, _r in enumerate(_det_alh):
+        with _cols_alh[_i % len(_cols_alh)]:
+            _flow_card(_r["Uso"], _r["hm³/día"], _r["Fuente"])
+
+    st.markdown("**Gatún**")
+    _cols_gat = st.columns(4)
+    for _i, _r in enumerate(_det_gat):
+        with _cols_gat[_i % len(_cols_gat)]:
+            _flow_card(_r["Uso"], _r["hm³/día"], _r["Fuente"])
+
+    st.dataframe(pd.DataFrame(_detalle_balance_rows), use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.subheader("☀️ Evaporación aplicada en el balance")
@@ -2631,11 +2929,17 @@ with tabs[9]:
     if dl is not None and len(dl)>0:
         total_dias = (dl["fecha"].max()-dl["fecha"].min()).days
         st.markdown("---")
+        _dias_opciones = [5, 7, 10]
+        try:
+            _dias_actual = int(st.session_state.get("dias_op", 5))
+        except Exception:
+            _dias_actual = 5
+        _dias_index = _dias_opciones.index(_dias_actual) if _dias_actual in _dias_opciones else 0
         dias_sel = st.radio("📅 Promedio de los últimos N días",
-            options=[5, 7, 10], index=0, horizontal=True, key="dias_op",
+            options=_dias_opciones, index=_dias_index, horizontal=True, key="dias_op",
             help=(
-                "Seleccione 5, 7 o 10 registros/días. Esta selección también actualiza "
-                "los valores iniciales del sidebar y el balance principal en el siguiente recálculo."
+                "Seleccione 5, 7 o 10 registros/días. Esta selección actualiza "
+                "los valores del LakeHouse usados por las tarjetas, el sidebar y el balance principal."
             ))
 
         # Usar exactamente los últimos N registros/días disponibles, no una ventana inclusiva por fecha.
@@ -2689,8 +2993,14 @@ with tabs[9]:
         # Conversiones de flujo
         MCF_TO_CFS = 1_000_000.0 / 86400.0   # MCF (millones de pies³/día) → cfs
 
-        def _hm3_series(df_base, col_hm3=None, col_mcf=None):
-            """Devuelve una serie en hm³/día, priorizando columnas hm³ cuando existan."""
+        def _hm3_series(df_base, col_hm3=None, col_mcf=None, prefer_mcf=False):
+            """Devuelve una serie en hm³/día.
+
+            Para fugas se puede priorizar MCF porque en algunos LakeHouse el campo *_hm3
+            puede venir desajustado respecto al consumo diario usado por el balance.
+            """
+            if prefer_mcf and col_mcf and col_mcf in df_base and df_base[col_mcf].notna().sum() > 0:
+                return pd.to_numeric(df_base[col_mcf], errors="coerce") * MCF_TO_CFS * CFS2HM3
             if col_hm3 and col_hm3 in df_base and df_base[col_hm3].notna().sum() > 0:
                 return pd.to_numeric(df_base[col_hm3], errors="coerce")
             if col_mcf and col_mcf in df_base and df_base[col_mcf].notna().sum() > 0:
@@ -2742,8 +3052,10 @@ with tabs[9]:
 
         def _promedio_componentes(df_base, componentes):
             series = []
-            for col_hm3, col_mcf in componentes:
-                s = _hm3_series(df_base, col_hm3=col_hm3, col_mcf=col_mcf)
+            for comp in componentes:
+                col_hm3, col_mcf = comp[0], comp[1]
+                prefer_mcf = bool(comp[2]) if len(comp) >= 3 else False
+                s = _hm3_series(df_base, col_hm3=col_hm3, col_mcf=col_mcf, prefer_mcf=prefer_mcf)
                 if s is not None:
                     series.append(s.fillna(0))
             if not series:
@@ -2783,8 +3095,11 @@ with tabs[9]:
         if _escl_hm3 is None:
             _escl_hm3 = _mean_col("total_escl_hm3")
         _pot_prom = _promedio_componentes(dv, [("mun_m_hm3", "mun_m"), ("mun_g_hm3", "mun_g")])
-        _fug_prom = _promedio_componentes(dv, [("leak_m_hm3", "leak_m"), ("leak_g_hm3", "leak_g")])
-        _evap_prom = _promedio_componentes(dv, [("evap_gat_hm3", None), ("evap_alh_hm3", None)])
+        _fug_prom = _promedio_componentes(dv, [("leak_m_hm3", "leak_m", True), ("leak_g_hm3", "leak_g", True)])
+        # La evaporación NO se toma de los campos de volumen del LakeHouse porque pueden venir
+        # vacíos, en cero o desajustados. Se muestra el cálculo activo del app:
+        # lámina mm/día × área del embalse × 0.001.
+        _evap_prom = _flow_prom_from_hm3(evap_tot)
         _gen_mwh = 0.0
         _gen_count = 0
         for _c in ["mad_mwh", "gat_mwh"]:
@@ -2804,14 +3119,14 @@ with tabs[9]:
         with cD:
             _lkh_card("⚡ Generación", _fmt_lkh(_gen_mw, "MW", 1), "MWh/d ÷ 24 · promedio horario")
         with cE:
-            _lkh_card("☀️ Evaporación", _fmt_lkh(_evap_prom['hm3'] if _evap_prom else None, "hm³/d", 2), f"{_fmt_lkh(_evap_prom['cfs'] if _evap_prom else None, 'cfs', 0)} · LakeHouse")
+            _lkh_card("☀️ Evaporación", _fmt_lkh(_evap_prom['hm3'] if _evap_prom else None, "hm³/d", 2), f"{_fmt_lkh(_evap_prom['cfs'] if _evap_prom else None, 'cfs', 0)} · App calculado")
         st.caption(
-            f"Estos valores provienen del LakeHouse y se calculan con los últimos {dias_sel} registros/días seleccionados. "
-            "Ese mismo período alimenta los valores iniciales del sidebar y el balance principal; todos los campos siguen siendo editables manualmente."
+            f"Esclusajes, potabilización, fugas y generación se calculan con los últimos {dias_sel} registros/días seleccionados del LakeHouse. "
+            "La evaporación se toma del cálculo activo del app por embalse, no de los campos de evaporación del LakeHouse."
         )
 
-        # --- Salidas de agua por embalse desde LakeHouse ---
-        st.markdown("#### 🏔️🌊 Salidas de agua por embalse — LakeHouse")
+        # --- Salidas de agua por embalse desde LakeHouse + evaporación calculada por el app ---
+        st.markdown("#### 🏔️🌊 Salidas de agua por embalse — LakeHouse + evaporación calculada")
 
         def _agregar_salida_embalse(rows, embalse, salida, componentes):
             prom = _promedio_componentes(dv, componentes)
@@ -2823,15 +3138,29 @@ with tabs[9]:
                 "Prom hm³/d": prom["hm3"],
                 "Prom cfs": prom["cfs"],
                 "Prom m³/s": prom["m3s"],
+                "Fuente": "LakeHouse",
+            })
+
+        def _agregar_salida_embalse_app(rows, embalse, salida, hm3_val):
+            prom = _flow_prom_from_hm3(hm3_val)
+            if prom is None:
+                return
+            rows.append({
+                "Embalse": embalse,
+                "Salida / uso de agua": salida,
+                "Prom hm³/d": prom["hm3"],
+                "Prom cfs": prom["cfs"],
+                "Prom m³/s": prom["m3s"],
+                "Fuente": "App calculado",
             })
 
         salidas_embalse_rows = []
         # Alhajuela / Madden
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Generación Madden", [("gen_mad_hm3", None)])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Potabilización", [("mun_m_hm3", "mun_m")])
-        _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Fugas", [("leak_m_hm3", "leak_m")])
+        _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Fugas", [("leak_m_hm3", "leak_m", True)])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Vertido Madden", [(None, "vert_m")])
-        _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Evaporación", [("evap_alh_hm3", None)])
+        _agregar_salida_embalse_app(salidas_embalse_rows, "Alhajuela", "Evaporación", evap_alh)
 
         # Gatún: si existen PNX/NPX separados se muestran por separado; si no, se usa total de esclusajes.
         _hay_pnx_npx_lkh = any(c in dv and dv[c].notna().sum() > 0 for c in ["pnx_hm3", "npx_hm3"])
@@ -2843,9 +3172,9 @@ with tabs[9]:
             _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Esclusajes total", [(_col_total_escl, None)])
         _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Generación Gatún", [("gen_gat_hm3", None)])
         _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Potabilización", [("mun_g_hm3", "mun_g")])
-        _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Fugas", [("leak_g_hm3", "leak_g")])
+        _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Fugas", [("leak_g_hm3", "leak_g", True)])
         _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Vertido Gatún", [(None, "vert_g")])
-        _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Evaporación", [("evap_gat_hm3", None)])
+        _agregar_salida_embalse_app(salidas_embalse_rows, "Gatún", "Evaporación", evap_gat)
 
         if salidas_embalse_rows:
             df_sal_emb = pd.DataFrame(salidas_embalse_rows)
@@ -2863,19 +3192,19 @@ with tabs[9]:
                 _lkh_card(
                     "🏔️ Total Alhajuela",
                     _fmt_lkh(_tot_alh["Prom hm³/d"].iloc[0] if not _tot_alh.empty else None, "hm³/d", 2),
-                    f"{_fmt_lkh(_tot_alh['Prom cfs'].iloc[0] if not _tot_alh.empty else None, 'cfs', 0)} · salidas LakeHouse",
+                    f"{_fmt_lkh(_tot_alh['Prom cfs'].iloc[0] if not _tot_alh.empty else None, 'cfs', 0)} · LakeHouse + evap. app",
                 )
             with e2:
                 _lkh_card(
                     "🌊 Total Gatún",
                     _fmt_lkh(_tot_gat["Prom hm³/d"].iloc[0] if not _tot_gat.empty else None, "hm³/d", 2),
-                    f"{_fmt_lkh(_tot_gat['Prom cfs'].iloc[0] if not _tot_gat.empty else None, 'cfs', 0)} · salidas LakeHouse",
+                    f"{_fmt_lkh(_tot_gat['Prom cfs'].iloc[0] if not _tot_gat.empty else None, 'cfs', 0)} · LakeHouse + evap. app",
                 )
             with e3:
                 _lkh_card(
                     "💧 Total sistema",
                     _fmt_lkh(tot_sistema["Prom hm³/d"], "hm³/d", 2),
-                    f"{_fmt_lkh(tot_sistema['Prom cfs'], 'cfs', 0)} · suma por embalse",
+                    f"{_fmt_lkh(tot_sistema['Prom cfs'], 'cfs', 0)} · suma LakeHouse + evap. app",
                 )
 
             st.dataframe(df_sal_emb, use_container_width=True, hide_index=True)
@@ -2898,7 +3227,7 @@ with tabs[9]:
                 margin=dict(t=70, b=90),
             )
             st.plotly_chart(fig_sal_emb, use_container_width=True)
-            st.caption("La tabla separa las salidas del LakeHouse por embalse. En Gatún, los esclusajes se muestran como PNX/NPX cuando esas columnas están disponibles; si no, se usa el total de esclusajes.")
+            st.caption("La tabla separa las salidas por embalse. La evaporación no usa el volumen del LakeHouse; se muestra como **App calculado** a partir de la lámina y área activa del embalse.")
         else:
             st.info("No se encontraron columnas suficientes en el LakeHouse para separar las salidas por embalse.")
 
@@ -2908,9 +3237,9 @@ with tabs[9]:
             ("Potable Alhajuela", [("mun_m_hm3", "mun_m")]),
             ("Potable Gatún", [("mun_g_hm3", "mun_g")]),
             ("Potable total", [("mun_m_hm3", "mun_m"), ("mun_g_hm3", "mun_g")]),
-            ("Fugas Alhajuela", [("leak_m_hm3", "leak_m")]),
-            ("Fugas Gatún", [("leak_g_hm3", "leak_g")]),
-            ("Fugas total", [("leak_m_hm3", "leak_m"), ("leak_g_hm3", "leak_g")]),
+            ("Fugas Alhajuela", [("leak_m_hm3", "leak_m", True)]),
+            ("Fugas Gatún", [("leak_g_hm3", "leak_g", True)]),
+            ("Fugas total", [("leak_m_hm3", "leak_m", True), ("leak_g_hm3", "leak_g", True)]),
         ]
         comp_rows = []
         for etiqueta, componentes in comp_def:
@@ -2932,7 +3261,7 @@ with tabs[9]:
                 comp_rows.append(fila)
         if comp_rows:
             st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
-            st.caption("Promedios calculados con los últimos 5, 7 y 10 registros/días disponibles, priorizando columnas en hm³ cuando existan.")
+            st.caption("Promedios calculados con los últimos 5, 7 y 10 registros/días disponibles. En fugas se priorizan MCF (`leak_mad` / `leak_gat`) para evitar desajustes del campo *_hm3.")
         else:
             st.info("No se encontraron columnas de potabilización o fugas en la hoja seleccionada.")
 
@@ -3011,7 +3340,6 @@ with tabs[9]:
             ("leak_m","Fugas Alhajuela","mcf"),("leak_g","Fugas Gatún","mcf"),
             ("leak_m_hm3","Fugas Alhajuela","hm3"),("leak_g_hm3","Fugas Gatún","hm3"),
             ("vert_g","Vertido Gatún","mcf"),("vert_m","Vertido Madden","mcf"),
-            ("evap_gat_hm3","Evaporación Gatún","hm3"),("evap_alh_hm3","Evaporación Alhajuela","hm3"),
         ]
         # Evitar duplicados: si existe la versión hm3 directa, omitir la MCF
         _skip_mcf = set()
@@ -3024,11 +3352,25 @@ with tabs[9]:
                 continue
             if col_name in dv and dv[col_name].notna().sum()>0:
                 v = dv[col_name]
-                row = {"Parámetro":label}
+                row = {"Parámetro":label, "Fuente":"LakeHouse"}
                 row.update(_prom_flow(v, src))
                 sal_rows.append(row)
+
+        # Evaporación: se calcula desde el app, no desde LakeHouse.
+        for _label, _hm3_app in [("Evaporación Gatún", evap_gat), ("Evaporación Alhajuela", evap_alh)]:
+            _prom_app = _flow_prom_from_hm3(_hm3_app)
+            if _prom_app is not None:
+                sal_rows.append({
+                    "Parámetro": _label,
+                    "Fuente": "App calculado",
+                    "Prom hm³/d": _prom_app["hm3"],
+                    "Prom cfs": _prom_app["cfs"],
+                    "Prom m³/s": _prom_app["m3s"],
+                })
+
         if sal_rows:
             st.dataframe(pd.DataFrame(sal_rows), use_container_width=True, hide_index=True)
+            st.caption("La evaporación se excluye de los campos de volumen del LakeHouse y se calcula con el app.")
 
         # --- Generación ---
         st.markdown("#### ⚡ Generación hidroeléctrica")
