@@ -863,7 +863,13 @@ def _lkh_sidebar_source():
     try:
         candidatos = _buscar_lakehouse_local()
         if candidatos:
-            path = candidatos[0]
+            # Si el usuario seleccionó un LakeHouse local en la pestaña 📂 Datos Lake House,
+            # se respeta esa selección; si no, se usa el archivo local más reciente.
+            seleccion_local = st.session_state.get("lkh_local_path_select")
+            if seleccion_local and os.path.exists(str(seleccion_local)):
+                path = str(seleccion_local)
+            else:
+                path = candidatos[0]
             try:
                 stat = os.stat(path)
                 return path, f"local:{os.path.abspath(path)}:{stat.st_mtime_ns}:{stat.st_size}"
@@ -2570,24 +2576,57 @@ with tabs[9]:
         return df
 
     lf = _buscar_lakehouse_local(); dl = None
-    if lf:
-        try:
-            hs = pd.ExcelFile(lf[0]).sheet_names
-            hojas_validas = [x for x in hs if x not in ["Sheet1","Para BalanceH"]] or hs
-            hoja = st.selectbox("Hoja",hojas_validas) if len(hojas_validas)>1 else hojas_validas[0]
-            dl = cargar_lkh(lf[0],hoja)
-            st.success(f"✅ {len(dl):,} registros · {dl['fecha'].min().date()} → {dl['fecha'].max().date()}")
-        except Exception as e: st.error(str(e))
+
+    # La pestaña siempre permite subir un LakeHouse, aun cuando exista uno local.
+    # Prioridad de uso: archivo subido por el usuario → archivo local seleccionado → archivo local más reciente.
+    fl = st.file_uploader(
+        "Sube LakeHouse (xlsx) opcional",
+        type=["xlsx"],
+        key="lk",
+        help=(
+            "Si cargas un archivo aquí, el app lo usará con prioridad. "
+            "Si no cargas nada, usará automáticamente el LakeHouse local detectado junto al app."
+        ),
+    )
+
+    fuente_lkh = None
+    fuente_txt = ""
+    if fl is not None:
+        fuente_lkh = fl
+        fuente_txt = f"archivo subido: {getattr(fl, 'name', 'LakeHouse.xlsx')}"
+    elif lf:
+        if len(lf) > 1:
+            sel_local = st.selectbox(
+                "Archivo LakeHouse local detectado",
+                options=lf,
+                format_func=lambda x: os.path.basename(str(x)),
+                key="lkh_local_path_select",
+                help="Se usará este archivo local como base del LakeHouse."
+            )
+        else:
+            sel_local = lf[0]
+            st.session_state.setdefault("lkh_local_path_select", sel_local)
+        fuente_lkh = sel_local
+        fuente_txt = f"archivo local: {os.path.basename(str(sel_local))}"
     else:
-        fl = st.file_uploader("Sube LakeHouse (xlsx)",type=["xlsx"],key="lk")
-        if fl:
-            try:
-                fl.seek(0); xls=pd.ExcelFile(fl)
-                hojas_validas=[x for x in xls.sheet_names if x not in ["Sheet1","Para BalanceH"]] or xls.sheet_names
-                hoja=st.selectbox("Hoja",hojas_validas) if len(hojas_validas)>1 else hojas_validas[0]
-                fl.seek(0); dl=cargar_lkh(fl,hoja)
-                st.success(f"✅ {len(dl):,} registros · {dl['fecha'].min().date()} → {dl['fecha'].max().date()}")
-            except Exception as e: st.error(str(e))
+        st.info("No se detectó un LakeHouse local. Puede subir uno en el selector anterior.")
+
+    if fuente_lkh is not None:
+        try:
+            if hasattr(fuente_lkh, "seek"):
+                fuente_lkh.seek(0)
+            xls = pd.ExcelFile(fuente_lkh)
+            hojas_validas = [x for x in xls.sheet_names if x not in ["Sheet1", "Para BalanceH"]] or xls.sheet_names
+            hoja = st.selectbox("Hoja", hojas_validas, key="lkh_sheet") if len(hojas_validas) > 1 else hojas_validas[0]
+            if hasattr(fuente_lkh, "seek"):
+                fuente_lkh.seek(0)
+            dl = cargar_lkh(fuente_lkh, hoja)
+            st.success(
+                f"✅ Usando {fuente_txt} · {len(dl):,} registros · "
+                f"{dl['fecha'].min().date()} → {dl['fecha'].max().date()}"
+            )
+        except Exception as e:
+            st.error(str(e))
 
     if dl is not None and len(dl)>0:
         total_dias = (dl["fecha"].max()-dl["fecha"].min()).days
@@ -2614,16 +2653,34 @@ with tabs[9]:
 
         # ── Resumen rápido: métricas clave ──────────────────────────────────────
         st.markdown("---")
-        lk1,lk2,lk3,lk4,lk5,lk6 = st.columns(6)
+        lk1, lk2, lk3, lk4, lk5 = st.columns(5)
         if "nv_g" in dl and pd.notna(ultimo_reg.get("nv_g", np.nan)):
             lk1.metric("Nivel Gatún (último día)", f"{ultimo_reg['nv_g']:.2f} ft")
         if "nv_a" in dl and pd.notna(ultimo_reg.get("nv_a", np.nan)):
             lk2.metric("Nivel Alhajuela (último día)", f"{ultimo_reg['nv_a']:.2f} ft")
-        if "n_pnx_r" in dv: lk3.metric(f"PNX/d ({dias_sel}d)",f"{dv['n_pnx_r'].mean():.1f}")
-        if "n_npx_r" in dv: lk4.metric(f"NPX/d ({dias_sel}d)",f"{dv['n_npx_r'].mean():.1f}")
-        if "total_hm3" in dv: lk5.metric(f"Consumo ({dias_sel}d)",f"{dv['total_hm3'].mean():.2f} hm³/d")
-        if "total_escl_hm3" in dv: lk6.metric(f"Total escl ({dias_sel}d)",f"{dv['total_escl_hm3'].mean():.2f} hm³/d")
-        st.caption("Los niveles corresponden al último día disponible; PNX y NPX son el promedio de tránsitos entre complejos, no la suma; los consumos corresponden al promedio del período seleccionado.")
+        if "n_pnx_r" in dv:
+            lk3.metric(f"PNX/d ({dias_sel}d)", f"{dv['n_pnx_r'].mean():.1f}")
+        if "n_npx_r" in dv:
+            lk4.metric(f"NPX/d ({dias_sel}d)", f"{dv['n_npx_r'].mean():.1f}")
+
+        # Evita duplicar la misma demanda de esclusajes cuando el LakeHouse trae
+        # tanto total_hm3 calculado como total_escl_hm3 directo. Se muestra una sola tarjeta.
+        _cons_escl = None
+        _cons_escl_fuente = ""
+        if "total_hm3" in dv and dv["total_hm3"].notna().sum() > 0:
+            _cons_escl = float(pd.to_numeric(dv["total_hm3"], errors="coerce").mean())
+            _cons_escl_fuente = "PNX + NPX"
+        elif "total_escl_hm3" in dv and dv["total_escl_hm3"].notna().sum() > 0:
+            _cons_escl = float(pd.to_numeric(dv["total_escl_hm3"], errors="coerce").mean())
+            _cons_escl_fuente = "Total escl. LakeHouse"
+        if _cons_escl is not None:
+            lk5.metric(f"Consumo esclusajes ({dias_sel}d)", f"{_cons_escl:.2f} hm³/d")
+
+        st.caption(
+            "Los niveles corresponden al último día disponible; PNX y NPX son el promedio de tránsitos entre complejos, no la suma; "
+            f"el consumo de esclusajes se muestra una sola vez y corresponde al promedio del período seleccionado"
+            f"{(' · fuente: ' + _cons_escl_fuente) if _cons_escl_fuente else ''}."
+        )
 
         # ── Promedios operativos por categoría ──────────────────────────────────
         st.markdown("---")
