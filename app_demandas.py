@@ -1218,7 +1218,9 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                 "fug_g_hm3": _find(header_l, exact=["leak_gat_hm3"]),
                 "fug_m_mcf": _find(header_l, exact=["leak_mad"]),
                 "fug_g_mcf": _find(header_l, exact=["leak_gat"]),
-                "vert_m_mcf": _find(header_l, exact=["madspill"]),
+                # madspill corresponde a compuertas de fondo Madden en cfs.
+                # No convertirlo como MCF/MPC para evitar inflar el vertido.
+                "vert_m_cfs": _find(header_l, exact=["madspill"]),
                 "vert_g_mcf": _find(header_l, exact=["gatspill"]),
                 "evap_m_hm3": _find(header_l, exact=["vol_evap_ala_hm3"]),
                 "evap_g_hm3": _find(header_l, exact=["vol_evap_gat_hm3"]),
@@ -1262,6 +1264,24 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                         return mcf * MCF_TO_CFS_LOCAL * CFS2HM3
                 return None
 
+            def _hm3_component_cfs(cfs_keys=None):
+                """Convierte columnas LakeHouse que ya vienen en cfs a hm³/día.
+
+                Se usa para madspill / compuertas de fondo Madden.
+                No aplica conversión MCF/MPC porque eso infla el valor.
+                """
+                cfs_keys = cfs_keys or []
+                vals_cfs = []
+                for r in ult:
+                    vals = [_num(r.get(k)) for k in cfs_keys]
+                    vals = [v for v in vals if v is not None]
+                    if vals:
+                        vals_cfs.append(sum(vals))
+                cfs = _mean(vals_cfs)
+                if cfs is not None:
+                    return cfs * CFS2HM3
+                return None
+
             def _hm3_component_mcf_first(mcf_keys=None, hm3_keys=None, max_hm3=None):
                 """Primero MCF/MPC por día del LakeHouse; hm³/día solo como respaldo validado."""
                 mcf_keys = mcf_keys or []
@@ -1294,7 +1314,7 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                 {"Embalse": "Alhajuela / Madden", "Uso": "Generación Madden", "hm3": _hm3_component(["gen_mad_hm3"])},
                 {"Embalse": "Alhajuela / Madden", "Uso": "Potabilización", "hm3": _hm3_component_mcf_first(["pot_m_mcf"], ["pot_m_hm3"], max_hm3=3.0)},
                 {"Embalse": "Alhajuela / Madden", "Uso": "Fugas", "hm3": _hm3_component_mcf_first(["fug_m_mcf"], ["fug_m_hm3"], max_hm3=1.5)},
-                {"Embalse": "Alhajuela / Madden", "Uso": "Vertido Madden", "hm3": _hm3_component([], ["vert_m_mcf"])},
+                {"Embalse": "Alhajuela / Madden", "Uso": "Vertido Madden fondo", "hm3": _hm3_component_cfs(["vert_m_cfs"])},
                 {"Embalse": "Alhajuela / Madden", "Uso": "Evaporación", "hm3": _hm3_component(["evap_m_hm3"])},
                 {"Embalse": "Gatún", "Uso": "Esclusajes PNX", "hm3": _hm3_component(["gat_hm3", "pm_hm3"], ["gat_mcf", "pm_mcf"])},
                 {"Embalse": "Gatún", "Uso": "Esclusajes NPX", "hm3": _hm3_component(["acl_hm3", "ccl_hm3"], ["acl_mcf", "ccl_mcf"])},
@@ -2864,6 +2884,11 @@ with tabs[9]:
                 df["pnx_hm3"]=df["pnx_m"]*MCF_TO_CFS*CFS2HM3
                 df["npx_hm3"]=df["npx_m"]*MCF_TO_CFS*CFS2HM3
                 df["total_hm3"]=df["pnx_hm3"]+df["npx_hm3"]
+
+            # madspill = vertido por compuertas de fondo Madden en cfs.
+            # Se convierte directamente de cfs a hm³/día; NO es MCF/MPC.
+            if "vert_m" in df:
+                df["vert_m_hm3"] = pd.to_numeric(df["vert_m"], errors="coerce") * CFS2HM3
         # Tránsitos diarios por tipo de esclusaje:
         # se usa el PROMEDIO entre complejos y no la suma, para evitar duplicar el tránsito
         # cuando el mismo buque pasa por ambos complejos del sistema Panamax o NeoPanamax.
@@ -3159,7 +3184,7 @@ with tabs[9]:
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Generación Madden", [("gen_mad_hm3", None)])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Potabilización", [("mun_m_hm3", "mun_m")])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Fugas", [("leak_m_hm3", "leak_m", True)])
-        _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Vertido Madden", [(None, "vert_m")])
+        _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Vertido Madden fondo", [("vert_m_hm3", None)])
         _agregar_salida_embalse_app(salidas_embalse_rows, "Alhajuela", "Evaporación", evap_alh)
 
         # Gatún: si existen PNX/NPX separados se muestran por separado; si no, se usa total de esclusajes.
@@ -3339,7 +3364,7 @@ with tabs[9]:
             ("mun_m_hm3","Potable Alhajuela","hm3"),("mun_g_hm3","Potable Gatún","hm3"),
             ("leak_m","Fugas Alhajuela","mcf"),("leak_g","Fugas Gatún","mcf"),
             ("leak_m_hm3","Fugas Alhajuela","hm3"),("leak_g_hm3","Fugas Gatún","hm3"),
-            ("vert_g","Vertido Gatún","mcf"),("vert_m","Vertido Madden","mcf"),
+            ("vert_g","Vertido Gatún","mcf"),("vert_m_hm3","Vertido Madden fondo","hm3"),
         ]
         # Evitar duplicados: si existe la versión hm3 directa, omitir la MCF
         _skip_mcf = set()
@@ -3370,7 +3395,7 @@ with tabs[9]:
 
         if sal_rows:
             st.dataframe(pd.DataFrame(sal_rows), use_container_width=True, hide_index=True)
-            st.caption("La evaporación se excluye de los campos de volumen del LakeHouse y se calcula con el app.")
+            st.caption("La evaporación se excluye de los campos de volumen del LakeHouse y se calcula con el app. El vertido Madden `madspill` se interpreta como cfs directo.")
 
         # --- Generación ---
         st.markdown("#### ⚡ Generación hidroeléctrica")
