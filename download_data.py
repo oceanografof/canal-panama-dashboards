@@ -34,11 +34,51 @@ BASE_URL = (
     "&Datasets%5B3%5D.Calculation=Aggregate&Datasets%5B3%5D.UnitId=170"
 )
 
+# Series adicionales solicitadas. Se mantienen como BulkExport separados para respetar
+# sus parámetros originales: Months6, PointsAsRecorded, TimeAligned=True y unidades.
+EXTRA_URLS = [
+    (
+        "https://panama.aquaticinformatics.net/Export/BulkExport"
+        "?DateRange=Months6&TimeZone=-5&Calendar=CALENDARYEAR"
+        "&Interval=PointsAsRecorded&Step=1&ExportFormat=csv&TimeAligned=True"
+        "&RoundData=True&IncludeGradeCodes=undefined&IncludeApprovalLevels=undefined"
+        "&IncludeQualifiers=undefined&IncludeInterpolationTypes=False&IncludeNotes=undefined"
+        "&Datasets%5B0%5D.DatasetName=Discharge.AT_GAT_Diario%40TstCHCP_AT"
+        "&Datasets%5B0%5D.Calculation=Instantaneous&Datasets%5B0%5D.UnitId=218"
+        "&_=1780498979073"
+    ),
+    (
+        "https://panama.aquaticinformatics.net/Export/BulkExport"
+        "?DateRange=Months6&TimeZone=-5&Calendar=CALENDARYEAR"
+        "&Interval=PointsAsRecorded&Step=1&ExportFormat=csv&TimeAligned=True"
+        "&RoundData=True&IncludeGradeCodes=undefined&IncludeApprovalLevels=undefined"
+        "&IncludeQualifiers=undefined&IncludeInterpolationTypes=False&IncludeNotes=undefined"
+        "&Datasets%5B0%5D.DatasetName=Discharge.ATotal_ALHA_tst%40TstCHCP_AT"
+        "&Datasets%5B0%5D.Calculation=Instantaneous&Datasets%5B0%5D.UnitId=218"
+        "&_=1780499004555"
+    ),
+    (
+        "https://panama.aquaticinformatics.net/Export/BulkExport"
+        "?DateRange=Months6&TimeZone=-5&Calendar=CALENDARYEAR"
+        "&Interval=PointsAsRecorded&Step=1&ExportFormat=csv&TimeAligned=True"
+        "&RoundData=True&IncludeGradeCodes=undefined&IncludeApprovalLevels=undefined"
+        "&IncludeQualifiers=undefined&IncludeInterpolationTypes=False&IncludeNotes=undefined"
+        "&Datasets%5B0%5D.DatasetName=Lake-Res%20elevation.Telem%20AVG%40GAT"
+        "&Datasets%5B0%5D.Calculation=Instantaneous&Datasets%5B0%5D.UnitId=70"
+        "&_=1780499075754"
+    ),
+]
+
+DOWNLOAD_URLS = [BASE_URL] + EXTRA_URLS
+
 DATASET_MAP = [
     {"keywords": ["LAN WT AVG","LAN_WT"],  "name": "LAN_WT_AVG_AMA",     "label": "Temp LAN WT AVG @ AMA"},
     {"keywords": ["Telemetria","TEMP@AMA"],"name": "Telemetria_TEMP_AMA", "label": "Temp Telemetría @ AMA"},
     {"keywords": ["WS AVG@LMB","WS_AVG"],  "name": "WS_AVG_LMB",         "label": "Viento WS AVG @ LMB"},
     {"keywords": ["LAN WS AVG","LAN_WS"],  "name": "LAN_WS_AVG_FLC",     "label": "Viento LAN WS AVG @ FLC"},
+    {"keywords": ["AT_GAT_Diario", "AT_GAT_DIARIO", "AT GAT Diario"], "name": "Discharge_AT_GAT_Diario", "label": "Caudal AT GAT Diario @ TstCHCP_AT"},
+    {"keywords": ["ATotal_ALHA_tst", "ATOTAL_ALHA_TST", "ATotal ALHA tst"], "name": "Discharge_ATotal_ALHA_tst", "label": "Caudal ATotal ALHA tst @ TstCHCP_AT"},
+    {"keywords": ["Lake-Res", "Lake_Res", "Lake Res", "Lake-Res elevation", "elevation.Telem", "elevation_Telem", "Telem AVG@GAT", "Telem_AVG@GAT"], "name": "Lake_Res_elevation_Telem_AVG_GAT", "label": "Nivel Lake-Res Telem AVG @ GAT"},
 ]
 
 TIMEOUT_CONN = 300
@@ -325,7 +365,7 @@ def normalize_csv(text: str) -> str:
 
     h = [x.lower() for x in split_row(header)]
     ts_kw  = ("time", "stamp", "fecha", "iso", "utc", "start", "inicio")
-    val_kw = ("value", "valor", "°c", "degc", "m/s", "ft", "temp", "wind", "speed", "nivel")
+    val_kw = ("value", "valor", "°c", "degc", "m/s", "ft", "cfs", "cms", "temp", "wind", "speed", "nivel", "level", "elevation", "discharge", "caudal")
     ts_cols  = [i for i, x in enumerate(h) if any(k in x for k in ts_kw)]
     val_cols = [i for i, x in enumerate(h) if any(k in x for k in val_kw)]
     if not ts_cols:
@@ -464,25 +504,27 @@ def main() -> None:
         print(f"\n❌ Error de Git: {e}")
         sys.exit(1)
 
+    csv_map = {}
     try:
         print("\n[1/4] Descargando BulkExport...")
-        raw_bytes = download_bytes(BASE_URL)
+        for idx, url in enumerate(DOWNLOAD_URLS, start=1):
+            print(f"\n  BulkExport {idx}/{len(DOWNLOAD_URLS)}")
+            raw_bytes = download_bytes(url)
+            is_zip = raw_bytes[:2] == b"PK"
+            print(f"\n  Formato: {'ZIP ✅' if is_zip else 'texto plano (inesperado)'}")
+            if not is_zip:
+                (OUTPUT_DIR / f"_raw_{idx}.bin").write_bytes(raw_bytes)
+                print(f"  Guardado como _raw_{idx}.bin para diagnóstico.")
+                sys.exit(1)
+
+            print("\n[2/4] Extrayendo CSVs del ZIP...")
+            try:
+                csv_map.update(extract_csvs_from_zip(raw_bytes))
+            except zipfile.BadZipFile as e:
+                print(f"\n❌ ZIP inválido: {e}")
+                sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")
-        sys.exit(1)
-
-    is_zip = raw_bytes[:2] == b"PK"
-    print(f"\n  Formato: {'ZIP ✅' if is_zip else 'texto plano (inesperado)'}")
-    if not is_zip:
-        (OUTPUT_DIR / "_raw.bin").write_bytes(raw_bytes)
-        print("  Guardado como _raw.bin para diagnóstico.")
-        sys.exit(1)
-
-    print("\n[2/4] Extrayendo CSVs del ZIP...")
-    try:
-        csv_map = extract_csvs_from_zip(raw_bytes)
-    except zipfile.BadZipFile as e:
-        print(f"\n❌ ZIP inválido: {e}")
         sys.exit(1)
 
     print(f"\n[3/4] Normalizando y guardando en: {OUTPUT_DIR}")
