@@ -3,6 +3,7 @@ setlocal EnableExtensions DisableDelayedExpansion
 
 set "REPO=C:\Users\JFRodriguez\OneDrive - Autoridad del Canal de Panama\Documents\Doc Doctorado\Articulo 1\Borrador Articulo\nuevo\MareasTest\DATA\TuRepo"
 set "BRANCH=main"
+set "PY_SCRIPT=download_data.py"
 
 cd /d "%REPO%" || (
     echo ERROR: no se pudo entrar al repositorio.
@@ -39,9 +40,20 @@ if errorlevel 1 goto :git_error
 
 echo.
 echo [3/6] Ejecutando descarga de datos...
-python download_data.py
+echo Incluye las series adicionales solicitadas:
+echo   - Discharge_AT_GAT_Diario.csv
+echo   - Discharge_AT_ALHA_Diario.csv
+echo   - Lake_Res_elevation_Telem_AVG_GAT.csv
+
+if not exist "%PY_SCRIPT%" (
+    echo ERROR: no se encontro %PY_SCRIPT% en el repositorio.
+    echo Coloque el download_data.py actualizado en esta misma carpeta.
+    goto :git_error
+)
+
+python "%PY_SCRIPT%"
 if errorlevel 1 (
-    echo ADVERTENCIA: download_data.py termino con error.
+    echo ADVERTENCIA: %PY_SCRIPT% termino con error.
     echo Se intentara subir cualquier archivo que haya cambiado.
 )
 
