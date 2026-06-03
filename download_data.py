@@ -53,9 +53,9 @@ EXTRA_URLS = [
         "&Interval=PointsAsRecorded&Step=1&ExportFormat=csv&TimeAligned=True"
         "&RoundData=True&IncludeGradeCodes=undefined&IncludeApprovalLevels=undefined"
         "&IncludeQualifiers=undefined&IncludeInterpolationTypes=False&IncludeNotes=undefined"
-        "&Datasets%5B0%5D.DatasetName=Discharge.ATotal_ALHA_tst%40TstCHCP_AT"
+        "&Datasets%5B0%5D.DatasetName=Discharge.AT_ALHA_Diario%40TstCHCP_AT"
         "&Datasets%5B0%5D.Calculation=Instantaneous&Datasets%5B0%5D.UnitId=218"
-        "&_=1780499004555"
+        "&_=1780512828046"
     ),
     (
         "https://panama.aquaticinformatics.net/Export/BulkExport"
@@ -77,7 +77,7 @@ DATASET_MAP = [
     {"keywords": ["WS AVG@LMB","WS_AVG"],  "name": "WS_AVG_LMB",         "label": "Viento WS AVG @ LMB"},
     {"keywords": ["LAN WS AVG","LAN_WS"],  "name": "LAN_WS_AVG_FLC",     "label": "Viento LAN WS AVG @ FLC"},
     {"keywords": ["AT_GAT_Diario", "AT_GAT_DIARIO", "AT GAT Diario"], "name": "Discharge_AT_GAT_Diario", "label": "Caudal AT GAT Diario @ TstCHCP_AT"},
-    {"keywords": ["ATotal_ALHA_tst", "ATOTAL_ALHA_TST", "ATotal ALHA tst"], "name": "Discharge_ATotal_ALHA_tst", "label": "Caudal ATotal ALHA tst @ TstCHCP_AT"},
+    {"keywords": ["AT_ALHA_Diario", "AT_ALHA_DIARIO", "AT ALHA Diario"], "name": "Discharge_AT_ALHA_Diario", "label": "Caudal AT ALHA Diario @ TstCHCP_AT"},
     {"keywords": ["Lake-Res", "Lake_Res", "Lake Res", "Lake-Res elevation", "elevation.Telem", "elevation_Telem", "Telem AVG@GAT", "Telem_AVG@GAT"], "name": "Lake_Res_elevation_Telem_AVG_GAT", "label": "Nivel Lake-Res Telem AVG @ GAT"},
 ]
 
@@ -401,6 +401,13 @@ def normalize_csv(text: str) -> str:
 # ── Guardar ────────────────────────────────────────────────────────────────
 def save_and_summarize(csv_map: dict[str, str], output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Limpieza de salida anterior que ya no se descarga, para evitar confusión en /data/.
+    legacy = output_dir / "Discharge_ATotal_ALHA_tst.csv"
+    if legacy.exists():
+        legacy.unlink()
+        print(f"  🧹  Archivo anterior eliminado: {legacy.name}")
+
     saved = []
     for filename, content in csv_map.items():
         meta = match_dataset(filename)
