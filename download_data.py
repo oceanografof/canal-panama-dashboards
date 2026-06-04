@@ -1,61 +1,103 @@
 """
-download_data.py — Descarga series de tiempo de Aquatic Informatics, las normaliza,
-las guarda en /data/ y sube automáticamente los archivos nuevos o modificados al repositorio.
+download_data.py — Descarga series de tiempo de Aquatic Informatics, normaliza CSV,
+guarda solo archivos esperados en /data/ y sube cambios seguros al repositorio.
 
-Corre desde tu PC dentro de la red ACP:
+Diseñado para ejecutarse desde el repositorio local dentro de la red ACP:
     python download_data.py
+
+Medidas de seguridad incluidas:
+- No usa git add -A indiscriminado.
+- Solo agrega al commit archivos permitidos y esperados.
+- Bloquea patrones típicos de credenciales antes del commit.
+- No imprime URLs completas ni credenciales.
+- Valida dominio HTTPS permitido para descargas.
+- Limita tamaño de descarga y contenido ZIP.
+- No extrae ZIPs al disco, evitando Zip Slip.
+- Detiene el flujo si hay cambios rastreados fuera de la lista permitida.
 """
 from __future__ import annotations
 
 import csv
+import fnmatch
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import pandas as pd
 
 # ── Configuración general ──────────────────────────────────────────────────
-REPO_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_DIR = SCRIPT_DIR
 OUTPUT_DIR = REPO_DIR / "data"
 
-# Para las series nuevas de tiempo: últimos 6 meses, puntos como fueron registrados.
 TIME_SERIES_DATE_RANGE = "Months6"
 TIME_ZONE = "-5"
 CALENDAR = "CALENDARYEAR"
 
+ALLOWED_DOWNLOAD_HOSTS = {"panama.aquaticinformatics.net"}
 TIMEOUT_CONN = 300
 TIMEOUT_READ = 900
 CHUNK_SIZE = 65536
+MAX_DOWNLOAD_BYTES = 180 * 1024 * 1024        # 180 MB por BulkExport
+MAX_ZIP_FILES = 25
+MAX_ZIP_UNCOMPRESSED_BYTES = 220 * 1024 * 1024
 
-# Archivos/carpetas que se suben automáticamente al repo.
-AUTO_ADD_TARGETS = [
-    "data/",
+# Archivos raíz que pueden subirse automáticamente.
+ALLOWED_ROOT_FILES = {
     "LakeHouse_Data.xlsx",
+    "app_dss.py",
     "download_data.py",
     "actualizar.bat",
     "requirements.txt",
     ".gitignore",
-]
+}
 
-# En conflictos de rebase/pull se conserva la versión local para datos generados.
+# Nunca subir automáticamente archivos sensibles, aunque estén modificados.
+BLOCKED_PATH_PATTERNS = (
+    ".env", ".env.local", ".env.production", ".env.development",
+    "credential", "credentials", "secret", "secrets", "token", "tokens",
+    "service_account", "private_key", "id_rsa", "id_dsa", "id_ed25519",
+    ".pem", ".key", ".p12", ".pfx", ".kdbx", ".ovpn",
+)
+
+# Solo estos archivos generados se resuelven automáticamente en rebase conservando local.
+# Se evita resolver automáticamente scripts, para no sobrescribir cambios remotos importantes.
 PREFER_LOCAL_PATTERNS = (
     "LakeHouse_Data.xlsx",
     "data/",
-    "download_data.py",
-    "actualizar.bat",
 )
 
+# Archivos locales generados por la app o por descargas manuales que NO deben
+# quedarse versionados en Git. Si ya estaban rastreados, el script los retira
+# del control de Git con `git rm --cached` y deja el archivo local intacto.
+LOCAL_ONLY_GIT_PATTERNS = (
+    "dss_views.txt",
+    ".dss_views.txt",
+    ".app_state",
+    ".app_state/*",
+    "BulkExport*.csv",
+    "BulkExport-*.csv",
+)
+
+SENSITIVE_REGEXES = [
+    re.compile(r"ghp_[A-Za-z0-9_]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"-----BEGIN (?:RSA |OPENSSH |DSA |EC |)?PRIVATE KEY-----"),
+    re.compile(r"(?i)(?:password|passwd|pwd|token|api[_-]?key|secret)\s*[:=]\s*['\"][^'\"]{8,}['\"]"),
+]
+
 # ── Series a descargar ─────────────────────────────────────────────────────
-# Nota: UnitId se mantiene según lo observado en los enlaces/archivos de Aquarius.
-# Los nombres de salida quedan fijos en /data/ para que la app los pueda leer siempre igual.
 SERIES_CONFIG = [
     {
         "station": "TstCHCP_AT",
@@ -88,7 +130,20 @@ SERIES_CONFIG = [
         "time_aligned": "True",
         "out_name": "Lake_Res_elevation_Telem_AVG_GAT.csv",
         "label": "Nivel Lake-Res Telem AVG @ GAT",
-        "kind_keywords": ["Lake-Res elevation.Telem AVG", "Lake-Res", "elevation.Telem"],
+        "kind_keywords": ["Lake-Res elevation.Telem AVG@GAT", "Telem AVG@GAT", "AVG@GAT"],
+    },
+    {
+        "station": "MAD",
+        "dataset": "Lake-Res elevation.Telem Radar@MAD",
+        "calculation": "Instantaneous",
+        "unit_id": 70,
+        "interval": "PointsAsRecorded",
+        "time_aligned": "True",
+        "date_range": "Days7",
+        "calendar": "CALENDARYEAR2",
+        "out_name": "Lake_Res_elevation_Telem_Radar_MAD.csv",
+        "label": "Nivel Lake-Res Telem Radar @ MAD",
+        "kind_keywords": ["Lake-Res elevation.Telem Radar@MAD", "Telem Radar@MAD", "Radar@MAD"],
     },
     {
         "station": "AMA",
@@ -125,7 +180,6 @@ SERIES_CONFIG = [
     },
 ]
 
-# Series meteorológicas/temperatura existentes en el script anterior. Se dejan activas.
 BASE_BULK_URL = (
     "https://panama.aquaticinformatics.net/Export/BulkExport"
     "?DateRange=Custom&Period=P90D"
@@ -150,12 +204,60 @@ BASE_DATASET_MAP = [
     {"keywords": ["Wind Speed.LAN WS AVG", "LAN WS AVG", "LAN_WS"], "out_name": "LAN_WS_AVG_FLC.csv", "label": "Viento LAN WS AVG @ FLC"},
 ]
 
+EXPECTED_DATA_FILES = {m["out_name"] for m in SERIES_CONFIG} | {m["out_name"] for m in BASE_DATASET_MAP}
+
+
+@dataclass
+class GitStatusEntry:
+    xy: str
+    path: str
+
+
+def sanitize_text(text: str) -> str:
+    """Redacta posibles credenciales antes de imprimir mensajes de Git/errores."""
+    if not text:
+        return ""
+    text = re.sub(r"https://([^/@:\s]+):([^/@\s]+)@", r"https://***:***@", text)
+    text = re.sub(r"https://([^/@\s]+)@github\.com", r"https://***@github.com", text)
+    for rgx in SENSITIVE_REGEXES[:4]:
+        text = rgx.sub("***REDACTED***", text)
+    return text
+
+
+def rel_path(path: Path) -> str:
+    return path.relative_to(REPO_DIR).as_posix()
+
+
+def is_path_blocked(path: str) -> bool:
+    p = path.replace("\\", "/").lower()
+    name = Path(p).name.lower()
+    return any(pattern.lower() in p or pattern.lower() == name for pattern in BLOCKED_PATH_PATTERNS)
+
+
+def is_allowed_to_commit(path: str) -> bool:
+    p = path.replace("\\", "/")
+    if is_path_blocked(p):
+        return False
+    if "/" not in p and p in ALLOWED_ROOT_FILES:
+        return True
+    if p.startswith("data/") and Path(p).name in EXPECTED_DATA_FILES:
+        return True
+    return False
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    tmp.replace(path)
+
 
 def build_series_url(series: dict) -> str:
     params = {
-        "DateRange": TIME_SERIES_DATE_RANGE,
-        "TimeZone": TIME_ZONE,
-        "Calendar": CALENDAR,
+        "DateRange": series.get("date_range", TIME_SERIES_DATE_RANGE),
+        "TimeZone": series.get("time_zone", TIME_ZONE),
+        "Calendar": series.get("calendar", CALENDAR),
         "Interval": series.get("interval", "PointsAsRecorded"),
         "Step": "1",
         "ExportFormat": "csv",
@@ -174,8 +276,17 @@ def build_series_url(series: dict) -> str:
     return "https://panama.aquaticinformatics.net/Export/BulkExport?" + urlencode(params)
 
 
+def validate_download_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https":
+        raise ValueError("URL bloqueada: solo se permite HTTPS.")
+    if parsed.hostname not in ALLOWED_DOWNLOAD_HOSTS:
+        raise ValueError(f"URL bloqueada: dominio no permitido ({parsed.hostname}).")
+
+
 def run_git(repo_dir: Path, *cmd: str, env: dict | None = None) -> tuple[int, str, str]:
     full_env = os.environ.copy()
+    full_env.setdefault("GIT_TERMINAL_PROMPT", "0")
     if env:
         full_env.update(env)
     result = subprocess.run(
@@ -187,17 +298,60 @@ def run_git(repo_dir: Path, *cmd: str, env: dict | None = None) -> tuple[int, st
         errors="replace",
         env=full_env,
     )
-    return result.returncode, result.stdout.strip(), result.stderr.strip()
+    return result.returncode, sanitize_text(result.stdout.strip()), sanitize_text(result.stderr.strip())
 
 
 def cleanup_temp_files(repo_dir: Path) -> None:
     for pycache in repo_dir.rglob("__pycache__"):
-        shutil.rmtree(pycache, ignore_errors=True)
+        if ".git" not in pycache.parts:
+            shutil.rmtree(pycache, ignore_errors=True)
     for pyc in repo_dir.rglob("*.pyc"):
-        try:
-            pyc.unlink()
-        except OSError:
-            pass
+        if ".git" not in pyc.parts:
+            try:
+                pyc.unlink()
+            except OSError:
+                pass
+
+    # Limpieza de BulkExport crudos dejados en la raíz por descargas manuales.
+    # Los CSV normalizados esperados se conservan en /data/.
+    for raw in list(repo_dir.glob("BulkExport*.csv")) + list(repo_dir.glob("BulkExport-*.csv")):
+        if raw.is_file():
+            try:
+                raw.unlink()
+                print(f"  ✅ BulkExport crudo eliminado de la raíz: {raw.name}")
+            except OSError:
+                pass
+
+
+def path_matches_any(path: str, patterns: tuple[str, ...]) -> bool:
+    p = path.replace("\\", "/")
+    return any(fnmatch.fnmatch(p, pat) or p == pat.rstrip("/") or p.startswith(pat.rstrip("/") + "/") for pat in patterns)
+
+
+def is_local_only_path(path: str) -> bool:
+    return path_matches_any(path, LOCAL_ONLY_GIT_PATTERNS)
+
+
+def untrack_local_only_files(repo_dir: Path) -> None:
+    """Retira del control Git contadores/estado local y BulkExport crudos.
+
+    No borra los archivos del disco; solo evita que bloqueen la automatización
+    o se suban al repositorio.
+    """
+    code, out, err = run_git(repo_dir, "git", "ls-files")
+    if code != 0:
+        return
+    tracked = [line.strip().replace("\\", "/") for line in out.splitlines() if line.strip()]
+    to_untrack = sorted({p for p in tracked if is_local_only_path(p)})
+    if not to_untrack:
+        return
+    code, out, err = run_git(repo_dir, "git", "rm", "--cached", "-r", "-f", "--", *to_untrack)
+    if code == 0:
+        print("  ✅ Archivos locales retirados del control Git:")
+        for path in to_untrack:
+            print(f"    · {path}")
+    else:
+        raise RuntimeError(f"No se pudieron retirar archivos locales del control Git: {(err or out).strip()}")
 
 
 def ensure_gitignore(repo_dir: Path) -> None:
@@ -206,37 +360,32 @@ def ensure_gitignore(repo_dir: Path) -> None:
     lines = existing.splitlines()
     stripped = [line.strip() for line in lines]
     changed = False
-
-    for rule in ("__pycache__/", "*.pyc"):
+    for rule in (
+        "__pycache__/", "*.pyc", "*.tmp", "*.bak",
+        ".env", ".env.*", "*.pem", "*.key", "credentials*", "secrets*",
+        # Estado local del dashboard y BulkExport crudos no normalizados.
+        ".app_state/", "dss_views.txt", ".dss_views.txt",
+        "BulkExport*.csv", "BulkExport-*.csv",
+    ):
         if rule not in stripped:
             lines.append(rule)
             changed = True
-
-    # Si estaba bloqueando data/ o CSV, se quita para poder subir las series.
-    block_rules = {"*.csv", "data/", "/data/", "data/*"}
-    filtered = [line for line in lines if line.strip() not in block_rules]
-    if filtered != lines:
-        lines = filtered
-        changed = True
-        print("  ✅ .gitignore ajustado: data/ y CSV quedan disponibles para subir")
-
     if changed:
-        gitignore.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        atomic_write_text(gitignore, "\n".join(lines).rstrip() + "\n")
+        print("  ✅ .gitignore reforzado para temporales, credenciales y estado local")
 
 
-def git_add_existing(repo_dir: Path, targets: list[str] | tuple[str, ...] = AUTO_ADD_TARGETS) -> None:
-    """
-    Agrega al commit todos los archivos nuevos/modificados.
-
-    Primero usa git add -A para que no queden cambios locales sin preparar
-    que bloqueen git pull --rebase. Luego fuerza los targets importantes
-    como data/ por si alguna regla de .gitignore los estuviera ignorando.
-    """
-    run_git(repo_dir, "git", "add", "-A")
-    for target in targets:
-        p = repo_dir / target.rstrip("/")
-        if p.exists():
-            run_git(repo_dir, "git", "add", "-f", "--", target)
+def parse_status(status: str) -> list[GitStatusEntry]:
+    entries: list[GitStatusEntry] = []
+    for line in status.splitlines():
+        if len(line) < 4:
+            continue
+        xy = line[:2]
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        entries.append(GitStatusEntry(xy=xy, path=path.replace("\\", "/")))
+    return entries
 
 
 def git_status_short(repo_dir: Path) -> str:
@@ -244,19 +393,100 @@ def git_status_short(repo_dir: Path) -> str:
     return out.strip() if code == 0 else (err or out).strip()
 
 
+def scan_for_secrets(repo_dir: Path, paths: list[str]) -> None:
+    suspicious: list[str] = []
+    for path in paths:
+        if path.startswith("data/") or path.lower().endswith(".xlsx"):
+            continue
+        p = repo_dir / path
+        if not p.exists() or p.is_dir():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for rgx in SENSITIVE_REGEXES:
+            if rgx.search(text):
+                suspicious.append(path)
+                break
+    if suspicious:
+        joined = ", ".join(sorted(set(suspicious)))
+        raise RuntimeError(
+            "Se detectaron posibles credenciales en archivos que iban a subirse. "
+            f"Revise antes de continuar: {joined}"
+        )
+
+
+def git_add_allowed(repo_dir: Path) -> bool:
+    status = git_status_short(repo_dir)
+    entries = parse_status(status)
+    if not entries:
+        return False
+
+    allowed: list[str] = []
+    staged_local_removals: list[str] = []
+    blocked_or_unapproved: list[str] = []
+    tracked_unapproved: list[str] = []
+
+    for entry in entries:
+        path = entry.path
+        if is_allowed_to_commit(path):
+            allowed.append(path)
+            continue
+
+        # Los archivos locales retirados con git rm --cached aparecen como D.
+        # Se permite esa eliminación del repositorio, pero nunca se vuelve a
+        # agregar el archivo local al commit.
+        if is_local_only_path(path) and "D" in entry.xy:
+            staged_local_removals.append(path)
+            continue
+
+        blocked_or_unapproved.append(path)
+        # Cambios rastreados fuera de la lista permitida pueden bloquear pull --rebase.
+        if entry.xy != "??":
+            tracked_unapproved.append(path)
+
+    if blocked_or_unapproved:
+        print("  ⚠️ Archivos no autorizados para commit automático; se omiten:")
+        for path in sorted(set(blocked_or_unapproved)):
+            print(f"    · {path}")
+
+    if staged_local_removals:
+        print("  ✅ Se retirarán del repositorio archivos locales/no operativos:")
+        for path in sorted(set(staged_local_removals)):
+            print(f"    · {path}")
+
+    if tracked_unapproved:
+        raise RuntimeError(
+            "Hay archivos rastreados modificados fuera de la lista segura. "
+            "No haré commit ni rebase automático para evitar subir o sobrescribir algo sensible. "
+            "Revise estos archivos: " + ", ".join(sorted(set(tracked_unapproved)))
+        )
+
+    if not allowed and not staged_local_removals:
+        return False
+
+    scan_for_secrets(repo_dir, allowed)
+    for path in sorted(set(allowed)):
+        code, out, err = run_git(repo_dir, "git", "add", "-f", "--", path)
+        if code != 0:
+            raise RuntimeError(f"git add falló para {path}: {(err or out).strip()}")
+    return True
+
 def commit_auto_changes(repo_dir: Path, message: str) -> bool:
     cleanup_temp_files(repo_dir)
     ensure_gitignore(repo_dir)
-    git_add_existing(repo_dir)
-
-    status = git_status_short(repo_dir)
-    if not status:
-        print("  Sin cambios para commit.")
+    untrack_local_only_files(repo_dir)
+    staged_any = git_add_allowed(repo_dir)
+    if not staged_any:
+        print("  Sin cambios seguros para commit.")
         return False
 
-    print("  Cambios detectados:")
-    for line in status.splitlines():
-        print(f"    {line}")
+    code, out, err = run_git(repo_dir, "git", "diff", "--cached", "--name-only")
+    staged_files = [p.strip() for p in out.splitlines() if p.strip()] if code == 0 else []
+    print("  Cambios seguros para commit:")
+    for path in staged_files:
+        print(f"    · {path}")
 
     code, out, err = run_git(repo_dir, "git", "commit", "-m", message)
     if code != 0:
@@ -276,18 +506,13 @@ def is_prefer_local_path(path: str) -> bool:
 def resolve_generated_rebase_conflicts(repo_dir: Path) -> bool:
     status = git_status_short(repo_dir)
     conflicted = []
-    for line in status.splitlines():
-        if len(line) < 4:
-            continue
-        xy = line[:2]
-        path = line[3:].strip()
-        if any(c in xy for c in ("U", "A", "D")) and is_prefer_local_path(path):
-            conflicted.append(path)
-
+    for entry in parse_status(status):
+        if any(c in entry.xy for c in ("U", "A", "D")) and is_prefer_local_path(entry.path):
+            conflicted.append(entry.path)
     if not conflicted:
         return False
 
-    print("  ⚠️ Conflicto en archivos generados. Se conserva la versión local:")
+    print("  ⚠️ Conflicto en archivos generados. Se conserva la versión local solo para datos:")
     for path in conflicted:
         print(f"    · {path}")
         run_git(repo_dir, "git", "checkout", "--theirs", "--", path)
@@ -296,15 +521,12 @@ def resolve_generated_rebase_conflicts(repo_dir: Path) -> bool:
 
 
 def pull_rebase_with_generated_resolution(repo_dir: Path, branch: str) -> None:
-    # Debe estar limpio antes del pull. Si quedó algo local por cualquier motivo,
-    # se guarda en commit automático para evitar: "cannot pull with rebase: unstaged changes".
-    commit_auto_changes(repo_dir, f"Cambios locales antes de pull {datetime.now():%Y-%m-%d %H:%M}")
+    commit_auto_changes(repo_dir, f"Cambios seguros antes de pull {datetime.now():%Y-%m-%d %H:%M}")
 
     code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "--autostash", "origin", branch)
     if code == 0:
         return
 
-    # Compatibilidad: versiones antiguas de Git pueden no soportar --autostash en pull.
     msg0 = (out + " " + err).strip()
     if "unknown option" in msg0.lower() or "autostash" in msg0.lower():
         code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "origin", branch)
@@ -317,7 +539,7 @@ def pull_rebase_with_generated_resolution(repo_dir: Path, branch: str) -> None:
             raise RuntimeError(f"No se pudo sincronizar {branch}: {(err or out).strip()}")
         code, out, err = run_git(repo_dir, "git", "rebase", "--continue", env={"GIT_EDITOR": "true"})
         if code == 0:
-            print("  ✅ Rebase continuado después de resolver archivos generados")
+            print("  ✅ Rebase continuado después de resolver datos generados")
             return
         msg = (out + " " + err).strip()
         if "No changes" in msg or "no changes" in msg:
@@ -327,16 +549,38 @@ def pull_rebase_with_generated_resolution(repo_dir: Path, branch: str) -> None:
     raise RuntimeError("No se pudo completar el rebase automáticamente.")
 
 
+def warn_remote_credentials(repo_dir: Path) -> None:
+    code, out, err = run_git(repo_dir, "git", "remote", "get-url", "origin")
+    if code != 0:
+        return
+    raw = out.strip()
+    if re.search(r"https://[^/@:\s]+:[^/@\s]+@", raw) or re.search(r"https://[^/@\s]+@github\.com", raw):
+        print("  ⚠️ El remoto origin parece tener credenciales embebidas en la URL.")
+        print("     Recomendado: usar Git Credential Manager o SSH, no tokens dentro de la URL remota.")
+
+
 def ensure_default_branch(repo_dir: Path) -> str:
-    print("\n── Verificando rama remota ───────────────────")
+    print("\n── Verificando repositorio y rama remota ──────")
     cleanup_temp_files(repo_dir)
     ensure_gitignore(repo_dir)
+    untrack_local_only_files(repo_dir)
 
     code, out, err = run_git(repo_dir, "git", "rev-parse", "--is-inside-work-tree")
     if code != 0 or out.strip().lower() != "true":
         raise RuntimeError("Esta carpeta no parece ser un repositorio Git.")
 
-    code, out, err = run_git(repo_dir, "git", "fetch", "origin")
+    code, top, err = run_git(repo_dir, "git", "rev-parse", "--show-toplevel")
+    if code == 0:
+        top_path = Path(top).resolve()
+        if top_path != repo_dir.resolve():
+            raise RuntimeError(
+                f"El script está en {repo_dir}, pero la raíz Git es {top_path}. "
+                "Coloque download_data.py y actualizar.bat en la raíz del repositorio."
+            )
+
+    warn_remote_credentials(repo_dir)
+
+    code, out, err = run_git(repo_dir, "git", "fetch", "origin", "--prune")
     if code != 0:
         raise RuntimeError(f"No se pudo hacer git fetch origin: {(err or out).strip()}")
 
@@ -371,7 +615,7 @@ def ensure_default_branch(repo_dir: Path) -> str:
             raise RuntimeError(f"No se pudo cambiar a {default_branch}: {(err or out).strip()}")
         print(f"  ✅ Cambiado a la rama {default_branch}")
 
-    commit_auto_changes(repo_dir, f"Cambios locales antes de sincronizar {datetime.now():%Y-%m-%d %H:%M}")
+    commit_auto_changes(repo_dir, f"Cambios seguros antes de sincronizar {datetime.now():%Y-%m-%d %H:%M}")
     pull_rebase_with_generated_resolution(repo_dir, default_branch)
     print(f"  ✅ Rama {default_branch} sincronizada con origin/{default_branch}")
     return default_branch
@@ -379,13 +623,14 @@ def ensure_default_branch(repo_dir: Path) -> str:
 
 # ── Descarga ───────────────────────────────────────────────────────────────
 def download_bytes(url: str) -> bytes:
+    validate_download_url(url)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "*/*",
+        "Accept": "text/csv,application/zip,*/*",
     }
     req = urllib.request.Request(url, headers=headers)
     chunks, total, t0 = [], 0, time.time()
-    print("  Conectando...", flush=True)
+    print("  Conectando al servidor autorizado...", flush=True)
     with urllib.request.urlopen(req, timeout=TIMEOUT_CONN) as resp:
         print(f"  HTTP {resp.status}")
         print("  Descargando", end="", flush=True)
@@ -396,8 +641,10 @@ def download_bytes(url: str) -> bytes:
             chunk = resp.read(CHUNK_SIZE)
             if not chunk:
                 break
-            chunks.append(chunk)
             total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(f"Descarga bloqueada: supera {MAX_DOWNLOAD_BYTES / 1024 / 1024:.0f} MB")
+            chunks.append(chunk)
             print(".", end="", flush=True)
     print(f" {total / 1024:.0f} KB en {time.time() - t0:.1f}s")
     return b"".join(chunks)
@@ -413,20 +660,28 @@ def decode_bytes(raw: bytes) -> str:
 
 
 def extract_csv_payloads(raw_bytes: bytes, fallback_name: str) -> dict[str, str]:
-    """Acepta ZIP de Aquarius o CSV plano."""
     results: dict[str, str] = {}
     if raw_bytes[:2] == b"PK":
         print("  Formato: ZIP ✅")
         with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
-            names = zf.namelist()
-            print(f"  Archivos en el ZIP ({len(names)}):")
-            for name in names:
+            infos = zf.infolist()
+            if len(infos) > MAX_ZIP_FILES:
+                raise RuntimeError(f"ZIP bloqueado: contiene demasiados archivos ({len(infos)}).")
+            total_size = sum(i.file_size for i in infos)
+            if total_size > MAX_ZIP_UNCOMPRESSED_BYTES:
+                raise RuntimeError("ZIP bloqueado: tamaño descomprimido demasiado grande.")
+            print(f"  Archivos en el ZIP ({len(infos)}):")
+            for info in infos:
+                name = Path(info.filename).name
+                if not name.lower().endswith(".csv"):
+                    print(f"    · {name} omitido: no es CSV")
+                    continue
                 print(f"    · {name}")
-                with zf.open(name) as f:
+                with zf.open(info) as f:
                     results[name] = decode_bytes(f.read())
     else:
         print("  Formato: CSV/texto plano ✅")
-        results[fallback_name] = decode_bytes(raw_bytes)
+        results[Path(fallback_name).name] = decode_bytes(raw_bytes)
     return results
 
 
@@ -441,13 +696,13 @@ def match_dataset(filename: str, content: str) -> dict | None:
     target_upper = target.upper()
 
     for meta in SERIES_CONFIG:
-        # Primero exige el nombre de dataset o una palabra clave específica.
-        # No basta con la estación, porque GAT y ALHA comparten TstCHCP_AT.
         specific_keywords = list(meta.get("kind_keywords", [])) + [meta["dataset"]]
         if text_has_any(target, specific_keywords):
-            # Para mareógrafos se confirma también la estación correcta.
-            if "Tide Height" in meta["dataset"]:
-                if meta["station"].upper() not in target_upper:
+            # Confirmar estación en series donde varios sensores comparten palabras similares.
+            # Esto evita que MAD se confunda con GAT solo por contener "Lake-Res elevation".
+            if ("Tide Height" in meta["dataset"] or "Lake-Res" in meta["dataset"]):
+                station_token = f"@{meta['station']}".upper()
+                if station_token not in target_upper:
                     continue
             return meta
 
@@ -476,7 +731,6 @@ def parse_float(value: str) -> float | None:
     value = value.strip().strip('"').strip("'")
     if not value or value.lower() in {"nan", "null", "none", "--"}:
         return None
-    # Maneja decimales con coma cuando no hay punto decimal.
     clean = value.replace(" ", "")
     if "," in clean and "." not in clean:
         clean = clean.replace(",", ".")
@@ -514,7 +768,14 @@ def normalize_csv(text: str) -> str:
         value = parse_float(value_raw)
         if not timestamp or value is None:
             continue
-        rows.append((timestamp, timestamp, value))
+
+        # Evita fórmulas si alguien abre el CSV en Excel.
+        # Se conserva el sello de tiempo de Aquarius, pero se rechaza si empieza
+        # con caracteres de fórmula y se limpian saltos/tabulaciones.
+        safe_timestamp = timestamp.replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
+        if safe_timestamp[:1] in {"=", "+", "-", "@"}:
+            continue
+        rows.append((safe_timestamp, safe_timestamp, value))
 
     output = io.StringIO()
     writer = csv.writer(output, lineterminator="\n")
@@ -525,8 +786,9 @@ def normalize_csv(text: str) -> str:
 
 def save_and_summarize(csv_map: dict[str, str], output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir.resolve().parent != REPO_DIR.resolve():
+        raise RuntimeError("La carpeta data debe estar directamente dentro del repositorio.")
 
-    # Limpieza de nombres viejos/incorrectos para no confundir la app.
     for legacy_name in ("Discharge_ATotal_ALHA_tst.csv",):
         legacy = output_dir / legacy_name
         if legacy.exists():
@@ -535,25 +797,36 @@ def save_and_summarize(csv_map: dict[str, str], output_dir: Path) -> list[Path]:
 
     saved: list[Path] = []
     seen_names: set[str] = set()
+    skipped_empty: dict[str, int] = {}
 
     for filename, content in csv_map.items():
         meta = match_dataset(filename, content)
         if meta is None:
-            print(f"  ⚠️ No se reconoció la serie: {filename}")
+            # Se omite sin ruido para evitar alertas falsas por CSVs no relacionados.
             continue
 
         norm = normalize_csv(content)
+        out_name = Path(meta["out_name"]).name
+        if out_name not in EXPECTED_DATA_FILES:
+            raise RuntimeError(f"Nombre de salida no autorizado: {out_name}")
+
         if not norm or norm.count("\n") < 1:
-            print(f"  ⚠️ {meta['label']}: sin datos válidos.")
+            skipped_empty[meta["label"]] = skipped_empty.get(meta["label"], 0) + 1
             continue
 
-        out_name = meta["out_name"]
         path = output_dir / out_name
-        path.write_text(norm + "\n", encoding="utf-8")
+        if path.resolve().parent != output_dir.resolve():
+            raise RuntimeError(f"Ruta de salida insegura: {path}")
+
+        atomic_write_text(path, norm + "\n")
         n = norm.count("\n")
         print(f"  ✅ {meta['label']}: {n} registros → {out_name}")
         saved.append(path)
         seen_names.add(out_name)
+
+    for label, count in sorted(skipped_empty.items()):
+        if count:
+            print(f"  ℹ️ {label}: {count} archivo(s) sin datos válidos omitidos; se usó el archivo válido si aparece arriba.")
 
     missing = [m["out_name"] for m in SERIES_CONFIG if m["out_name"] not in seen_names]
     if missing:
@@ -578,7 +851,7 @@ def print_summary(saved: list[Path]) -> None:
             else:
                 print(f"  {path.name:<40} {n:>8} registros  {first:%Y-%m-%d} → {last:%Y-%m-%d %H:%M}")
         except Exception as e:
-            print(f"  {path.name}: error leyendo resumen ({e})")
+            print(f"  {path.name}: error leyendo resumen ({sanitize_text(str(e))})")
 
 
 # ── Git push ───────────────────────────────────────────────────────────────
@@ -587,7 +860,7 @@ def git_push(repo_dir: Path, branch: str) -> bool:
     try:
         commit_auto_changes(repo_dir, f"Actualiza series de tiempo {datetime.now():%Y-%m-%d %H:%M}")
     except Exception as e:
-        print(f"  ❌ git commit falló: {e}")
+        print(f"  ❌ git commit bloqueado: {sanitize_text(str(e))}")
         return False
 
     code, out, err = run_git(repo_dir, "git", "push", "origin", branch)
@@ -597,12 +870,12 @@ def git_push(repo_dir: Path, branch: str) -> bool:
         try:
             pull_rebase_with_generated_resolution(repo_dir, branch)
         except Exception as e:
-            print(f"  ❌ No se pudo sincronizar automáticamente: {e}")
+            print(f"  ❌ No se pudo sincronizar automáticamente: {sanitize_text(str(e))}")
             return False
         code, out, err = run_git(repo_dir, "git", "push", "origin", branch)
         if code != 0:
             print(f"  ❌ git push falló:\n    {err or out}")
-            print("  → Revise token de GitHub, permisos o protección de rama.")
+            print("  → Revise permisos, Git Credential Manager, token/SSH o protección de rama.")
             return False
 
     print(f"  ✅ git push OK hacia origin/{branch}")
@@ -612,14 +885,14 @@ def git_push(repo_dir: Path, branch: str) -> bool:
 
 def main() -> None:
     print("=" * 60)
-    print("  Descarga de series de tiempo — Aquatic Informatics / ACP")
+    print("  Descarga segura de series de tiempo — Aquarius / GitHub")
     print(f"  {datetime.now():%Y-%m-%d %H:%M:%S}")
     print("=" * 60)
 
     try:
         branch = ensure_default_branch(REPO_DIR)
     except Exception as e:
-        print(f"\n❌ Error de Git: {e}")
+        print(f"\n❌ Error de Git/seguridad: {sanitize_text(str(e))}")
         sys.exit(1)
 
     csv_map: dict[str, str] = {}
@@ -629,7 +902,7 @@ def main() -> None:
         raw = download_bytes(BASE_BULK_URL)
         csv_map.update(extract_csv_payloads(raw, "base_temp_wind.csv"))
     except Exception as e:
-        print(f"  ⚠️ No se pudo descargar el BulkExport base: {e}")
+        print(f"  ⚠️ No se pudo descargar el BulkExport base: {sanitize_text(str(e))}")
 
     print("\n[2/4] Descargando series de tiempo solicitadas...")
     for idx, series in enumerate(SERIES_CONFIG, start=1):
@@ -638,7 +911,7 @@ def main() -> None:
             raw = download_bytes(build_series_url(series))
             csv_map.update(extract_csv_payloads(raw, series["out_name"]))
         except Exception as e:
-            print(f"  ⚠️ No se pudo descargar {series['label']}: {e}")
+            print(f"  ⚠️ No se pudo descargar {series['label']}: {sanitize_text(str(e))}")
 
     print(f"\n[3/4] Normalizando y guardando en: {OUTPUT_DIR}")
     saved = save_and_summarize(csv_map, OUTPUT_DIR)
@@ -647,7 +920,7 @@ def main() -> None:
         sys.exit(1)
     print_summary(saved)
 
-    print("\n[4/4] Commit y push al repositorio...")
+    print("\n[4/4] Commit y push seguro al repositorio...")
     ok = git_push(REPO_DIR, branch)
     if not ok:
         sys.exit(1)

@@ -1,3 +1,16 @@
 __pycache__/
 *.pyc
 "visit_counter.json" 
+*.tmp
+*.bak
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*
+.app_state/
+dss_views.txt
+.dss_views.txt
+BulkExport*.csv
+BulkExport-*.csv

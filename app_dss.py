@@ -16,6 +16,7 @@ Ejecución (Windows):
 from __future__ import annotations
 
 import re
+import urllib.request
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -47,8 +48,19 @@ APP_TITLE   = "DSS Simulación 2026 · Embalses ACP"
 AUTHOR_NOTE = "JFRodriguez · Hidrólogo / Oceanógrafo Físico · ACP-HIMH"
 SIMULATION_NOTE = "Simulación realizada por JFRodriguez"
 PROJ_NOTE   = "Proyecciones basadas en el decenio 2015-2025."
-VIEW_FILE   = ".dss_views.txt"
+VIEW_FILE   = "dss_views.txt"
+VIEW_STATE_DIR = ".app_state"
 RADAR_URL   = "https://radar-meteorologico.delcanal.com/es.gif"
+
+# Series Aquarius que la app puede intentar cargar automáticamente.
+# La carga remota es opcional desde la barra lateral; si no hay acceso a la red
+# o Aquarius solicita autenticación, la app continúa usando los CSV locales/subidos.
+AQUARIUS_REQUIRED_SERIES_URLS: List[Tuple[str, str]] = [
+    (
+        "Lake_Res_elevation_Telem_Radar_MAD.csv",
+        "https://panama.aquaticinformatics.net/Export/BulkExport?DateRange=Days7&TimeZone=-5&Calendar=CALENDARYEAR2&Interval=PointsAsRecorded&Step=1&ExportFormat=csv&TimeAligned=True&RoundData=True&IncludeGradeCodes=undefined&IncludeApprovalLevels=undefined&IncludeQualifiers=undefined&IncludeInterpolationTypes=False&IncludeNotes=undefined&Datasets[0].DatasetName=Lake-Res%20elevation.Telem%20Radar%40MAD&Datasets[0].Calculation=Instantaneous&Datasets[0].UnitId=70&_=1780594389875",
+    ),
+]
 
 DSS_NAMES = [
     "SimulacionDSS_2026.xlsx", "SimulacionDSS_2026(3).xlsx",
@@ -136,14 +148,46 @@ def inject_css() -> None:
 # ─────────────────────────────────────────────────────────────────────
 # Contador de vistas (por sesión, persistente en archivo)
 # ─────────────────────────────────────────────────────────────────────
+def _safe_view_count_path() -> Path:
+    """Ruta segura para el contador interno de vistas.
+
+    Importante: antes se creaba `.dss_views.txt` en la carpeta principal.
+    Si otro módulo carga archivos de viento buscando `.txt`, podía intentar
+    leer ese contador como dato meteorológico. Ahora se guarda en una carpeta
+    interna oculta y, si existe el archivo antiguo, se migra y se elimina.
+    """
+    try:
+        base = Path(__file__).resolve().parent
+    except Exception:
+        base = Path.cwd().resolve()
+
+    state_dir = base / VIEW_STATE_DIR
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    new_path = state_dir / VIEW_FILE
+    legacy_path = base / ".dss_views.txt"
+
+    # Migrar el contador viejo para que no sea detectado como archivo de datos.
+    try:
+        if legacy_path.exists() and legacy_path.is_file():
+            if not new_path.exists():
+                new_path.write_text(legacy_path.read_text(encoding="utf-8", errors="ignore").strip() or "0", encoding="utf-8")
+            legacy_path.unlink(missing_ok=True)
+    except Exception:
+        # No detenemos el dashboard por un problema con el contador.
+        pass
+
+    return new_path
+
+
 def get_view_count() -> int:
     if "view_count" in st.session_state:
         return int(st.session_state["view_count"])
     try:
-        p = Path(VIEW_FILE)
-        n = int(p.read_text().strip()) if p.exists() else 0
+        p = _safe_view_count_path()
+        n = int(p.read_text(encoding="utf-8").strip()) if p.exists() else 0
         n += 1
-        p.write_text(str(n))
+        p.write_text(str(n), encoding="utf-8")
     except Exception:
         n = int(st.session_state.get("view_count", 0)) + 1
     st.session_state["view_count"] = n
@@ -173,6 +217,7 @@ def local_search_dirs() -> List[Path]:
           Discharge_AT_ALHA_Diario.csv
           Lake_Res_elevation_*GAT*.csv
           Lake_Res_elevation_*ALHA*.csv
+          Lake_Res_elevation_Telem_Radar_MAD.csv   # nivel Alhajuela/Madden
     """
     base = app_base_dir()
     candidates = [base / DATA_DIR_NAME, Path.cwd().resolve() / DATA_DIR_NAME, base, Path.cwd().resolve()]
@@ -316,8 +361,12 @@ def _detect_embalse(header_text: str, filename: str) -> str:
     t = f"{filename} {header_text}".upper()
     if any(x in t for x in ["ATOTAL_GAT", "_GAT_", "GAT_TST", "GATUN", "GATÚN", "BulkExport-GAT".upper()]):
         return "Gatún"
-    if any(x in t for x in ["ATOTAL_ALHA", "_ALHA_", "ALHA", "MADDEN", "MAD", "BulkExport-MAD".upper(),
-                              "BulkExport-TstCHCP".upper()]):
+    if any(x in t for x in [
+        "ATOTAL_ALHA", "_ALHA_", "ALHA", "MADDEN", "MAD",
+        "LAKE-RES ELEVATION.TELEM RADAR@MAD", "TELEM RADAR@MAD",
+        "LAKE_RES_ELEVATION_TELEM_RADAR_MAD",
+        "BulkExport-MAD".upper(), "BulkExport-TstCHCP".upper(),
+    ]):
         return "Alhajuela / Madden"
     if "GAT" in t and "ALH" not in t:
         return "Gatún"
@@ -497,6 +546,7 @@ def discover_local_bulk_csvs() -> List[Path]:
     - BulkExport-GAT.csv / BulkExport-MAD.csv
     - Discharge_AT_GAT_Diario.csv / Discharge_AT_ALHA_Diario.csv
     - Lake_Res_elevation_*GAT*.csv / Lake_Res_elevation_*ALHA*.csv
+    - Lake_Res_elevation_Telem_Radar_MAD.csv (nivel Alhajuela/Madden desde MAD)
     """
     patterns = [
         "BulkExport*.csv",
@@ -508,13 +558,15 @@ def discover_local_bulk_csvs() -> List[Path]:
         "*MADDEN*.csv",
         "*ALHA*.csv",
         "*ALHAJUELA*.csv",
+        "*Telem*Radar*MAD*.csv",
+        "*Lake*Res*elevation*MAD*.csv",
     ]
     seen: Dict[Path, Path] = {}
     for base in local_search_dirs():
         for pat in patterns:
             for p in base.glob(pat):
                 try:
-                    if p.exists() and p.is_file():
+                    if p.exists() and p.is_file() and not p.name.startswith("."):
                         seen[p.resolve()] = p
                 except OSError:
                     continue
@@ -538,19 +590,103 @@ def exceedance_pct(col: str) -> int:
 
 
 def ordered_percentile_map_by_value(df: pd.DataFrame, cols: List[str], ref_row: Optional[pd.Series] = None) -> Dict[str, int]:
-    """Devuelve el percentil original de cada columna DSS.
+    """Mapea columnas AP a **probabilidad de excedencia** según magnitud.
 
-    Importante: no se reetiquetan los percentiles por magnitud.
-    En aportes DSS la lógica operativa es de probabilidad de excedencia:
-    P95 suele representar una condición más seca / menor aporte y P5 una
-    condición más húmeda / mayor aporte. Por eso se conserva la etiqueta
-    original de cada columna AP del DSS.
+    Convención hidrológica usada en la app para AP:
+    - P95 = caudal bajo / condición más seca, porque se excede con mayor frecuencia.
+    - P5  = caudal alto / condición más húmeda, porque se excede con menor frecuencia.
+
+    Algunos archivos DSS traen las columnas AP como percentiles no-excedentes
+    (por ejemplo, el sufijo 95 puede venir asociado a caudal alto). Para evitar
+    que las etiquetas de probabilidad de excedencia queden invertidas, esta
+    función ordena las columnas por su valor representativo y asigna las
+    probabilidades de excedencia de mayor a menor: valor más bajo → P95,
+    valor más alto → P5. Si los sufijos originales ya están en convención de
+    excedencia, el mapeo queda igual.
     """
-    return {c: exceedance_pct(c) for c in cols if c in df.columns}
+    cols = [c for c in cols if c in df.columns]
+    if not cols:
+        return {}
+
+    # Etiquetas disponibles, tomadas de los sufijos del DSS para no inventar
+    # probabilidades que no existan en la simulación.
+    labels = sorted({exceedance_pct(c) for c in cols}, reverse=True)
+    if len(labels) != len(cols):
+        # Respaldo ante columnas duplicadas o nombres no estándar.
+        labels = sorted([exceedance_pct(c) for c in cols], reverse=True)
+
+    values: Dict[str, float] = {}
+    for c in cols:
+        v = np.nan
+        if ref_row is not None:
+            try:
+                v = pd.to_numeric(pd.Series([ref_row.get(c, np.nan)]), errors="coerce").iloc[0]
+            except Exception:
+                v = np.nan
+        if pd.isna(v):
+            try:
+                v = pd.to_numeric(df[c], errors="coerce").median()
+            except Exception:
+                v = np.nan
+        if pd.notna(v):
+            values[c] = float(v)
+
+    if not values:
+        return {c: exceedance_pct(c) for c in cols}
+
+    sorted_cols = sorted(
+        values.keys(),
+        key=lambda c: (values[c], exceedance_pct(c)),  # bajo→alto
+    )
+
+    pct_map: Dict[str, int] = {}
+    for c, pct in zip(sorted_cols, labels):
+        pct_map[c] = int(pct)
+
+    # Columnas sin valor representativo: conservar el sufijo original.
+    for c in cols:
+        pct_map.setdefault(c, exceedance_pct(c))
+    return pct_map
+
+
+def pick_percentile_column(cols: List[str], pct_ref: int, pct_map: Optional[Dict[str, int]] = None) -> Tuple[Optional[str], Optional[int]]:
+    """Selecciona la columna de percentil solicitada, con respaldo al percentil disponible más cercano.
+
+    En NP, HP, V, EG y EP se usa el sufijo de la columna DSS. En AP puede
+    recibirse un `pct_map` corregido por probabilidad de excedencia
+    (menor AP → P95; mayor AP → P5). Esto evita que Manejo/Decisión quede
+    vacío cuando el percentil seleccionado no existe para una variable.
+    """
+    valid = [c for c in cols if c is not None]
+    if not valid:
+        return None, None
+
+    def _pct(c: str) -> int:
+        if pct_map is not None:
+            return int(pct_map.get(c, exceedance_pct(c)))
+        return int(exceedance_pct(c))
+
+    exact = [c for c in valid if _pct(c) == int(pct_ref)]
+    if exact:
+        return exact[0], int(pct_ref)
+
+    # Respaldo: percentil disponible más cercano. En empate se prefiere el
+    # percentil de mayor excedencia (más conservador para condiciones secas).
+    best = min(valid, key=lambda c: (abs(_pct(c) - int(pct_ref)), -_pct(c)))
+    return best, _pct(best)
 
 
 def make_ordered_ap_columns(df: pd.DataFrame, cols: List[str], flow_unit: str, add_cfs: float = 0.0) -> Tuple[pd.DataFrame, List[str], Dict[str, int]]:
-    """Crea columnas AP conservando el percentil original del DSS."""
+    """Crea columnas AP con etiqueta corregida como probabilidad de excedencia.
+
+    Orden visual para Plotly/visor unificado:
+    - Primero se grafican las curvas más húmedas / mayor aporte: P5, P10, P20...
+    - Al final queda la curva más seca / menor aporte: P95.
+
+    Plotly muestra el cuadro flotante en el mismo orden en que se agregan las
+    trazas. Por eso aquí se devuelve el listado P5→P95, para que en el visor
+    los aportes altos queden arriba y P95 quede abajo.
+    """
     out = df.copy()
     cols = [c for c in cols if c in out.columns]
     pct_map = ordered_percentile_map_by_value(out, cols)
@@ -561,8 +697,11 @@ def make_ordered_ap_columns(df: pd.DataFrame, cols: List[str], flow_unit: str, a
         # Evita duplicados si dos columnas terminan con la misma etiqueta
         if nc in out.columns:
             nc = f"AP P{pct} {c} [{unit_label(flow_unit)}]"
-        out[nc] = convert_flow(pd.to_numeric(out[c], errors="coerce") + float(add_cfs or 0.0), flow_unit)
+        out[nc] = convert_flow(ap_total_dss_cfs(out[c], add_cfs), flow_unit)
         new_cols.append(nc)
+
+    # Orden para la leyenda/visor de Plotly: húmedo arriba (P5) → seco abajo (P95).
+    new_cols = sorted(new_cols, key=lambda c: exceedance_pct(c))
     return out, new_cols, pct_map
 
 
@@ -610,6 +749,27 @@ def scalar_to_cfs(v: float, unit: str) -> float:
     if unit == "hm³/d":
         return v / CFS_TO_HM3_DAY
     return v
+
+
+def clean_evap_cfs(evap_cfs: float) -> float:
+    """Evaporación operativa en p³/s, siempre no negativa.
+
+    Blindaje: el caudal evaporado **se suma** al AP neto DSS para estimar
+    AP total DSS. Nunca se resta, aunque llegue como valor inválido o negativo.
+    """
+    try:
+        return max(float(evap_cfs or 0.0), 0.0)
+    except Exception:
+        return 0.0
+
+
+def ap_total_dss_cfs(ap_neto_cfs, evap_cfs: float) -> pd.Series:
+    """AP total DSS estimado = AP neto DSS + caudal evaporado.
+
+    Acepta escalares o Series y retorna una Series numérica en p³/s.
+    """
+    ap = pd.to_numeric(pd.Series(ap_neto_cfs), errors="coerce")
+    return ap + clean_evap_cfs(evap_cfs)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -965,7 +1125,7 @@ def show_aporte_reservoir_metrics(
     if ap_ref is None:
         ap_ref = next((c for c in ap_cols if exceedance_pct(c) == pct_ref), ap_cols[0])
 
-    ap_dss_total_cfs = float(ref_row.get(ap_ref, np.nan)) + float(evap_cfs or 0.0) if ap_ref else np.nan
+    ap_dss_total_cfs = ap_total_dss_cfs([ref_row.get(ap_ref, np.nan)], evap_cfs).iloc[0] if ap_ref else np.nan
     ap_dss_total = convert_flow(pd.Series([ap_dss_total_cfs]), flow_unit).iloc[0] if pd.notna(ap_dss_total_cfs) else np.nan
 
     obs_val_cfs = np.nan
@@ -989,17 +1149,19 @@ def show_aporte_reservoir_metrics(
     obs_val = convert_flow(pd.Series([obs_val_cfs]), flow_unit).iloc[0] if pd.notna(obs_val_cfs) else np.nan
     nearest_obs = None
     if pd.notna(obs_val_cfs) and obs_date is not None:
-        nearest_obs = _nearest_ap_percentile(base, cfg, obs_date, obs_val_cfs, dss_add_cfs=float(evap_cfs or 0.0))
+        nearest_obs = _nearest_ap_percentile(base, cfg, obs_date, obs_val_cfs, dss_add_cfs=clean_evap_cfs(evap_cfs))
 
     # Hidrogeneración DSS recomendada: usa el mismo percentil operativo del aporte más cercano.
     hp_rec_val = np.nan
     hp_rec_label = "—"
     if nearest_obs and hp_cols:
-        raw_pct = nearest_obs.get("raw_percentile", nearest_obs.get("percentile", pct_ref))
-        hp_col = next((c for c in hp_cols if exceedance_pct(c) == raw_pct), None)
+        # La hidrogeneración recomendada debe seguir el percentil AP corregido
+        # como probabilidad de excedencia, no el sufijo crudo de la columna AP.
+        indicador_pct = int(nearest_obs.get("percentile", pct_ref))
+        hp_col, hp_pct = pick_percentile_column(hp_cols, indicador_pct)
         if hp_col is not None:
             hp_rec_val = float(ref_row.get(hp_col, np.nan))
-            hp_rec_label = nearest_obs["label"]
+            hp_rec_label = f"P{hp_pct}" if hp_pct is not None else nearest_obs["label"]
     elif hp_cols:
         hp_col = next((c for c in hp_cols if exceedance_pct(c) == pct_ref), hp_cols[0])
         hp_rec_val = float(ref_row.get(hp_col, np.nan))
@@ -1015,21 +1177,24 @@ def show_aporte_reservoir_metrics(
         help=f"Fecha: {obs_date:%d-%m-%Y}" if obs_date is not None else "Sin BulkExport de aporte observado.",
     )
     m2.metric("Fecha aporte obs.", f"{obs_date:%d-%m-%Y}" if obs_date is not None else "—")
-    m3.metric("Evaporación aplicada (p³/s)", f"{float(evap_cfs or 0.0):,.1f}")
+    m3.metric("Evaporación aplicada (p³/s)", f"{clean_evap_cfs(evap_cfs):,.1f}")
     m4.metric(
         f"AP total DSS P{ap_pct_map.get(ap_ref, exceedance_pct(ap_ref))} ({unit_label(flow_unit)})",
         f"{ap_dss_total:,.2f}" if pd.notna(ap_dss_total) else "—",
     )
     if nearest_obs:
+        nearest_diff_unit = convert_flow(pd.Series([nearest_obs['diff_cfs']]), flow_unit).iloc[0]
+        nearest_total_unit = convert_flow(pd.Series([nearest_obs['dss_total_cfs']]), flow_unit).iloc[0]
         m5.metric(
-            "Percentil AP más cercano",
+            "Indicador AP observado",
             nearest_obs["label"],
-            delta=f"Obs-DSS: {nearest_obs['diff_cfs']:+,.1f} p³/s",
+            delta=f"Obs-DSS: {nearest_diff_unit:+,.2f} {unit_label(flow_unit)}",
             delta_color="inverse",
-            help=f"AP total DSS cercano: {nearest_obs['dss_total_cfs']:,.1f} p³/s · Fecha DSS: {nearest_obs['date']:%d-%m-%Y}",
+            help=f"AP total DSS indicador: {nearest_total_unit:,.2f} {unit_label(flow_unit)} "
+                 f"({nearest_obs['dss_total_cfs']:,.1f} p³/s) · Fecha DSS: {nearest_obs['date']:%d-%m-%Y}",
         )
     else:
-        m5.metric("Percentil AP más cercano", "—")
+        m5.metric("Indicador AP observado", "—")
     m6.metric(
         f"Hidrogeneración DSS recomendada ({hp_rec_label})",
         f"{hp_rec_val:,.2f} MW" if pd.notna(hp_rec_val) else "—",
@@ -1110,10 +1275,10 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
         st.markdown(f"### 🌊 Aportes — AP total DSS estimado "
                     f"<span class='badge'>{unit_label(flow_unit)}</span>",
                     unsafe_allow_html=True)
-        st.caption(f"AP total DSS estimado = AP neto DSS + {float(evap_cfs or 0.0):,.1f} p³/s de evaporación. Se conserva el percentil original del DSS.")
-        # Reetiquetar AP por magnitud: percentil alto arriba, percentil bajo abajo.
+        st.caption(f"AP total DSS estimado = AP neto DSS + {clean_evap_cfs(evap_cfs):,.1f} p³/s de evaporación. El visor se ordena de húmedo a seco: P5 arriba y P95 abajo.")
+        # Reetiquetar AP por magnitud como probabilidad de excedencia: menor AP → P95; mayor AP → P5.
         ap_df_all, ordered_ap_cols_all, ap_pct_map = make_ordered_ap_columns(
-            filtered, ap_cols, flow_unit, add_cfs=float(evap_cfs or 0.0)
+            filtered, ap_cols, flow_unit, add_cfs=clean_evap_cfs(evap_cfs)
         )
         pcts_available = sorted(set(ap_pct_map.values()), reverse=True)
         default_pcts = pcts_available
@@ -1147,7 +1312,7 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
                         cfg,
                         pd.to_datetime(last_obs_ap["Fecha_dia"]),
                         float(last_obs_ap["Valor"]),
-                        dss_add_cfs=float(evap_cfs or 0.0),
+                        dss_add_cfs=clean_evap_cfs(evap_cfs),
                     )
             except Exception as exc:
                 st.warning(f"No se pudo agregar el aporte observado a la gráfica: {exc}")
@@ -1155,15 +1320,16 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
 
         if nearest_ap_info:
             st.caption(
-                f"🎯 Según el **aporte observado**, el percentil AP DSS ajustado más cercano es "
+                f"🎯 Según el **aporte observado**, el indicador AP DSS ajustado corresponde a "
                 f"**{nearest_ap_info['label']}** "
                 f"(Obs-DSS: {nearest_ap_info['diff_cfs']:+,.1f} p³/s; "
                 f"fecha DSS: {nearest_ap_info['date']:%d-%m-%Y})."
             )
 
+        _unit_key_ap = str(flow_unit).replace("³", "3").replace("/", "_").replace(" ", "")
         fan_chart(ap_df_all, new_ap_cols,
                   f"{cfg['name']} · AP total DSS estimado y aporte observado ({unit_label(flow_unit)})",
-                  unit_label(flow_unit), f"{res_key}_ap_plot",
+                  unit_label(flow_unit), f"{res_key}_ap_plot_{_unit_key_ap}",
                   obs_col=obs_ap_col, obs_label="Aporte observado")
 
     # --- V ---
@@ -1262,11 +1428,13 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
     c1, c2, c3 = st.columns(3)
     gat_threshold = c1.number_input(
         "Umbral operativo Gatún Δ nivel (ft)",
-        min_value=0.01, value=0.60, step=0.05, key="mj_thr_gat"
+        min_value=0.01, value=0.10, step=0.05, key="mj_thr_gat",
+        help="Valor por defecto solicitado para Gatún."
     )
     alh_threshold = c2.number_input(
         "Umbral operativo Alhajuela / Madden Δ nivel (ft)",
-        min_value=0.01, value=0.10, step=0.05, key="mj_thr_alh"
+        min_value=0.01, value=0.60, step=0.05, key="mj_thr_alh",
+        help="Valor por defecto solicitado para Alhajuela/Madden."
     )
     horizon  = c3.selectbox("Horizonte (días)", [7, 15, 30, 60, 90], index=2, key="mj_horiz")
     st.caption(
@@ -1294,10 +1462,17 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
         v_cols  = cols_by_prefix(daily, "V",  token)
         hp_cols = cols_by_prefix(daily, "HP", token)
 
-        np_col = next((c for c in np_cols if exceedance_pct(c) == pct_ref), np_cols[0] if np_cols else None)
-        ap_col = next((c for c in ap_cols if exceedance_pct(c) == pct_ref), ap_cols[0] if ap_cols else None)
-        v_col  = next((c for c in v_cols  if exceedance_pct(c) == pct_ref), v_cols[0]  if v_cols  else None)
-        hp_col = next((c for c in hp_cols if exceedance_pct(c) == pct_ref), hp_cols[0] if hp_cols else None)
+        # Elegir columnas con respaldo: si el percentil seleccionado no existe
+        # en alguna variable, se usa el percentil disponible más cercano para
+        # evitar valores None en la tabla de Manejo/Decisión.
+        np_col, np_pct = pick_percentile_column(np_cols, pct_ref)
+        v_col,  v_pct  = pick_percentile_column(v_cols,  pct_ref)
+        hp_col, hp_pct = pick_percentile_column(hp_cols, pct_ref)
+
+        # AP usa etiqueta corregida como probabilidad de excedencia por magnitud:
+        # menor AP → P95; mayor AP → P5.
+        ap_pct_map = ordered_percentile_map_by_value(daily, ap_cols)
+        ap_col, ap_pct = pick_percentile_column(ap_cols, pct_ref, pct_map=ap_pct_map)
 
         # Último observado
         obs_val, obs_date = None, None
@@ -1340,19 +1515,23 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
         np_start = float(future[np_col].iloc[0])  if np_col and np_col in future and not future.empty else np.nan
         np_end   = float(future[np_col].iloc[-1]) if np_col and np_col in future and not future.empty else np.nan
 
+        # Estado ejecutivo: mostrar primero los VALORES usados por la simulación DSS.
+        # Los percentiles quedan como trazabilidad en una columna compacta, para no
+        # confundirlos con los valores operativos de nivel, aporte, vertido e hidrogeneración.
         rows.append({
             "Embalse":                   cfg["name"],
             "Estado":                    semaforo,
             "Obs. LKH (ft)":             _fmt(obs_val),
             "Fecha obs.":                f"{obs_date:%d-%m-%Y}" if obs_date else "—",
-            f"NP{pct_ref} DSS (ft)":     _fmt(np_v),
-            "Percentil más cercano":     closest["label"] if closest else "—",
-            "Umbral embalse (ft)":      _fmt(threshold_ft, 3),
-            "Umbral embalse (ft)":      _fmt(threshold_ft, 3),
-            f"Δ Obs-NP{pct_ref} (ft)":   _fmt(diff_np, 3),
-            f"AP{pct_ref} ({unit_label(flow_unit)})": _fmt(ap_v, 2),
-            f"V{pct_ref} ({unit_label(flow_unit)})":  _fmt(v_v, 2),
-            f"HP{pct_ref} (MW)":         _fmt(hp_v, 2),
+            "Percentil referencia":      f"P{pct_ref}",
+            "Nivel DSS usado (ft)":      _fmt(np_v),
+            f"Aporte DSS usado ({unit_label(flow_unit)})": _fmt(ap_v, 2),
+            f"Vertido DSS usado ({unit_label(flow_unit)})": _fmt(v_v, 2),
+            "Hidrogeneración DSS usada (MW)": _fmt(hp_v, 2),
+            "Series DSS usadas":         f"NP P{np_pct if np_pct is not None else '—'} · AP P{ap_pct if ap_pct is not None else '—'} · V P{v_pct if v_pct is not None else '—'} · HP P{hp_pct if hp_pct is not None else '—'}",
+            "Percentil nivel cercano":   closest["label"] if closest else "—",
+            "Umbral embalse (ft)":       _fmt(threshold_ft, 3),
+            "Δ Obs-NP (ft)":             _fmt(diff_np, 3),
             f"AP prom. {horizon}d ({unit_label(flow_unit)})": _fmt(ap_prom, 2),
             f"V prom. {horizon}d ({unit_label(flow_unit)})":  _fmt(v_prom, 2),
             f"HP prom. {horizon}d (MW)": _fmt(hp_prom, 2),
@@ -1388,7 +1567,7 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
         pct_ref = int(pct_ref_gat if cfg.get("token") == "GAT" else pct_ref_alh)
         token = cfg["token"]
         np_cols = cols_by_prefix(daily, "NP", token)
-        np_col  = next((c for c in np_cols if exceedance_pct(c) == pct_ref), np_cols[0] if np_cols else None)
+        np_col, _np_pct_plot = pick_percentile_column(np_cols, pct_ref)
         if not np_col:
             continue
 
@@ -1446,7 +1625,7 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
 
         _today_line(fig, filt["Fecha_dia"])
         fig.update_layout(**_base_layout(
-            f"{name} · Nivel proyectado P{pct_ref} vs observado (ft PLD)",
+            f"{name} · Nivel proyectado P{_np_pct_plot if _np_pct_plot is not None else pct_ref} vs observado (ft PLD)",
             "ft PLD", height=580,
         ))
         st.plotly_chart(fig, use_container_width=True, key=f"mj_np_{cfg['token']}")
@@ -1474,10 +1653,15 @@ def _nearest_ap_percentile(
     obs_total_cfs: float,
     dss_add_cfs: float = 0.0,
 ) -> Optional[Dict]:
-    """Busca el percentil AP DSS TOTAL más cercano al aporte observado total.
+    """Determina el indicador AP DSS para el último aporte observado total.
 
     El DSS trae AP neto. Para comparar contra un aporte total observado:
         AP total DSS estimado = AP neto DSS + evaporación (p³/s)
+
+    Criterio del indicador: las etiquetas se tratan como probabilidad de
+    excedencia hidrológica. Por eso, si el observado cae entre dos curvas, se
+    asigna la curva inferior del tramo (por ejemplo, entre P95 y P90 se reporta
+    P95). Esto evita que el indicador del último dato se invierta visualmente.
     """
     if daily is None or daily.empty or ref_date is None or pd.isna(obs_total_cfs):
         return None
@@ -1500,36 +1684,55 @@ def _nearest_ap_percentile(
         row = base.loc[(base["Fecha_dia"] - ref_ts).abs().idxmin()]
         exact_date = False
 
+    pct_map = ordered_percentile_map_by_value(base, ap_cols, ref_row=row)
     candidates = []
-    evap = max(float(dss_add_cfs or 0.0), 0.0)
+    evap = clean_evap_cfs(dss_add_cfs)
     for col in ap_cols:
         val = pd.to_numeric(pd.Series([row.get(col, np.nan)]), errors="coerce").iloc[0]
         if pd.notna(val):
-            dss_total = float(val) + evap
-            candidates.append((col, dss_total, abs(float(obs_total_cfs) - dss_total)))
+            dss_total = float(ap_total_dss_cfs([val], evap).iloc[0])
+            display_pct = int(pct_map.get(col, exceedance_pct(col)))
+            raw_pct = int(exceedance_pct(col))
+            candidates.append({
+                "column": col,
+                "raw_percentile": raw_pct,
+                "percentile": display_pct,
+                "dss_total_cfs": dss_total,
+            })
     if not candidates:
         return None
 
-    best_col, best_val, abs_diff = min(candidates, key=lambda x: x[2])
-    display_pct = exceedance_pct(best_col)
-    diff = float(obs_total_cfs) - best_val
-    rel = abs(diff) / max(abs(float(obs_total_cfs)), 1e-9) * 100
+    # Orden por caudal: menor caudal debe corresponder a mayor excedencia.
+    candidates = sorted(candidates, key=lambda r: (r["dss_total_cfs"], -r["percentile"]))
+    obs = float(obs_total_cfs)
+
+    # Indicador por tramo: último valor <= observado. Si el observado cae por
+    # debajo de todas las curvas, se usa la curva más baja (P95). Si queda por
+    # encima de todas, se usa la más alta (P5).
+    eligible = [r for r in candidates if r["dss_total_cfs"] <= obs]
+    if eligible:
+        selected = eligible[-1]
+    else:
+        selected = candidates[0]
+
+    diff = obs - float(selected["dss_total_cfs"])
+    rel = abs(diff) / max(abs(obs), 1e-9) * 100
     estado = "🟢 Muy cercano" if rel <= 10 else ("🟠 Seguimiento" if rel <= 25 else "🔴 Revisar")
     return {
-        "column": best_col,
-        "raw_percentile": exceedance_pct(best_col),
-        "percentile": int(display_pct),
-        "label": f"P{int(display_pct)}",
-        "dss_total_cfs": best_val,
-        "dss_cfs": best_val,  # compatibilidad
-        "diff_cfs": diff,
-        "rel_pct": rel,
+        "column": selected["column"],
+        "raw_percentile": int(selected["raw_percentile"]),
+        "percentile": int(selected["percentile"]),
+        "label": f"P{int(selected['percentile'])}",
+        "dss_total_cfs": float(selected["dss_total_cfs"]),
+        "dss_cfs": float(selected["dss_total_cfs"]),  # compatibilidad
+        "diff_cfs": float(diff),
+        "rel_pct": float(rel),
         "estado": estado,
         "date": pd.to_datetime(row["Fecha_dia"]),
         "exact_date": exact_date,
         "evap_cfs": evap,
+        "criterio": "tramo_excedencia",
     }
-
 
 
 def tab_aporte_obs_embalse(
@@ -1555,7 +1758,7 @@ def tab_aporte_obs_embalse(
         "**AP total DSS estimado = AP neto DSS + evaporación**."
     )
     st.caption(SIMULATION_NOTE)
-    st.caption("Se conserva el orden original de percentiles del DSS: P95 representa menor aporte y P5 mayor aporte, si así viene en la simulación.")
+    st.caption("Las etiquetas AP se corrigen por excedencia: P95 es el aporte más seco y P5 el más húmedo; el visor muestra P5 arriba y P95 abajo.")
 
     try:
         raw = load_dss_sheet(dss_bytes, cfg["sheet"])
@@ -1577,7 +1780,7 @@ def tab_aporte_obs_embalse(
     show_obs_total = st.checkbox("Mostrar aporte observado", value=True, key=f"show_obs_total_{res_key}")
     show_dss_neto = st.checkbox("Mostrar AP neto DSS de referencia", value=False, key=f"show_dss_neto_{res_key}")
     st.info(
-        f"Caudal evaporado aplicado desde la barra lateral: **{float(evap_cfs or 0.0):,.3f} p³/s**. "
+        f"Caudal evaporado aplicado desde la barra lateral: **{clean_evap_cfs(evap_cfs):,.3f} p³/s**. "
         f"Fórmula: **AP total DSS estimado = AP neto DSS + caudal evaporado**."
     )
 
@@ -1639,24 +1842,29 @@ def tab_aporte_obs_embalse(
         last = valid_obs.iloc[-1]
         last_total_cfs = float(last["Aporte total observado (p³/s)"])
         last_date = pd.to_datetime(last["Fecha_dia"])
-        nearest = _nearest_ap_percentile(daily, cfg, last_date, last_total_cfs, dss_add_cfs=float(evap_cfs))
+        nearest = _nearest_ap_percentile(daily, cfg, last_date, last_total_cfs, dss_add_cfs=clean_evap_cfs(evap_cfs))
 
+        unit_lbl = unit_label(flow_unit)
+        last_total_unit = convert_flow(pd.Series([last_total_cfs]), flow_unit).iloc[0]
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Último aporte total obs. (p³/s)", f"{last_total_cfs:,.1f}")
-        m2.metric("Evap. sumada al DSS (p³/s)", f"{evap_cfs:,.1f}")
+        m1.metric(f"Último aporte total obs. ({unit_lbl})", f"{last_total_unit:,.2f}")
+        m2.metric("Evap. sumada al DSS (p³/s)", f"{clean_evap_cfs(evap_cfs):,.1f}")
         if nearest:
-            m3.metric("AP total DSS cercano (p³/s)", f"{nearest['dss_total_cfs']:,.1f}")
+            nearest_total_unit = convert_flow(pd.Series([nearest['dss_total_cfs']]), flow_unit).iloc[0]
+            nearest_diff_unit = convert_flow(pd.Series([nearest['diff_cfs']]), flow_unit).iloc[0]
+            m3.metric(f"AP total DSS indicador ({unit_lbl})", f"{nearest_total_unit:,.2f}")
         else:
-            m3.metric("AP total DSS cercano (p³/s)", "—")
+            nearest_diff_unit = np.nan
+            m3.metric(f"AP total DSS indicador ({unit_lbl})", "—")
         m4.metric("Fecha obs.", f"{last_date:%d-%m-%Y}")
         if nearest:
             m5.metric(
-                "Percentil DSS cercano",
+                "Indicador DSS AP",
                 nearest["label"],
-                delta=f"Obs-DSS total: {nearest['diff_cfs']:+,.1f} p³/s",
+                delta=f"Obs-DSS total: {nearest_diff_unit:+,.2f} {unit_lbl}",
                 delta_color="inverse",
-                help=f"{nearest['estado']} · AP total DSS {nearest['label']}: {nearest['dss_total_cfs']:,.1f} p³/s · "
-                     f"Fecha DSS: {nearest['date']:%d-%m-%Y}",
+                help=f"{nearest['estado']} · AP total DSS {nearest['label']}: {nearest_total_unit:,.2f} {unit_lbl} "
+                     f"({nearest['dss_total_cfs']:,.1f} p³/s) · Fecha DSS: {nearest['date']:%d-%m-%Y}",
             )
     else:
         st.warning(
@@ -1671,12 +1879,13 @@ def tab_aporte_obs_embalse(
     fig = go.Figure()
 
     # AP total DSS estimado = AP neto DSS + evaporación.
-    # Se usa etiqueta operativa por magnitud: P alto arriba, P bajo abajo.
-    for col in ap_cols:
+    # Orden del visor/leyenda: húmedo arriba (P5) → seco abajo (P95).
+    ap_cols_plot = sorted(ap_cols, key=lambda c: ap_pct_map.get(c, exceedance_pct(c)))
+    for col in ap_cols_plot:
         pct = ap_pct_map.get(col, exceedance_pct(col))
         if pct not in sel_pcts:
             continue
-        dss_total_cfs = pd.to_numeric(daily_f[col], errors="coerce") + float(evap_cfs or 0.0)
+        dss_total_cfs = ap_total_dss_cfs(daily_f[col], evap_cfs)
         vals_total = convert_flow(dss_total_cfs, flow_unit)
         fig.add_trace(go.Scatter(
             x=daily_f["Fecha_dia"],
@@ -1688,11 +1897,11 @@ def tab_aporte_obs_embalse(
                 dash="solid" if pct in (pct_ref, 50) else "dot",
                 color=EXCEEDANCE_COLORS.get(pct, "#aaa"),
             ),
-            hovertemplate="Fecha: %{x|%d-%m-%Y}<br>AP total DSS: %{y:,.2f}<extra></extra>",
+            hovertemplate=f"Fecha: %{{x|%d-%m-%Y}}<br>AP total DSS: %{{y:,.2f}} {unit_label(flow_unit)}<extra></extra>",
         ))
 
     if show_dss_neto:
-        ref_col = next((c for c in ap_cols if exceedance_pct(c) == pct_ref), None)
+        ref_col = next((c for c, p in ap_pct_map.items() if p == pct_ref), None)
         if ref_col and ref_col in daily_f.columns:
             vals_net = convert_flow(daily_f[ref_col], flow_unit)
             fig.add_trace(go.Scatter(
@@ -1709,7 +1918,7 @@ def tab_aporte_obs_embalse(
         if not obs_v.empty:
             y_total = convert_flow(obs_v["Aporte total observado (p³/s)"], flow_unit)
             labels_total = [""] * len(obs_v)
-            labels_total[-1] = f"Obs {y_total.iloc[-1]:,.1f}"
+            labels_total[-1] = f"Obs {y_total.iloc[-1]:,.1f} {unit_label(flow_unit)}"
             fig.add_trace(go.Scatter(
                 x=obs_v["Fecha_dia"],
                 y=y_total,
@@ -1720,7 +1929,7 @@ def tab_aporte_obs_embalse(
                 line=dict(color="#d90429", width=5),
                 marker=dict(size=9, color="#d90429", line=dict(width=2, color="white")),
                 connectgaps=True,
-                hovertemplate="Fecha: %{x|%d-%m-%Y}<br>Aporte observado: %{y:,.2f}<extra></extra>",
+                hovertemplate=f"Fecha: %{{x|%d-%m-%Y}}<br>Aporte observado: %{{y:,.2f}} {unit_label(flow_unit)}<extra></extra>",
             ))
             fig.add_trace(go.Scatter(
                 x=[obs_v["Fecha_dia"].iloc[-1]],
@@ -1754,7 +1963,8 @@ def tab_aporte_obs_embalse(
         unit_label(flow_unit),
         height=650,
     ))
-    st.plotly_chart(fig, use_container_width=True, key=f"ao_{res_key}_plot")
+    _unit_key = str(flow_unit).replace("³", "3").replace("/", "_").replace(" ", "")
+    st.plotly_chart(fig, use_container_width=True, key=f"ao_{res_key}_plot_{_unit_key}")
 
     with st.expander("📋 Tabla de aporte observado y AP total DSS estimado", expanded=False):
         rows = []
@@ -1763,7 +1973,7 @@ def tab_aporte_obs_embalse(
             table["Aporte total observado ({})".format(unit_label(flow_unit))] = convert_flow(
                 table["Aporte total observado (p³/s)"], flow_unit
             )
-            table["Evaporación sumada al DSS (p³/s)"] = float(evap_cfs)
+            table["Evaporación sumada al DSS (p³/s)"] = clean_evap_cfs(evap_cfs)
             table = table.rename(columns={"Fecha_dia": "Fecha"})
             for _, r in table.iterrows():
                 rows.append({
@@ -1773,7 +1983,7 @@ def tab_aporte_obs_embalse(
                     f"Aporte total observado ({unit_label(flow_unit)})": r.get(
                         "Aporte total observado ({})".format(unit_label(flow_unit)), np.nan
                     ),
-                    "Evaporación sumada al DSS (p³/s)": float(evap_cfs),
+                    "Evaporación sumada al DSS (p³/s)": clean_evap_cfs(evap_cfs),
                 })
         if rows:
             out = pd.DataFrame(rows)
@@ -1794,14 +2004,15 @@ def tab_aporte_obs_embalse(
 
 
 def tab_aportes_obs(dss_bytes: bytes, flow_unit: str, pct_ref: int,
-                    obs_gat: Optional[pd.DataFrame], obs_alh: Optional[pd.DataFrame]) -> None:
+                    obs_gat: Optional[pd.DataFrame], obs_alh: Optional[pd.DataFrame],
+                    evap_gat_cfs: float = 0.0, evap_alh_cfs: float = 0.0) -> None:
     """Vista contenedora conservada por compatibilidad: una subpestaña por embalse."""
     st.subheader("🌧️ Aportes observados separados por embalse")
     sub = st.tabs(["GAT · Gatún", "ALHA · Alhajuela/Madden"])
     with sub[0]:
-        tab_aporte_obs_embalse("gatun", dss_bytes, flow_unit, pct_ref, obs_gat)
+        tab_aporte_obs_embalse("gatun", dss_bytes, flow_unit, pct_ref, obs_gat, evap_gat_cfs)
     with sub[1]:
-        tab_aporte_obs_embalse("alhajuela", dss_bytes, flow_unit, pct_ref, obs_alh)
+        tab_aporte_obs_embalse("alhajuela", dss_bytes, flow_unit, pct_ref, obs_alh, evap_alh_cfs)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1970,14 +2181,28 @@ def tab_comparativo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_
     gat_f = gat_d[(gat_d["Fecha_dia"].dt.date >= s) & (gat_d["Fecha_dia"].dt.date <= e)].copy()
     alh_f = alh_d[(alh_d["Fecha_dia"].dt.date >= s) & (alh_d["Fecha_dia"].dt.date <= e)].copy()
 
-    gat_cols = [c for c in cols_by_prefix(gat_f, prefix, "GAT") if exceedance_pct(c) in pcts]
-    alh_cols = [c for c in cols_by_prefix(alh_f, prefix, "ALH") if exceedance_pct(c) in pcts]
+    raw_gat_cols = cols_by_prefix(gat_f, prefix, "GAT")
+    raw_alh_cols = cols_by_prefix(alh_f, prefix, "ALH")
 
     is_flow = prefix in ("AP", "V")
     y_lbl   = unit_label(flow_unit) if is_flow else ("ft PLD" if prefix == "NP" else "MW")
 
-    gat_plot = gat_f.copy()
-    alh_plot = alh_f.copy()
+    if prefix == "AP":
+        gat_plot, gat_cols_all, _ = make_ordered_ap_columns(
+            gat_f, raw_gat_cols, flow_unit, add_cfs=clean_evap_cfs(evap_gat_cfs)
+        )
+        alh_plot, alh_cols_all, _ = make_ordered_ap_columns(
+            alh_f, raw_alh_cols, flow_unit, add_cfs=clean_evap_cfs(evap_alh_cfs)
+        )
+        gat_cols = [c for c in gat_cols_all if exceedance_pct(c) in pcts]
+        alh_cols = [c for c in alh_cols_all if exceedance_pct(c) in pcts]
+        st.caption("En AP se corrige la etiqueta como probabilidad de excedencia: menor AP → P95; mayor AP → P5. En el visor Plotly se ordena P5 arriba y P95 abajo.")
+    else:
+        gat_cols = [c for c in raw_gat_cols if exceedance_pct(c) in pcts]
+        alh_cols = [c for c in raw_alh_cols if exceedance_pct(c) in pcts]
+        gat_plot = gat_f.copy()
+        alh_plot = alh_f.copy()
+
     gat_obs_col = alh_obs_col = None
 
     if prefix == "NP":
@@ -2024,12 +2249,11 @@ def tab_comparativo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_
             alh_obs_col = "Aporte obs. Alhajuela"
 
     # Convertir flujos DSS en la copia de gráfica.
-    if is_flow:
-        for df, cols, evap in [(gat_plot, gat_cols, evap_gat_cfs), (alh_plot, alh_cols, evap_alh_cfs)]:
+    # En AP ya se convirtió y se sumó evaporación mediante make_ordered_ap_columns().
+    if is_flow and prefix != "AP":
+        for df, cols in [(gat_plot, gat_cols), (alh_plot, alh_cols)]:
             for c in cols:
                 base_series = pd.to_numeric(df[c], errors="coerce")
-                if prefix == "AP":
-                    base_series = base_series + float(evap or 0.0)
                 df[c] = convert_flow(base_series, flow_unit)
 
     c_gat, c_alh = st.columns(2)
@@ -2115,7 +2339,7 @@ def tab_aporte_instantaneo(dss_bytes: bytes, flow_unit: str, pct_ref: int = 50) 
                     continue
                 obs_cfs = scalar_to_cfs(obs_val, unit_obs)
                 nearest = _nearest_ap_percentile(
-                    daily, cfg, pd.to_datetime(ref_date), obs_cfs, dss_add_cfs=float(evap_cfs)
+                    daily, cfg, pd.to_datetime(ref_date), obs_cfs, dss_add_cfs=clean_evap_cfs(evap_cfs)
                 )
                 if not nearest:
                     results.append({
@@ -2128,7 +2352,7 @@ def tab_aporte_instantaneo(dss_bytes: bytes, flow_unit: str, pct_ref: int = 50) 
                 results.append({
                     "Embalse": nombre,
                     f"Aporte total obs. ({unit_label(flow_unit)})": round(float(obs_converted), 3),
-                    "Evap. sumada al DSS (p³/s)": round(float(evap_cfs), 3),
+                    "Evap. sumada al DSS (p³/s)": round(clean_evap_cfs(evap_cfs), 3),
                     "Percentil AP total DSS más cercano": nearest["label"],
                     f"AP total DSS ({unit_label(flow_unit)})": round(float(dss_converted), 3),
                     "Diferencia Obs-DSS (p³/s)": round(float(nearest["diff_cfs"]), 3),
@@ -2151,6 +2375,28 @@ def tab_radar(dss_bytes: bytes, flow_unit: str) -> None:
 # CARGA MASIVA DE BulkExports (CSVs locales + upload)
 # ─────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────
+# CARGA MASIVA DE BulkExports (CSVs locales + upload + URL Aquarius opcional)
+# ─────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False, ttl=900)
+def fetch_url_bytes_cached(url: str, timeout_seconds: int = 30) -> bytes:
+    """Descarga una serie remota de Aquarius como bytes, con timeout y tamaño limitado."""
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "DSS-Simulacion-ACP/1.0"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        content_type = str(resp.headers.get("Content-Type", ""))
+        data = resp.read(25_000_000)  # límite defensivo: 25 MB
+    if not data:
+        raise ValueError("respuesta vacía")
+    # Si Aquarius devuelve una página HTML de login/error, no se intenta parsear como CSV.
+    head = data[:500].lower()
+    if b"<html" in head or b"<!doctype html" in head:
+        raise ValueError(f"Aquarius devolvió HTML en lugar de CSV ({content_type or 'sin content-type'})")
+    return data
+
+# ─────────────────────────────────────────────────────────────────────
 # CARGA MASIVA DE BulkExports (CSVs locales + upload)
 # ─────────────────────────────────────────────────────────────────────
 def load_observed_data() -> Tuple[
@@ -2171,16 +2417,38 @@ def load_observed_data() -> Tuple[
         type=["csv"], accept_multiple_files=True, key="bulk_up",
     )
     use_local = st.sidebar.checkbox("Usar CSV locales desde carpeta data", value=True, key="bulk_local")
+    use_aquarius_url = st.sidebar.checkbox(
+        "Intentar cargar nivel Radar@MAD desde URL Aquarius",
+        value=True,
+        key="bulk_url_mad_radar",
+        help="Serie solicitada: Lake-Res elevation.Telem Radar@MAD. Si Aquarius requiere autenticación o no hay red, la app continúa con CSV locales/subidos.",
+    )
 
     sources: List[Tuple[bytes, str]] = []
+    remote_errors: List[Dict[str, object]] = []
 
     if use_local:
-        for p in discover_local_bulk_csvs()[:20]:
+        # discover_local_bulk_csvs() retorna primero los más recientes. Se invierte
+        # para que, al consolidar por día, el archivo local más nuevo prevalezca.
+        for p in reversed(discover_local_bulk_csvs()[:20]):
             try:
                 sources.append((p.read_bytes(), p.name))
             except Exception:
                 pass
 
+    if use_aquarius_url:
+        for alias, url in AQUARIUS_REQUIRED_SERIES_URLS:
+            try:
+                sources.append((fetch_url_bytes_cached(url), alias))
+            except Exception as exc:
+                remote_errors.append({
+                    "Archivo": alias,
+                    "Embalse": "Alhajuela / Madden",
+                    "Variable": "nivel",
+                    "Estado": f"URL no cargada: {exc}",
+                })
+
+    # Los archivos subidos manualmente prevalecen sobre los locales y la URL.
     for uf in (uploaded or []):
         sources.append((uf.getvalue(), uf.name))
 
@@ -2190,8 +2458,8 @@ def load_observed_data() -> Tuple[
     gat_aporte = []
     alh_aporte = []
 
-    file_info = []
-    for fbytes, fname in sources:
+    file_info = list(remote_errors)
+    for source_order, (fbytes, fname) in enumerate(sources):
         try:
             daily, embalse, variable, serie = read_bulk_csv(fbytes, fname)
         except Exception as exc:
@@ -2200,6 +2468,8 @@ def load_observed_data() -> Tuple[
         if daily.empty:
             file_info.append({"Archivo": fname, "Embalse": embalse, "Variable": variable, "Estado": "Sin datos"})
             continue
+        daily = daily.copy()
+        daily["_source_order"] = int(source_order)
         file_info.append({
             "Archivo": fname, "Embalse": embalse, "Variable": variable,
             "Serie": serie, "Registros": len(daily),
@@ -2214,18 +2484,28 @@ def load_observed_data() -> Tuple[
         with st.sidebar.expander("📋 Archivos BulkExport leídos", expanded=False):
             st.dataframe(pd.DataFrame(file_info), use_container_width=True, hide_index=True)
 
-    def _concat(lst: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    def _concat(lst: List[pd.DataFrame], variable: str) -> Optional[pd.DataFrame]:
         if not lst:
             return None
         out = pd.concat(lst, ignore_index=True)
-        # Keep last valid value per day
-        out = out.sort_values("Fecha_dia")
-        out = out.groupby("Fecha_dia", as_index=False).agg(
-            Valor=("Valor", "mean"), Fuente=("Fuente", "last")
-        )
+        out["Fecha_dia"] = pd.to_datetime(out["Fecha_dia"], errors="coerce").dt.normalize()
+        out["Valor"] = pd.to_numeric(out["Valor"], errors="coerce")
+        out["_source_order"] = pd.to_numeric(out.get("_source_order", 0), errors="coerce").fillna(0).astype(int)
+        out = out.dropna(subset=["Fecha_dia", "Valor"]).sort_values(["Fecha_dia", "_source_order"])
+
+        # Niveles: conservar el último valor disponible del día/fuente prioritaria.
+        # Aportes: promedio diario si hay más de una muestra válida del mismo día.
+        if variable == "nivel":
+            out = out.groupby("Fecha_dia", as_index=False).agg(
+                Valor=("Valor", "last"), Fuente=("Fuente", "last")
+            )
+        else:
+            out = out.groupby("Fecha_dia", as_index=False).agg(
+                Valor=("Valor", "mean"), Fuente=("Fuente", "last")
+            )
         return out
 
-    return _concat(gat_nivel), _concat(alh_nivel), _concat(gat_aporte), _concat(alh_aporte)
+    return _concat(gat_nivel, "nivel"), _concat(alh_nivel, "nivel"), _concat(gat_aporte, "aporte"), _concat(alh_aporte, "aporte")
 
 
 
@@ -2330,34 +2610,282 @@ def tab_hp_semanal(dss_bytes: bytes) -> None:
 
 
 def tab_instructivo() -> None:
-    st.subheader("📘 Instructivo rápido del dashboard")
+    st.subheader("📘 Instructivo operativo del dashboard DSS")
     st.markdown("""
-**Objetivo:** apoyar la revisión operativa de las proyecciones DSS 2026 para Gatún y Alhajuela/Madden, usando percentiles, aportes, vertidos, hidrogeneración y datos observados BulkExport.
+### Objetivo general
 
-**1. Cargar información**
-- Coloca `SimulacionDSS_2026.xlsx` en la carpeta `data` o cárgalo desde la barra lateral.
-- Coloca los `BulkExport*.csv` o los CSV normalizados en la carpeta `data` o súbelos desde la barra lateral.
-- Usa **Recargar archivos** cuando cambies un Excel o CSV.
+Este dashboard apoya la interpretación operativa de las simulaciones DSS 2026 para los embalses **Gatún** y **Alhajuela/Madden**. Integra resultados del archivo DSS, datos observados tipo BulkExport/Aquarius, percentiles hidrológicos, niveles proyectados, aportes, vertidos e hidrogeneración recomendada.
 
-**2. Pestañas principales**
-- **GATÚN DSS / ALHAJUELA DSS:** revisión por embalse de nivel, HP, AP y vertidos.
-- **Manejo / Decisión:** resume diferencias entre observado y DSS, estado tipo semáforo y horizonte de decisión.
-- **Aporte GAT obs / Aporte ALHA obs:** compara aporte total observado con AP total DSS estimado usando el caudal evaporado ingresado en la barra lateral.
-- **Comparativo:** permite ver ambos embalses lado a lado; en AP incluye los valores observados disponibles.
-- **Hidrogeneración DSS:** resume la variable Hidrogeneración DSS por semana operativa sábado-viernes.
+El propósito no es reemplazar el criterio hidrológico ni la coordinación operativa, sino ofrecer una vista rápida y consistente para responder preguntas como:
 
-**3. Aportes totales vs DSS**
-El DSS se interpreta como **AP neto**. Para comparar con aportes totales observados:
+- ¿El nivel observado está cercano a la trayectoria simulada?
+- ¿Qué percentil DSS representa mejor la condición actual?
+- ¿Los aportes observados se parecen más a un escenario seco, medio o húmedo?
+- ¿Qué hidrogeneración DSS está asociada al percentil operativo evaluado?
+- ¿Existen señales tempranas de desviación que requieran revisión?
+
+---
+
+### ¿Para qué se usa el modelo DSS?
+
+El modelo DSS se utiliza como una herramienta de apoyo a la decisión para evaluar posibles trayectorias futuras de los embalses bajo diferentes escenarios hidrológicos y operativos. En este dashboard, el DSS permite revisar:
+
+- **NP:** nivel proyectado del embalse, en ft PLD.
+- **AP:** aportes del embalse, interpretados en la app como AP neto DSS.
+- **HP:** hidrogeneración proyectada o recomendada por el escenario DSS.
+- **V:** vertidos o descargas por aliviadero/estructuras, según la variable disponible.
+- **EG / EP:** consumos asociados a esclusajes en Gatún, cuando están disponibles en el DSS.
+
+La simulación DSS debe interpretarse como un conjunto de escenarios. Cada percentil representa una trayectoria posible, no una predicción única. Por eso se recomienda comparar el dato observado con varias curvas, no solamente con P50.
+
+---
+
+### Cómo interpretar los percentiles DSS
+
+Los percentiles se leen como escenarios de probabilidad de excedencia:
+
+- **P95:** condición más seca o de menor aporte. Se ubica abajo en las gráficas de aportes.
+- **P50:** condición media o central.
+- **P5:** condición más húmeda o de mayor aporte. Se ubica arriba en las gráficas de aportes.
+
+En las gráficas de **AP / Aportes**, el visor se ordena visualmente de húmedo a seco: **P5 arriba** y **P95 abajo**. Esto facilita verificar rápidamente si el aporte observado se acerca a una condición seca, media o húmeda.
+
+Para AP, la app corrige la etiqueta por magnitud cuando es necesario, manteniendo esta interpretación:
+
+`menor AP → P95`  
+`mayor AP → P5`
+
+---
+
+### Carga de información
+
+La app puede trabajar con archivos locales o cargados manualmente desde la barra lateral.
+
+**Archivo DSS:**
+- Coloca `SimulacionDSS_2026.xlsx` en la carpeta `data`, o cárgalo manualmente desde la barra lateral.
+- La app también busca variantes del nombre del archivo DSS si existen copias nuevas.
+
+**Archivos observados:**
+- Coloca los `BulkExport*.csv` o CSV normalizados en la carpeta `data`, o súbelos desde la barra lateral.
+- La app reconoce niveles y aportes observados para Gatún y Alhajuela/Madden.
+- La serie **Lake-Res elevation.Telem Radar@MAD** se usa para el nivel observado de Alhajuela/Madden cuando está disponible.
+- Los CSV subidos manualmente tienen prioridad sobre los archivos locales.
+
+Después de reemplazar un Excel o CSV, usa **Recargar archivos** para limpiar caché y actualizar los cálculos.
+
+---
+
+### Barra lateral: cómo utilizarla correctamente
+
+La barra lateral es el panel de control principal del dashboard. Desde allí se cargan los archivos, se actualizan los datos y se definen los parámetros que afectan la visualización e interpretación de los resultados. Se recomienda configurarla antes de revisar las pestañas de análisis.
+
+#### 1. Carga del archivo DSS
+
+En la sección **Archivos DSS** se debe cargar el archivo principal de simulación, normalmente denominado `SimulacionDSS_2026.xlsx`.
+
+Existen dos formas de usarlo:
+
+- **Carga automática:** colocar el archivo DSS dentro de la carpeta `data` del proyecto. La app lo buscará automáticamente al iniciar.
+- **Carga manual:** usar el botón de carga de la barra lateral para seleccionar el Excel DSS desde la computadora.
+
+Si se carga un archivo manualmente, ese archivo tendrá prioridad durante la sesión. Si se reemplaza el Excel DSS o se actualizan archivos CSV, se debe presionar **Recargar archivos** para limpiar la caché y obligar a la app a leer los datos más recientes.
+
+#### 2. Botón Recargar archivos
+
+El botón **Recargar archivos** se usa cuando se cambia o reemplaza algún archivo de entrada, por ejemplo:
+
+- nuevo Excel DSS;
+- nuevos CSV de Aquarius/BulkExport;
+- actualización de niveles observados;
+- actualización de aportes observados;
+- corrección o sustitución de archivos dentro de la carpeta `data`.
+
+Este botón no cambia los cálculos manualmente; solo fuerza a la app a volver a leer los archivos disponibles.
+
+#### 3. Unidad de caudal / flujo
+
+La opción **Unidad de caudal / flujo** permite seleccionar cómo se muestran los aportes, vertidos y comparativos hidráulicos:
+
+- `p³/s`: pies cúbicos por segundo, unidad base usual de muchas salidas DSS.
+- `m³/s`: metros cúbicos por segundo, útil para reportes técnicos en unidades internacionales.
+- `hm³/d`: hectómetros cúbicos por día, útil para interpretar volúmenes diarios de balance.
+
+Al cambiar esta opción, la app actualiza las métricas, gráficas, tablas y comparativos relacionados con AP, V, EG, EP y aportes observados. Los niveles se mantienen en **ft PLD** y la hidrogeneración se mantiene en **MW**.
+
+#### 4. Percentiles de referencia
+
+La barra lateral tiene dos selectores independientes:
+
+- **Percentil de referencia Gatún**
+- **Percentil de referencia Alhajuela/Madden**
+
+Estos percentiles se usan para las métricas principales, la pestaña **Manejo / Decisión**, los promedios de horizonte y la comparación operativa de cada embalse. No es obligatorio usar el mismo percentil para ambos embalses, porque Gatún y Alhajuela/Madden pueden responder a condiciones hidrológicas diferentes.
+
+La interpretación general es:
+
+- **P95:** escenario más seco o de menor aporte.
+- **P50:** escenario central o medio.
+- **P5:** escenario más húmedo o de mayor aporte.
+
+En la pestaña **Manejo / Decisión**, la columna de percentil de referencia indica el percentil seleccionado por el usuario, mientras que las columnas de valores muestran los resultados DSS asociados al percentil utilizado para nivel, aporte, vertido e hidrogeneración.
+
+#### 5. Evaporación GAT y Evaporación ALHA
+
+Los campos **Evaporación GAT** y **Evaporación ALHA** se ingresan en `p³/s`. Estos valores se usan para ajustar el aporte DSS de cada embalse mediante la relación:
 
 `AP total DSS estimado = AP neto DSS + caudal evaporado`
 
-Ingresa el caudal evaporado en **p³/s** en cada pestaña de aporte.
+Este ajuste permite comparar de forma más consistente el AP DSS con el aporte observado. La app siempre suma la evaporación al AP neto DSS; no la resta. Si no se desea aplicar ajuste por evaporación, se debe dejar el valor en `0.0`.
 
-**4. Semana operativa**
-La semana se calcula de **sábado a viernes**. Para 2026, el 30-may al 05-jun corresponde a la **semana 23** y desde el 06-jun inicia la **semana 24**.
+#### 6. Glosario lateral
 
-**5. Recomendación de uso**
-Primero revisa **Manejo / Decisión**, luego valida detalle en **GATÚN DSS** o **ALHAJUELA DSS**, y finalmente compara aportes observados en las pestañas de aporte.
+El glosario de la barra lateral resume las siglas principales usadas en el DSS:
+
+- **NP:** nivel proyectado.
+- **HP:** hidrogeneración.
+- **AP:** aportes.
+- **V:** vertidos.
+- **EG / EP:** consumos por esclusajes, cuando están disponibles.
+- **P95...P5:** probabilidades de excedencia o escenarios percentiles.
+
+Este glosario sirve como referencia rápida para interpretar las pestañas sin volver al instructivo completo.
+
+#### 7. Orden recomendado de configuración
+
+Antes de analizar los resultados, se recomienda configurar la barra lateral en este orden:
+
+1. Verificar que el archivo DSS esté cargado correctamente.
+2. Confirmar que los CSV observados estén en la carpeta `data` o cargados manualmente.
+3. Presionar **Recargar archivos** si se reemplazó algún archivo.
+4. Seleccionar la unidad de caudal/flujo requerida para el análisis.
+5. Seleccionar el percentil de referencia para Gatún.
+6. Seleccionar el percentil de referencia para Alhajuela/Madden.
+7. Ingresar la evaporación de Gatún y Alhajuela/Madden, si aplica.
+8. Revisar primero la pestaña **Manejo / Decisión** y luego las pestañas específicas de cada embalse.
+
+---
+
+### Aportes DSS, aportes observados y evaporación
+
+El DSS se interpreta en esta app como **AP neto**. Para compararlo con el aporte total observado, la app calcula:
+
+`AP total DSS estimado = AP neto DSS + caudal evaporado`
+
+Este ajuste es importante porque el aporte observado puede representar una condición total del sistema, mientras que el DSS puede estar expresado como aporte neto. La app está blindada para que el caudal evaporado **siempre se sume** al AP neto DSS y nunca se reste.
+
+La evaporación se ingresa en `p³/s` para cada embalse. Luego la app convierte el resultado a la unidad seleccionada por el usuario.
+
+---
+
+### Pestaña GATÚN DSS
+
+Esta pestaña permite revisar Gatún en detalle:
+
+- Nivel proyectado DSS vs nivel observado.
+- Hidrogeneración DSS por percentiles.
+- AP total DSS estimado y aporte observado.
+- Vertidos DSS.
+- Consumos por esclusajes EG + EP, cuando estén disponibles.
+- Tabla diaria descargable con los valores DSS.
+
+Se recomienda usarla para validar si Gatún se comporta según el percentil de referencia o si el observado se acerca a otra trayectoria.
+
+---
+
+### Pestaña ALHAJUELA DSS
+
+Esta pestaña permite revisar Alhajuela/Madden en detalle:
+
+- Nivel proyectado DSS vs nivel observado.
+- Hidrogeneración DSS.
+- AP total DSS estimado y aporte observado.
+- Vertidos DSS.
+- Tabla diaria descargable.
+
+La serie Radar@MAD se utiliza como referencia observada de nivel cuando está disponible. Si no se encuentra, la app continúa funcionando con los datos DSS y los CSV locales/subidos disponibles.
+
+---
+
+### Pestaña Manejo / Decisión
+
+Esta pestaña resume el estado ejecutivo por embalse. Debe ser la primera revisión operativa.
+
+Incluye:
+
+- **Estado:** semáforo de comparación entre nivel observado y nivel DSS.
+- **Obs. LKH:** último nivel observado disponible.
+- **Fecha obs.:** fecha del último dato observado.
+- **Percentil referencia:** percentil seleccionado en la barra lateral.
+- **Nivel DSS usado:** nivel simulado asociado al percentil operativo usado.
+- **Aporte DSS usado:** AP total DSS estimado en la unidad seleccionada.
+- **Vertido DSS usado:** vertido DSS en la unidad seleccionada.
+- **HP DSS usada:** hidrogeneración DSS asociada.
+- **Series DSS usadas:** trazabilidad de los percentiles usados para NP, AP, V y HP.
+- Promedios del horizonte seleccionado para AP, V y HP.
+- Cambio esperado de nivel dentro del horizonte seleccionado.
+
+El semáforo usa el umbral operativo configurado para cada embalse:
+
+- **🟢 En rango:** diferencia dentro del margen normal.
+- **🟠 Atención:** la diferencia alcanza 70% del umbral.
+- **🔴 Revisar:** la diferencia iguala o supera el umbral.
+
+Los umbrales por defecto son:
+
+- Gatún: **0.10 ft**
+- Alhajuela/Madden: **0.60 ft**
+
+---
+
+### Pestañas de aporte observado
+
+Las pestañas **Aporte GAT obs** y **Aporte ALHA obs** comparan el aporte observado con el AP total DSS estimado.
+
+La interpretación recomendada es:
+
+- Si el observado está cerca de **P95**, la condición se parece a un escenario seco.
+- Si el observado está cerca de **P50**, la condición se parece a un escenario medio.
+- Si el observado está cerca de **P5**, la condición se parece a un escenario húmedo.
+
+Estas pestañas ayudan a identificar si la hidrología real está alineada con el percentil operativo usado o si conviene revisar otro escenario.
+
+---
+
+### Pestaña Comparativo
+
+La pestaña comparativa permite revisar Gatún y Alhajuela/Madden lado a lado. Es útil para ver si ambos embalses están respondiendo de forma consistente o si uno presenta mayor desviación respecto al DSS.
+
+En AP, el comparativo mantiene la lectura de percentiles:
+
+- **P5:** más húmedo / mayor aporte.
+- **P95:** más seco / menor aporte.
+
+---
+
+### Pestaña Hidrogeneración DSS
+
+Esta pestaña resume la hidrogeneración DSS por semana operativa. La semana operativa se calcula de **sábado a viernes**.
+
+Para 2026:
+
+- Del 30-may al 05-jun corresponde a la **semana 23**.
+- Desde el 06-jun inicia la **semana 24**.
+
+La pestaña permite revisar el patrón semanal de hidrogeneración por embalse y relacionarlo con el percentil operativo evaluado.
+
+---
+
+### Recomendación de uso operativo
+
+La secuencia recomendada es:
+
+1. Revisar **Manejo / Decisión** para conocer el estado general.
+2. Validar el embalse específico en **GATÚN DSS** o **ALHAJUELA DSS**.
+3. Revisar las pestañas de **aporte observado** para identificar el percentil hidrológico actual.
+4. Revisar **Hidrogeneración DSS** para confirmar la recomendación semanal.
+5. Usar **Comparativo** para evaluar ambos embalses de forma conjunta.
+
+La lectura final debe considerar siempre la consistencia entre nivel observado, aporte observado, percentil DSS, vertidos e hidrogeneración.
 """)
 
 # ─────────────────────────────────────────────────────────────────────
