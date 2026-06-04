@@ -41,7 +41,7 @@ echo ============================================================
 echo OK: series descargadas y cambios enviados a GitHub.
 echo La ventana se cerrara en 10 segundos...
 echo ============================================================
-timeout /t 10 /nobreak >nul
+timeout /t 15 /nobreak >nul
 exit /b 0
 
 :ERROR_REPO
@@ -55,7 +55,7 @@ echo.
 echo ============================================================
 echo ERROR: hubo un problema en la actualizacion.
 echo Revise los mensajes de arriba.
-echo La ventana se cerrara en 10 segundos...
+echo La ventana se cerrara en 15 segundos...
 echo ============================================================
 timeout /t 10 /nobreak >nul
 exit /b 1
