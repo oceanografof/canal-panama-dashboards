@@ -1,143 +1,59 @@
 @echo off
-setlocal EnableExtensions DisableDelayedExpansion
+setlocal EnableExtensions
 
+REM Ajuste esta ruta si cambia la carpeta local del repositorio.
 set "REPO=C:\Users\JFRodriguez\OneDrive - Autoridad del Canal de Panama\Documents\Doc Doctorado\Articulo 1\Borrador Articulo\nuevo\MareasTest\DATA\TuRepo"
-set "BRANCH=main"
 set "PY_SCRIPT=download_data.py"
 
-cd /d "%REPO%" || (
-    echo ERROR: no se pudo entrar al repositorio.
-    timeout /t 10 /nobreak >nul
-    exit /b 1
-)
+cd /d "%REPO%"
+if errorlevel 1 goto ERROR_REPO
 
 echo ============================================================
-echo Actualizacion automatica - GitHub
-echo Sube archivos nuevos y modificados antes de sincronizar
+echo Actualizacion automatica - Aquarius / GitHub
+echo Descarga series de tiempo, guarda data y sube al repositorio
 echo ============================================================
-
-call :cleanup_cache
-call :ensure_gitignore
-
 echo.
-echo [1/6] Guardando cambios locales antes de sincronizar...
-call :commit_all "Cambios locales antes de sincronizar"
 
-echo.
-echo [2/6] Sincronizando con GitHub...
-git fetch origin
-if errorlevel 1 goto :git_error
-
-git checkout %BRANCH%
-if errorlevel 1 goto :git_error
-
-git pull --no-rebase -X ours origin %BRANCH%
-if errorlevel 1 call :resolve_conflicts
-if errorlevel 1 goto :git_error
-
-git push origin %BRANCH%
-if errorlevel 1 goto :git_error
-
-echo.
-echo [3/6] Ejecutando descarga de datos...
-echo Incluye las series adicionales solicitadas:
-echo   - Discharge_AT_GAT_Diario.csv
-echo   - Discharge_AT_ALHA_Diario.csv
-echo   - Lake_Res_elevation_Telem_AVG_GAT.csv
+if exist "__pycache__" rmdir /s /q "__pycache__"
+for /d /r %%D in (__pycache__) do if exist "%%D" rmdir /s /q "%%D"
+del /s /q "*.pyc" 2>nul
 
 if not exist "%PY_SCRIPT%" (
-    echo ERROR: no se encontro %PY_SCRIPT% en el repositorio.
-    echo Coloque el download_data.py actualizado en esta misma carpeta.
-    goto :git_error
+    echo ERROR: no se encontro %PY_SCRIPT% en esta carpeta.
+    echo Copie el download_data.py corregido dentro del repositorio.
+    goto ERROR_FINAL
 )
+
+echo Ejecutando %PY_SCRIPT%...
+echo El script de Python se encarga de:
+echo   1. guardar cambios locales,
+echo   2. sincronizar con GitHub,
+echo   3. descargar las series,
+echo   4. hacer commit,
+echo   5. hacer push.
+echo.
 
 python "%PY_SCRIPT%"
-if errorlevel 1 (
-    echo ADVERTENCIA: %PY_SCRIPT% termino con error.
-    echo Se intentara subir cualquier archivo que haya cambiado.
-)
-
-echo.
-echo [4/6] Preparando archivos para subir...
-call :cleanup_cache
-call :ensure_gitignore
-
-echo.
-echo [5/6] Subiendo cualquier archivo nuevo o modificado...
-call :commit_all "Auto todos los archivos"
-
-echo.
-echo [6/6] Sincronizacion final con GitHub...
-git pull --no-rebase -X ours origin %BRANCH%
-if errorlevel 1 call :resolve_conflicts
-if errorlevel 1 goto :git_error
-
-git push origin %BRANCH%
-if errorlevel 1 goto :git_error
+if errorlevel 1 goto ERROR_FINAL
 
 echo.
 echo ============================================================
-echo OK: cambios enviados a GitHub.
-echo Streamlit Cloud se actualizara en 1-2 minutos.
+echo OK: series descargadas y cambios enviados a GitHub.
 echo La ventana se cerrara en 10 segundos...
 echo ============================================================
 timeout /t 10 /nobreak >nul
 exit /b 0
 
-
-:cleanup_cache
-if exist "__pycache__" rmdir /s /q "__pycache__"
-for /d /r %%D in (__pycache__) do if exist "%%D" rmdir /s /q "%%D"
-del /s /q "*.pyc" 2>nul
-exit /b 0
-
-
-:ensure_gitignore
-if not exist ".gitignore" type nul > ".gitignore"
-findstr /x /c:"__pycache__/" ".gitignore" >nul 2>nul || echo __pycache__/>> ".gitignore"
-findstr /x /c:"*.pyc" ".gitignore" >nul 2>nul || echo *.pyc>> ".gitignore"
-exit /b 0
-
-
-:commit_all
-git add -A
-set "HAS_CHANGES="
-for /f "delims=" %%S in ('git status --porcelain') do set "HAS_CHANGES=1"
-
-if defined HAS_CHANGES (
-    git commit -m "%~1 %date% %time%"
-) else (
-    echo Sin cambios para commit.
-)
-exit /b 0
-
-
-:resolve_conflicts
+:ERROR_REPO
 echo.
-echo Resolviendo conflictos automaticamente.
-echo Se conservara la version local para archivos en conflicto.
+echo ERROR: no se pudo entrar al repositorio configurado.
+echo Revise la variable REPO dentro de actualizar.bat.
+goto ERROR_FINAL
 
-set "HAS_CONFLICTS="
-for /f "delims=" %%F in ('git diff --name-only --diff-filter=U') do (
-    set "HAS_CONFLICTS=1"
-    echo Conservando local: %%F
-    git checkout --ours -- "%%F"
-    git add "%%F"
-)
-
-if defined HAS_CONFLICTS (
-    git commit -m "Resuelve conflictos conservando version local %date% %time%"
-    exit /b 0
-) else (
-    echo No se encontraron archivos en conflicto.
-    exit /b 1
-)
-
-
-:git_error
+:ERROR_FINAL
 echo.
 echo ============================================================
-echo ERROR: hubo un problema de Git.
+echo ERROR: hubo un problema en la actualizacion.
 echo Revise los mensajes de arriba.
 echo La ventana se cerrara en 10 segundos...
 echo ============================================================
