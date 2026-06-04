@@ -337,7 +337,13 @@ def _detect_variable(header_text: str, filename: str) -> str:
 @st.cache_data(show_spinner=False)
 def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, str, str, str]:
     """
-    Lee un CSV de BulkExport (Aquatic Informatics).
+    Lee un CSV de BulkExport o un CSV normalizado por el descargador local.
+
+    Formatos soportados:
+    1) BulkExport original de Aquatic Informatics.
+    2) CSV normalizado/sanitizado con columnas:
+       fecha_inicio, fecha_fin, valor_raw
+
     Retorna: (df_diario, embalse, variable, serie_name)
     df_diario tiene columnas: Fecha_dia, Valor, Fuente
     variable: 'nivel' | 'aporte'
@@ -354,15 +360,16 @@ def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, 
     if not lines:
         return empty, "Desconocido", "aporte", "—"
 
-    # Detect separator
+    # Detectar separador con las primeras líneas.
     sep = ";" if sum(l.count(";") for l in lines[:10]) >= sum(l.count(",") for l in lines[:10]) else ","
 
-    # Find header row
+    # Buscar fila de encabezado. Incluye BulkExport y CSV normalizado local.
     header_idx = 0
-    for i, line in enumerate(lines[:50]):
+    for i, line in enumerate(lines[:80]):
         low = line.lower()
-        if ("sello" in low or "timestamp" in low or "fecha" in low or "time" in low) and \
-           ("valor" in low or "value" in low or "ft" in low):
+        has_time = any(x in low for x in ["sello", "timestamp", "fecha", "date", "time"])
+        has_value = any(x in low for x in ["valor", "value", "valor_raw", "ft", "cfs", "cms", "m3", "m³"])
+        if has_time and has_value:
             header_idx = i
             break
 
@@ -387,12 +394,74 @@ def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, 
     if df.empty or len(df.columns) < 2:
         return empty, embalse, variable, serie
 
-    time_col = df.columns[0]
-    val_col = df.columns[1]
+    # ── Detección robusta de columnas ───────────────────────────────
+    # Los CSV normalizados tienen: fecha_inicio, fecha_fin, valor_raw.
+    # Antes se tomaba la segunda columna como valor; eso podía leer fecha_fin
+    # y dejar todo como NaN. Aquí se detecta explícitamente la columna numérica.
+    def _norm_col(c: object) -> str:
+        s = str(c).strip().lower()
+        repl = str.maketrans("áéíóúüñ", "aeiouun")
+        return s.translate(repl)
+
+    cols = list(df.columns)
+    norm = {_norm_col(c): c for c in cols}
+
+    preferred_time_names = [
+        "fecha_inicio", "timestamp", "sello de tiempo", "sello", "fecha", "date", "time"
+    ]
+    time_col = None
+    for key in preferred_time_names:
+        for n, original in norm.items():
+            if key in n:
+                parsed = pd.to_datetime(df[original], errors="coerce")
+                if parsed.notna().sum() > 0:
+                    time_col = original
+                    break
+        if time_col is not None:
+            break
+    if time_col is None:
+        time_col = cols[0]
+
+    preferred_value_names = [
+        "valor_raw", "valor", "value", "elevation", "nivel", "discharge", "aporte", "flow", "cfs", "ft"
+    ]
+    value_col = None
+    for key in preferred_value_names:
+        for n, original in norm.items():
+            if original == time_col:
+                continue
+            if key in n and not any(x in n for x in ["fecha", "date", "time", "sello"]):
+                sample = df[original].astype(str).str.replace(",", ".", regex=False).str.strip()
+                parsed = pd.to_numeric(sample, errors="coerce")
+                if parsed.notna().sum() > 0:
+                    value_col = original
+                    break
+        if value_col is not None:
+            break
+
+    # Respaldo: escoger la columna con mayor cantidad de valores numéricos,
+    # excluyendo columnas claramente temporales.
+    if value_col is None:
+        best = None
+        best_count = -1
+        for c in cols:
+            n = _norm_col(c)
+            if c == time_col or any(x in n for x in ["fecha", "date", "time", "sello"]):
+                continue
+            sample = df[c].astype(str).str.replace(",", ".", regex=False).str.strip()
+            parsed = pd.to_numeric(sample, errors="coerce")
+            count = int(parsed.notna().sum())
+            if count > best_count:
+                best = c
+                best_count = count
+        value_col = best
+
+    if time_col is None or value_col is None:
+        return empty, embalse, variable, serie
 
     out = pd.DataFrame()
     out["Fecha"] = pd.to_datetime(df[time_col], errors="coerce")
-    raw_val = df[val_col].astype(str).str.replace(",", ".", regex=False).str.strip()
+    raw_val = df[value_col].astype(str).str.replace(",", ".", regex=False).str.strip()
     out["Valor"] = pd.to_numeric(raw_val, errors="coerce")
     out = out.dropna(subset=["Fecha", "Valor"]).sort_values("Fecha")
     out["Fuente"] = filename or serie
@@ -400,15 +469,23 @@ def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, 
     if out.empty:
         return empty, embalse, variable, serie
 
-    # Agregar a diario
+    # Agregar a diario.
+    # - Nivel subdiario: último valor diario, más representativo del estado operativo.
+    # - Aporte diario/subdiario: promedio diario.
     out["Fecha_dia"] = out["Fecha"].dt.floor("D")
-    # Blindaje: ninguna observación debe quedar después del día actual operativo.
-    # Esto evita líneas observadas adelantadas por zona horaria o sello futuro.
     out = clamp_observed_future_dates(out, "Fecha_dia")
-    daily = out.groupby("Fecha_dia", as_index=False).agg(
-        Valor=("Valor", "mean"),
-        Fuente=("Fuente", "last"),
-    )
+
+    if variable == "nivel":
+        daily = out.groupby("Fecha_dia", as_index=False).agg(
+            Valor=("Valor", "last"),
+            Fuente=("Fuente", "last"),
+        )
+    else:
+        daily = out.groupby("Fecha_dia", as_index=False).agg(
+            Valor=("Valor", "mean"),
+            Fuente=("Fuente", "last"),
+        )
+
     return daily.sort_values("Fecha_dia"), embalse, variable, serie
 
 
