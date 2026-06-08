@@ -43,10 +43,10 @@ if not exist "%PY_SCRIPT%" (
 
 set "PYTHON_CMD="
 where py >nul 2>&1
-if not errorlevel 1 set "PYTHON_CMD=py -3"
+if not errorlevel 1 set "PYTHON_CMD=py -3 -u"
 if not defined PYTHON_CMD (
     where python >nul 2>&1
-    if not errorlevel 1 set "PYTHON_CMD=python"
+    if not errorlevel 1 set "PYTHON_CMD=python -u"
 )
 if not defined PYTHON_CMD (
     echo ERROR: no se encontro Python.
@@ -70,6 +70,10 @@ echo.
 
 %PYTHON_CMD% "%PY_SCRIPT%"
 if errorlevel 1 goto ERROR_FINAL
+
+echo.
+echo Archivos CSV en data despues de actualizar:
+if exist "data\*.csv" dir /T:W /O:-D "data\*.csv"
 
 echo.
 echo ============================================================

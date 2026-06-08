@@ -204,7 +204,70 @@ BASE_DATASET_MAP = [
     {"keywords": ["Wind Speed.LAN WS AVG", "LAN WS AVG", "LAN_WS"], "out_name": "LAN_WS_AVG_FLC.csv", "label": "Viento LAN WS AVG @ FLC"},
 ]
 
-EXPECTED_DATA_FILES = {m["out_name"] for m in SERIES_CONFIG} | {m["out_name"] for m in BASE_DATASET_MAP}
+# Estas 4 series antes se descargaban juntas en un BulkExport base. Para evitar
+# que Aquarius entregue un ZIP parcial/cacheado y queden archivos sin actualizar,
+# también se consultan individualmente, igual que las demás series operativas.
+BASE_SERIES_CONFIG = [
+    {
+        "station": "AMA",
+        "dataset": "Water Temp.LAN WT AVG@AMA",
+        "calculation": "Aggregate",
+        "unit_id": 153,
+        "interval": "Hourly",
+        "time_aligned": "False",
+        "date_range": "Custom",
+        "period": "P90D",
+        "calendar": "CALENDARYEAR2",
+        "out_name": "LAN_WT_AVG_AMA.csv",
+        "label": "Temp LAN WT AVG @ AMA",
+        "kind_keywords": ["Water Temp.LAN WT AVG", "LAN WT AVG", "LAN_WT", "AMA"],
+    },
+    {
+        "station": "AMA",
+        "dataset": "Water Temp.Telemetria TEMP@AMA",
+        "calculation": "Aggregate",
+        "unit_id": 153,
+        "interval": "Hourly",
+        "time_aligned": "False",
+        "date_range": "Custom",
+        "period": "P90D",
+        "calendar": "CALENDARYEAR2",
+        "out_name": "Telemetria_TEMP_AMA.csv",
+        "label": "Temp Telemetría @ AMA",
+        "kind_keywords": ["Water Temp.Telemetria TEMP", "Telemetria", "TEMP@AMA", "AMA"],
+    },
+    {
+        "station": "LMB",
+        "dataset": "Wind Speed.WS AVG@LMB",
+        "calculation": "Aggregate",
+        "unit_id": 170,
+        "interval": "Hourly",
+        "time_aligned": "False",
+        "date_range": "Custom",
+        "period": "P90D",
+        "calendar": "CALENDARYEAR2",
+        "out_name": "WS_AVG_LMB.csv",
+        "label": "Viento WS AVG @ LMB",
+        "kind_keywords": ["Wind Speed.WS AVG", "WS AVG@LMB", "WS_AVG", "LMB"],
+    },
+    {
+        "station": "FLC",
+        "dataset": "Wind Speed.LAN WS AVG@FLC",
+        "calculation": "Aggregate",
+        "unit_id": 170,
+        "interval": "Hourly",
+        "time_aligned": "False",
+        "date_range": "Custom",
+        "period": "P90D",
+        "calendar": "CALENDARYEAR2",
+        "out_name": "LAN_WS_AVG_FLC.csv",
+        "label": "Viento LAN WS AVG @ FLC",
+        "kind_keywords": ["Wind Speed.LAN WS AVG", "LAN WS AVG", "LAN_WS", "FLC"],
+    },
+]
+
+ALL_SERIES_CONFIG = SERIES_CONFIG + BASE_SERIES_CONFIG
+EXPECTED_DATA_FILES = {m["out_name"] for m in ALL_SERIES_CONFIG}
 
 
 @dataclass
@@ -259,7 +322,7 @@ def build_series_url(series: dict) -> str:
         "TimeZone": series.get("time_zone", TIME_ZONE),
         "Calendar": series.get("calendar", CALENDAR),
         "Interval": series.get("interval", "PointsAsRecorded"),
-        "Step": "1",
+        "Step": str(series.get("step", "1")),
         "ExportFormat": "csv",
         "TimeAligned": series.get("time_aligned", "True"),
         "RoundData": "True",
@@ -273,6 +336,8 @@ def build_series_url(series: dict) -> str:
         "Datasets[0].UnitId": str(series["unit_id"]),
         "_": str(int(time.time() * 1000)),
     }
+    if series.get("period"):
+        params["Period"] = series["period"]
     return "https://panama.aquaticinformatics.net/Export/BulkExport?" + urlencode(params)
 
 
@@ -848,6 +913,89 @@ def save_and_summarize(csv_map: dict[str, str], output_dir: Path) -> list[Path]:
     return saved
 
 
+def clean_legacy_data_files(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for legacy_name in ("Discharge_ATotal_ALHA_tst.csv",):
+        legacy = output_dir / legacy_name
+        if legacy.exists():
+            legacy.unlink()
+            print(f"  🧹 Archivo anterior eliminado: {legacy.name}")
+
+
+def choose_best_payload_for_series(series: dict, csv_map: dict[str, str]) -> tuple[str, str]:
+    """Escoge el CSV descargado para una serie individual.
+
+    Como cada consulta usa un solo Datasets[0], si Aquarius cambia el nombre
+    del archivo dentro del ZIP, no dependemos únicamente del nombre. Se intenta
+    confirmar por palabras clave y, si no hay coincidencia explícita, se usa el
+    primer CSV con datos válidos de esa descarga individual.
+    """
+    candidates: list[tuple[int, str, str]] = []
+    keywords = list(series.get("kind_keywords", [])) + [series["dataset"], Path(series["out_name"]).stem]
+
+    for filename, content in csv_map.items():
+        norm = normalize_csv(content)
+        if not norm or norm.count("\n") < 1:
+            continue
+
+        target = f"{filename}\n{content[:5000]}"
+        matched = match_dataset(filename, content)
+        score = 10
+        if matched and matched.get("out_name") == series["out_name"]:
+            score = 100
+        elif text_has_any(target, keywords):
+            score = 80
+
+        candidates.append((score, filename, norm))
+
+    if not candidates:
+        raise RuntimeError("Aquarius respondió, pero no se encontró un CSV con filas válidas para normalizar.")
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    score, filename, norm = candidates[0]
+    return filename, norm
+
+
+def save_single_series(series: dict, csv_map: dict[str, str], output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir.resolve().parent != REPO_DIR.resolve():
+        raise RuntimeError("La carpeta data debe estar directamente dentro del repositorio.")
+
+    out_name = Path(series["out_name"]).name
+    if out_name not in EXPECTED_DATA_FILES:
+        raise RuntimeError(f"Nombre de salida no autorizado: {out_name}")
+
+    source_name, norm = choose_best_payload_for_series(series, csv_map)
+    path = output_dir / out_name
+    if path.resolve().parent != output_dir.resolve():
+        raise RuntimeError(f"Ruta de salida insegura: {path}")
+
+    atomic_write_text(path, norm + "\n")
+    records = norm.count("\n")
+    print(f"  ✅ {series['label']}: {records} registros → {out_name}")
+    print(f"     Fuente Aquarius: {source_name}")
+    return path
+
+
+def verify_expected_outputs(saved: list[Path]) -> None:
+    saved_names = {p.name for p in saved}
+    expected_names = {m["out_name"] for m in ALL_SERIES_CONFIG}
+    missing = sorted(expected_names - saved_names)
+    if missing:
+        raise RuntimeError(
+            "No se actualizaron todas las series requeridas. Faltan: " + ", ".join(missing)
+        )
+
+    print("\n── Verificación de archivos actualizados ──────")
+    for meta in ALL_SERIES_CONFIG:
+        path = OUTPUT_DIR / meta["out_name"]
+        if not path.exists():
+            raise RuntimeError(f"No existe el archivo esperado: {path.name}")
+        mtime = datetime.fromtimestamp(path.stat().st_mtime)
+        print(f"  ✅ {path.name:<40} modificado {mtime:%Y-%m-%d %H:%M:%S}")
+
+
+
 def print_summary(saved: list[Path]) -> None:
     print("\n── Resumen de archivos normalizados ───────────")
     for path in saved:
@@ -906,29 +1054,40 @@ def main() -> None:
         print(f"\n❌ Error de Git/seguridad: {sanitize_text(str(e))}")
         sys.exit(1)
 
-    csv_map: dict[str, str] = {}
+    clean_legacy_data_files(OUTPUT_DIR)
+    saved: list[Path] = []
+    failures: list[str] = []
 
-    print("\n[1/4] Descargando BulkExport base de temperatura/viento...")
-    try:
-        raw = download_bytes(BASE_BULK_URL)
-        csv_map.update(extract_csv_payloads(raw, "base_temp_wind.csv"))
-    except Exception as e:
-        print(f"  ⚠️ No se pudo descargar el BulkExport base: {sanitize_text(str(e))}")
-
-    print("\n[2/4] Descargando series de tiempo solicitadas...")
-    for idx, series in enumerate(SERIES_CONFIG, start=1):
-        print(f"\n  Serie {idx}/{len(SERIES_CONFIG)}: {series['label']}")
+    print(f"\n[1/4] Descargando y guardando {len(ALL_SERIES_CONFIG)} series individuales desde Aquarius...")
+    for idx, series in enumerate(ALL_SERIES_CONFIG, start=1):
+        print(f"\n  Serie {idx}/{len(ALL_SERIES_CONFIG)}: {series['label']}")
         try:
             raw = download_bytes(build_series_url(series))
-            csv_map.update(extract_csv_payloads(raw, series["out_name"]))
+            payloads = extract_csv_payloads(raw, series["out_name"])
+            saved_path = save_single_series(series, payloads, OUTPUT_DIR)
+            saved.append(saved_path)
         except Exception as e:
-            print(f"  ⚠️ No se pudo descargar {series['label']}: {sanitize_text(str(e))}")
+            msg = sanitize_text(str(e))
+            failures.append(f"{series['out_name']}: {msg}")
+            print(f"  ❌ No se pudo actualizar {series['label']}: {msg}")
 
-    print(f"\n[3/4] Normalizando y guardando en: {OUTPUT_DIR}")
-    saved = save_and_summarize(csv_map, OUTPUT_DIR)
-    if not saved:
-        print("\n❌ No se guardó ningún archivo. Revise conexión/VPN o nombres de datasets.")
+    print(f"\n[2/4] Verificando que todos los CSV requeridos se hayan actualizado en: {OUTPUT_DIR}")
+    try:
+        verify_expected_outputs(saved)
+    except Exception as e:
+        print(f"\n❌ {sanitize_text(str(e))}")
+
+    if failures:
+        print("\n❌ Fallaron una o más series. No se hará commit ni push para evitar subir datos incompletos:")
+        for item in failures:
+            print(f"    · {item}")
         sys.exit(1)
+
+    if len({p.name for p in saved}) != len(ALL_SERIES_CONFIG):
+        print("\n❌ No se actualizaron todas las series requeridas. No se hará commit ni push.")
+        sys.exit(1)
+
+    print("\n[3/4] Resumen de archivos normalizados...")
     print_summary(saved)
 
     print("\n[4/4] Commit y push seguro al repositorio...")
