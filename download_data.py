@@ -208,44 +208,46 @@ BASE_DATASET_MAP = [
 # que Aquarius entregue un ZIP parcial/cacheado y queden archivos sin actualizar,
 # también se consultan individualmente, igual que las demás series operativas.
 BASE_SERIES_CONFIG = [
+    # Estas 4 series deben descargarse con los parámetros exactos indicados por Aquarius:
+    # DateRange=EntirePeriodOfRecord, Calendar=CALENDARYEAR,
+    # Interval=PointsAsRecorded, TimeAligned=True, Calculation=Instantaneous.
+    # Antes estaban como Aggregate/Hourly/P90D y por eso Aquarius devolvía CSV tipo
+    # "Aggregate" que no se normalizaban correctamente.
     {
         "station": "AMA",
         "dataset": "Water Temp.LAN WT AVG@AMA",
-        "calculation": "Aggregate",
+        "calculation": "Instantaneous",
         "unit_id": 153,
-        "interval": "Hourly",
-        "time_aligned": "False",
-        "date_range": "Custom",
-        "period": "P90D",
-        "calendar": "CALENDARYEAR2",
+        "interval": "PointsAsRecorded",
+        "time_aligned": "True",
+        "date_range": "EntirePeriodOfRecord",
+        "calendar": "CALENDARYEAR",
         "out_name": "LAN_WT_AVG_AMA.csv",
         "label": "Temp LAN WT AVG @ AMA",
-        "kind_keywords": ["Water Temp.LAN WT AVG", "LAN WT AVG", "LAN_WT", "AMA"],
+        "kind_keywords": ["Water Temp.LAN WT AVG", "LAN WT AVG", "LAN_WT", "WT AVG@AMA", "AMA"],
     },
     {
         "station": "AMA",
         "dataset": "Water Temp.Telemetria TEMP@AMA",
-        "calculation": "Aggregate",
+        "calculation": "Instantaneous",
         "unit_id": 153,
-        "interval": "Hourly",
-        "time_aligned": "False",
-        "date_range": "Custom",
-        "period": "P90D",
-        "calendar": "CALENDARYEAR2",
+        "interval": "PointsAsRecorded",
+        "time_aligned": "True",
+        "date_range": "EntirePeriodOfRecord",
+        "calendar": "CALENDARYEAR",
         "out_name": "Telemetria_TEMP_AMA.csv",
         "label": "Temp Telemetría @ AMA",
-        "kind_keywords": ["Water Temp.Telemetria TEMP", "Telemetria", "TEMP@AMA", "AMA"],
+        "kind_keywords": ["Water Temp.Telemetria TEMP", "Telemetria TEMP", "TEMP@AMA", "AMA"],
     },
     {
         "station": "LMB",
         "dataset": "Wind Speed.WS AVG@LMB",
-        "calculation": "Aggregate",
+        "calculation": "Instantaneous",
         "unit_id": 170,
-        "interval": "Hourly",
-        "time_aligned": "False",
-        "date_range": "Custom",
-        "period": "P90D",
-        "calendar": "CALENDARYEAR2",
+        "interval": "PointsAsRecorded",
+        "time_aligned": "True",
+        "date_range": "EntirePeriodOfRecord",
+        "calendar": "CALENDARYEAR",
         "out_name": "WS_AVG_LMB.csv",
         "label": "Viento WS AVG @ LMB",
         "kind_keywords": ["Wind Speed.WS AVG", "WS AVG@LMB", "WS_AVG", "LMB"],
@@ -253,13 +255,12 @@ BASE_SERIES_CONFIG = [
     {
         "station": "FLC",
         "dataset": "Wind Speed.LAN WS AVG@FLC",
-        "calculation": "Aggregate",
+        "calculation": "Instantaneous",
         "unit_id": 170,
-        "interval": "Hourly",
-        "time_aligned": "False",
-        "date_range": "Custom",
-        "period": "P90D",
-        "calendar": "CALENDARYEAR2",
+        "interval": "PointsAsRecorded",
+        "time_aligned": "True",
+        "date_range": "EntirePeriodOfRecord",
+        "calendar": "CALENDARYEAR",
         "out_name": "LAN_WS_AVG_FLC.csv",
         "label": "Viento LAN WS AVG @ FLC",
         "kind_keywords": ["Wind Speed.LAN WS AVG", "LAN WS AVG", "LAN_WS", "FLC"],
@@ -768,17 +769,19 @@ def text_has_any(text: str, keywords: list[str]) -> bool:
 
 
 def match_dataset(filename: str, content: str) -> dict | None:
-    target = f"{filename}\n{content[:3000]}"
+    target = f"{filename}\n{content[:5000]}"
     target_upper = target.upper()
 
-    for meta in SERIES_CONFIG:
-        specific_keywords = list(meta.get("kind_keywords", [])) + [meta["dataset"]]
+    # Buscar primero en todas las series configuradas, incluyendo las 4 series
+    # de temperatura/viento que ahora se descargan individualmente.
+    for meta in globals().get("ALL_SERIES_CONFIG", SERIES_CONFIG):
+        specific_keywords = list(meta.get("kind_keywords", [])) + [meta["dataset"], Path(meta["out_name"]).stem]
         if text_has_any(target, specific_keywords):
             # Confirmar estación en series donde varios sensores comparten palabras similares.
-            # Esto evita que MAD se confunda con GAT solo por contener "Lake-Res elevation".
-            if ("Tide Height" in meta["dataset"] or "Lake-Res" in meta["dataset"]):
+            if ("Tide Height" in meta["dataset"] or "Lake-Res" in meta["dataset"]
+                    or "Wind Speed" in meta["dataset"] or "Water Temp" in meta["dataset"]):
                 station_token = f"@{meta['station']}".upper()
-                if station_token not in target_upper:
+                if station_token not in target_upper and meta["station"].upper() not in target_upper:
                     continue
             return meta
 
@@ -789,17 +792,25 @@ def match_dataset(filename: str, content: str) -> dict | None:
 
 
 def find_header_index(lines: list[str]) -> int | None:
+    """Ubica la fila de encabezados del CSV exportado por Aquarius.
+
+    Aquarius puede cambiar los títulos según el tipo de cálculo:
+    - Instantaneous / PointsAsRecorded suele traer columnas de tiempo y valor.
+    - Aggregate puede traer "Interval Start", "Interval End", "Value", etc.
+    Por eso no se exige literalmente "timestamp"; se aceptan variantes de fecha,
+    hora, inicio/fin de intervalo y valor.
+    """
+    time_words = ("timestamp", "sello de tiempo", "fecha", "date", "time", "hora", "interval", "inicio", "start", "end", "fin")
+    value_words = ("value", "valor", "result", "resultado", "reading", "lectura", "avg", "average", "mean", "promedio")
     for i, line in enumerate(lines):
         low = line.lower()
-        if (
-            ("timestamp" in low or "sello de tiempo" in low or "fecha" in low or "time" in low)
-            and ("value" in low or "valor" in low)
-        ):
+        if any(w in low for w in time_words) and any(w in low for w in value_words):
             return i
     return None
 
 
 def detect_separator(line: str) -> str:
+    # Aquarius normalmente usa coma, pero algunos equipos/regiones pueden usar punto y coma.
     return ";" if line.count(";") > line.count(",") else ","
 
 
@@ -814,6 +825,41 @@ def parse_float(value: str) -> float | None:
         return float(clean)
     except ValueError:
         return None
+
+
+def _column_score_for_time(header_name: str) -> int:
+    h = header_name.strip().lower()
+    score = 0
+    if "timestamp" in h or "sello de tiempo" in h:
+        score += 100
+    if "date" in h or "fecha" in h:
+        score += 80
+    if "time" in h or "hora" in h:
+        score += 60
+    if "interval start" in h or "start time" in h or "inicio" in h:
+        score += 70
+    if "interval" in h:
+        score += 20
+    if h in {"time", "date time", "datetime", "fecha", "fecha/hora"}:
+        score += 50
+    return score
+
+
+def _column_score_for_value(header_name: str) -> int:
+    h = header_name.strip().lower()
+    score = 0
+    if h in {"value", "valor"}:
+        score += 100
+    if "value" in h or "valor" in h:
+        score += 90
+    if "reading" in h or "lectura" in h or "result" in h or "resultado" in h:
+        score += 70
+    if "avg" in h or "average" in h or "mean" in h or "promedio" in h:
+        score += 40
+    # Evita escoger columnas de calidad/aprobación como si fueran valores.
+    if any(bad in h for bad in ("grade", "quality", "approval", "qualifier", "nota", "note", "interpolation")):
+        score -= 100
+    return score
 
 
 def normalize_csv(text: str) -> str:
@@ -831,27 +877,61 @@ def normalize_csv(text: str) -> str:
     except StopIteration:
         return ""
 
-    header_low = [h.strip().lower() for h in header]
-    ts_idx = next((i for i, h in enumerate(header_low) if "timestamp" in h or "sello de tiempo" in h or "fecha" in h or "time" in h), 0)
-    val_idx = next((i for i, h in enumerate(header_low) if "value" in h or "valor" in h), 1 if len(header) > 1 else 0)
+    header_clean = [h.strip().strip('"').strip("'") for h in header]
 
+    # Selección robusta de columna de tiempo.
+    time_scores = [(_column_score_for_time(h), i) for i, h in enumerate(header_clean)]
+    time_scores.sort(reverse=True)
+    ts_idx = time_scores[0][1] if time_scores and time_scores[0][0] > 0 else 0
+
+    # Selección robusta de columna de valor.
+    value_scores = [(_column_score_for_value(h), i) for i, h in enumerate(header_clean)]
+    value_scores.sort(reverse=True)
+    val_idx = value_scores[0][1] if value_scores and value_scores[0][0] > 0 else (1 if len(header_clean) > 1 else 0)
+
+    # Si por alguna razón coincide con la columna de tiempo, buscar la primera columna numérica distinta.
     rows = []
+    sample_rows = []
     for row in reader:
+        sample_rows.append(row)
+        if len(sample_rows) >= 50:
+            break
+
+    if val_idx == ts_idx:
+        best_numeric = None
+        best_count = -1
+        for i in range(len(header_clean)):
+            if i == ts_idx:
+                continue
+            count = 0
+            for row in sample_rows:
+                if len(row) > i and parse_float(row[i]) is not None:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                best_numeric = i
+        if best_numeric is not None:
+            val_idx = best_numeric
+
+    def add_row(row: list[str]) -> None:
         if len(row) <= max(ts_idx, val_idx):
-            continue
+            return
         timestamp = row[ts_idx].strip().strip('"').strip("'")
         value_raw = row[val_idx].strip().strip('"').strip("'")
         value = parse_float(value_raw)
         if not timestamp or value is None:
-            continue
+            return
 
         # Evita fórmulas si alguien abre el CSV en Excel.
-        # Se conserva el sello de tiempo de Aquarius, pero se rechaza si empieza
-        # con caracteres de fórmula y se limpian saltos/tabulaciones.
         safe_timestamp = timestamp.replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
         if safe_timestamp[:1] in {"=", "+", "-", "@"}:
-            continue
+            return
         rows.append((safe_timestamp, safe_timestamp, value))
+
+    for row in sample_rows:
+        add_row(row)
+    for row in reader:
+        add_row(row)
 
     output = io.StringIO()
     writer = csv.writer(output, lineterminator="\n")
