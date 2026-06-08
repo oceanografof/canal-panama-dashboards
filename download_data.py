@@ -298,7 +298,15 @@ def run_git(repo_dir: Path, *cmd: str, env: dict | None = None) -> tuple[int, st
         errors="replace",
         env=full_env,
     )
-    return result.returncode, sanitize_text(result.stdout.strip()), sanitize_text(result.stderr.strip())
+    # IMPORTANTE:
+    # No usar .strip() aquí. La salida de `git status --short` usa los dos
+    # primeros caracteres como columnas de estado y un espacio separador.
+    # Si se eliminan espacios iniciales, rutas como "LakeHouse_Data.xlsx"
+    # pueden quedar mal interpretadas como "akeHouse_Data.xlsx", y
+    # "data/archivo.csv" como "ata/archivo.csv".
+    stdout = sanitize_text(result.stdout.rstrip("\r\n"))
+    stderr = sanitize_text(result.stderr.rstrip("\r\n"))
+    return result.returncode, stdout, stderr
 
 
 def cleanup_temp_files(repo_dir: Path) -> None:
@@ -381,16 +389,19 @@ def parse_status(status: str) -> list[GitStatusEntry]:
         if len(line) < 4:
             continue
         xy = line[:2]
-        path = line[3:].strip()
+        # No eliminar espacios al inicio de la ruta; Git ya separa el estado
+        # con los tres primeros caracteres. Solo se eliminan finales.
+        path = line[3:].rstrip()
         if " -> " in path:
-            path = path.split(" -> ", 1)[1].strip()
+            path = path.split(" -> ", 1)[1].rstrip()
         entries.append(GitStatusEntry(xy=xy, path=path.replace("\\", "/")))
     return entries
 
 
 def git_status_short(repo_dir: Path) -> str:
     code, out, err = run_git(repo_dir, "git", "status", "--short")
-    return out.strip() if code == 0 else (err or out).strip()
+    # Conserva espacios iniciales de las columnas XY de Git.
+    return out.rstrip("\r\n") if code == 0 else (err or out).rstrip("\r\n")
 
 
 def scan_for_secrets(repo_dir: Path, paths: list[str]) -> None:

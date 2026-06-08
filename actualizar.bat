@@ -37,7 +37,7 @@ if not exist ".git" (
 
 if not exist "%PY_SCRIPT%" (
     echo ERROR: no se encontro %PY_SCRIPT% en esta carpeta.
-    echo Copie el download_data.py blindado dentro de la raiz del repositorio.
+    echo Copie download_data.py dentro de la raiz del repositorio.
     goto ERROR_FINAL
 )
 
@@ -53,6 +53,9 @@ if not defined PYTHON_CMD (
     echo Instale Python o agreguelo al PATH.
     goto ERROR_FINAL
 )
+
+REM Asegura caracteres UTF-8 en Python cuando sea posible.
+set "PYTHONUTF8=1"
 
 echo Repositorio: %CD%
 echo Python usado: %PYTHON_CMD%
