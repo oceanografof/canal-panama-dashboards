@@ -589,6 +589,24 @@ def exceedance_pct(col: str) -> int:
     return int(m.group()) if m else 50
 
 
+def order_cols_wet_to_dry(cols: List[str], pct_map: Optional[Dict[str, int]] = None) -> List[str]:
+    """Orden visual de probabilidades para leyenda/visor Plotly.
+
+    Convención solicitada en el dashboard:
+    - P5  = condición más húmeda / curva superior.
+    - P95 = condición más seca / curva inferior.
+
+    Plotly muestra el visor unificado en el orden en que se agregan las
+    trazas; por eso todas las gráficas deben enviar las columnas como
+    P5 → P95.
+    """
+    def _pct(c: str) -> int:
+        if pct_map is not None:
+            return int(pct_map.get(c, exceedance_pct(c)))
+        return int(exceedance_pct(c))
+    return sorted([c for c in cols if c is not None], key=lambda c: (_pct(c), str(c)))
+
+
 def ordered_percentile_map_by_value(df: pd.DataFrame, cols: List[str], ref_row: Optional[pd.Series] = None) -> Dict[str, int]:
     """Mapea columnas AP a **probabilidad de excedencia** según magnitud.
 
@@ -818,7 +836,7 @@ def fan_chart(df: pd.DataFrame, cols: List[str], title: str, y_label: str, key: 
     if df.empty or not cols:
         st.info("Sin datos para graficar.")
         return
-    cols = [c for c in cols if c in df.columns]
+    cols = order_cols_wet_to_dry([c for c in cols if c in df.columns])
     if not cols:
         st.info("Columnas no disponibles.")
         return
@@ -1037,7 +1055,20 @@ def sidebar() -> Dict:
 # Métricas de cabecera
 # ─────────────────────────────────────────────────────────────────────
 def show_header_metrics(daily: pd.DataFrame, cfg: Dict, flow_unit: str,
-                        obs_daily: Optional[pd.DataFrame] = None) -> None:
+                        obs_daily: Optional[pd.DataFrame] = None,
+                        obs_aportes: Optional[pd.DataFrame] = None,
+                        evap_cfs: float = 0.0,
+                        pct_ref: int = 50) -> None:
+    """Métricas principales usando el percentil más cercano disponible.
+
+    Corrección puntual:
+    - NP se etiqueta con el percentil más cercano al nivel observado.
+    - AP se etiqueta con el percentil más cercano al aporte observado de Aquarius,
+      considerando AP total DSS = AP neto DSS + evaporación.
+    - HP sigue el percentil AP más cercano cuando existe aporte observado; si no,
+      usa el percentil más cercano al nivel observado. Así las tarjetas no quedan
+      mezcladas con P50/P90/P95 sin relación con el dato observado.
+    """
     if daily.empty:
         return
     token = cfg["token"]
@@ -1045,48 +1076,100 @@ def show_header_metrics(daily: pd.DataFrame, cfg: Dict, flow_unit: str,
     hp_cols = cols_by_prefix(daily, "HP", token)
     ap_cols = cols_by_prefix(daily, "AP", token)
 
-    np50 = next((c for c in np_cols if "50" in c), np_cols[0] if np_cols else None)
-    hp50 = next((c for c in hp_cols if "50" in c), hp_cols[0] if hp_cols else None)
-    ap50 = next((c for c in ap_cols if "50" in c), ap_cols[0] if ap_cols else None)
-
-    today = pd.Timestamp.today().normalize()
-    srt   = daily.sort_values("Fecha_dia")
+    today = today_panama()
+    srt = daily.copy()
+    srt["Fecha_dia"] = pd.to_datetime(srt["Fecha_dia"], errors="coerce").dt.normalize()
+    srt = srt[srt["Fecha_dia"].notna()].sort_values("Fecha_dia")
+    if srt.empty:
+        return
     exact = srt[srt["Fecha_dia"] == today]
-    rec   = exact.iloc[0] if not exact.empty else srt.iloc[-1]
+    past = srt[srt["Fecha_dia"] <= today]
+    rec = exact.iloc[0] if not exact.empty else (past.iloc[-1] if not past.empty else srt.iloc[-1])
 
-    np50_v = float(rec.get(np50, np.nan)) if np50 else np.nan
-    hp50_v = float(rec.get(hp50, np.nan)) if hp50 else np.nan
-    ap50_v = float(rec.get(ap50, np.nan)) if ap50 else np.nan
-    ap50_c = convert_flow(pd.Series([ap50_v]), flow_unit).iloc[0]
-
-    # Último nivel observado
-    obs_val, obs_date, closest = None, None, None
-    if obs_daily is not None and not obs_daily.empty:
-        obs_valid = obs_daily[obs_daily["Valor"].notna()].sort_values("Fecha_dia")
-        if not obs_valid.empty:
+    # Último nivel observado y percentil NP más cercano.
+    obs_val, obs_date, closest_level = None, None, None
+    if obs_daily is not None and isinstance(obs_daily, pd.DataFrame) and not obs_daily.empty:
+        obs_valid = obs_daily[obs_daily["Valor"].notna()].copy()
+        obs_valid["Fecha_dia"] = pd.to_datetime(obs_valid["Fecha_dia"], errors="coerce").dt.normalize()
+        obs_valid = obs_valid[obs_valid["Fecha_dia"].notna()].sort_values("Fecha_dia")
+        obs_past = obs_valid[obs_valid["Fecha_dia"] <= today]
+        if not obs_past.empty:
+            last_obs = obs_past.iloc[-1]
+        elif not obs_valid.empty:
             last_obs = obs_valid.iloc[-1]
-            obs_val  = float(last_obs["Valor"])
+        else:
+            last_obs = None
+        if last_obs is not None:
+            obs_val = float(last_obs["Valor"])
             obs_date = pd.to_datetime(last_obs["Fecha_dia"])
-            closest  = closest_np(daily, cfg, obs_date, obs_val)
+            closest_level = closest_np(srt, cfg, obs_date, obs_val)
+
+    level_pct = int(str(closest_level["label"]).replace("P", "")) if closest_level else int(pct_ref)
+    np_col, np_pct = pick_percentile_column(np_cols, level_pct)
+    np_v = float(rec.get(np_col, np.nan)) if np_col else np.nan
+
+    # Último aporte observado y percentil AP más cercano.
+    ap_nearest = None
+    obs_ap_val_cfs, obs_ap_date = np.nan, None
+    if obs_aportes is not None and isinstance(obs_aportes, pd.DataFrame) and not obs_aportes.empty:
+        obs_ap = clamp_observed_future_dates(obs_aportes, "Fecha_dia")
+        obs_ap = obs_ap[obs_ap["Valor"].notna()].copy()
+        obs_ap["Fecha_dia"] = pd.to_datetime(obs_ap["Fecha_dia"], errors="coerce").dt.normalize()
+        obs_ap = obs_ap[obs_ap["Fecha_dia"].notna()].sort_values("Fecha_dia")
+        obs_ap_past = obs_ap[obs_ap["Fecha_dia"] <= today]
+        if not obs_ap_past.empty:
+            last_ap = obs_ap_past.iloc[-1]
+        elif not obs_ap.empty:
+            last_ap = obs_ap.iloc[-1]
+        else:
+            last_ap = None
+        if last_ap is not None:
+            obs_ap_val_cfs = float(last_ap["Valor"])
+            obs_ap_date = pd.to_datetime(last_ap["Fecha_dia"])
+            ap_nearest = _nearest_ap_percentile(
+                srt, cfg, obs_ap_date, obs_ap_val_cfs, dss_add_cfs=clean_evap_cfs(evap_cfs)
+            )
+
+    ap_pct = int(ap_nearest["percentile"]) if ap_nearest else level_pct
+    ap_pct_map = ordered_percentile_map_by_value(srt, ap_cols, ref_row=rec) if ap_cols else {}
+    ap_col, ap_pct_used = pick_percentile_column(ap_cols, ap_pct, pct_map=ap_pct_map)
+    hp_col, hp_pct_used = pick_percentile_column(hp_cols, ap_pct if ap_nearest else level_pct)
+
+    ap_dss_cfs = ap_total_dss_cfs([rec.get(ap_col, np.nan)], evap_cfs).iloc[0] if ap_col else np.nan
+    ap_dss_v = convert_flow(pd.Series([ap_dss_cfs]), flow_unit).iloc[0] if pd.notna(ap_dss_cfs) else np.nan
+    hp_v = float(rec.get(hp_col, np.nan)) if hp_col else np.nan
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("📅 Referencia DSS", rec["Fecha_dia"].strftime("%d-%m-%Y"))
     if obs_val is not None:
-        delta = f"Δ vs NP50: {obs_val - np50_v:+.3f} ft" if pd.notna(np50_v) else None
+        delta = f"Δ vs NP P{np_pct}: {obs_val - np_v:+.3f} ft" if pd.notna(np_v) and np_pct is not None else None
         c2.metric(f"🔴 Obs. {cfg['level_unit']}", f"{obs_val:,.3f}", delta=delta,
                   delta_color="inverse",
                   help=f"Último observado: {obs_date:%d-%m-%Y}" if obs_date else None)
     else:
         c2.metric("🔴 Obs. LKH", "—")
-    c3.metric(f"NP50 ({cfg['level_unit']})", f"{np50_v:,.3f}" if pd.notna(np50_v) else "—")
-    c4.metric("HP50 (MW)", f"{hp50_v:,.2f}" if pd.notna(hp50_v) else "—")
-    c5.metric(f"AP50 ({unit_label(flow_unit)})", f"{ap50_c:,.2f}" if pd.notna(ap50_c) else "—")
-    if closest:
-        c6.metric("🎯 Percentil más cercano", closest["label"],
-                  delta=f"Obs-DSS: {closest['diff']:+.3f} ft", delta_color="inverse",
-                  help=f"NP DSS: {closest['dss_value']:.3f} ft · {closest['date']:%d-%m-%Y}")
+    c3.metric(f"NP cercano P{np_pct if np_pct is not None else '—'} ({cfg['level_unit']})",
+              f"{np_v:,.3f}" if pd.notna(np_v) else "—")
+    c4.metric(f"HP cercano P{hp_pct_used if hp_pct_used is not None else '—'} (MW)",
+              f"{hp_v:,.2f}" if pd.notna(hp_v) else "—")
+    c5.metric(f"AP DSS P{ap_pct_used if ap_pct_used is not None else '—'} ({unit_label(flow_unit)})",
+              f"{ap_dss_v:,.2f}" if pd.notna(ap_dss_v) else "—",
+              help="AP total DSS estimado = AP neto DSS + evaporación.")
+    if closest_level or ap_nearest:
+        level_txt = closest_level["label"] if closest_level else "—"
+        ap_txt = ap_nearest["label"] if ap_nearest else "—"
+        delta_txt = None
+        help_txt = []
+        if closest_level:
+            delta_txt = f"Nivel: {closest_level['diff']:+.3f} ft"
+            help_txt.append(f"Nivel DSS {closest_level['label']}: {closest_level['dss_value']:.3f} ft · {closest_level['date']:%d-%m-%Y}")
+        if ap_nearest:
+            ap_diff = convert_flow(pd.Series([ap_nearest['diff_cfs']]), flow_unit).iloc[0]
+            help_txt.append(f"AP DSS {ap_nearest['label']}: {convert_flow(pd.Series([ap_nearest['dss_total_cfs']]), flow_unit).iloc[0]:,.2f} {unit_label(flow_unit)} · Obs-DSS {ap_diff:+,.2f} {unit_label(flow_unit)}")
+        c6.metric("🎯 Percentil cercano", f"NP {level_txt} · AP {ap_txt}",
+                  delta=delta_txt, delta_color="inverse", help=" | ".join(help_txt) if help_txt else None)
     else:
-        c6.metric("🎯 Percentil más cercano", "—")
+        c6.metric("🎯 Percentil cercano", "—")
 
 
 def show_aporte_reservoir_metrics(
@@ -1119,15 +1202,6 @@ def show_aporte_reservoir_metrics(
         past = base[base["Fecha_dia"] <= today]
         ref_row = past.iloc[-1] if not past.empty else base.iloc[-1]
 
-    ap_pct_map = ordered_percentile_map_by_value(base, ap_cols, ref_row=ref_row)
-    # Columna AP de referencia visual según pct_ref
-    ap_ref = next((c for c, p in ap_pct_map.items() if p == pct_ref), None)
-    if ap_ref is None:
-        ap_ref = next((c for c in ap_cols if exceedance_pct(c) == pct_ref), ap_cols[0])
-
-    ap_dss_total_cfs = ap_total_dss_cfs([ref_row.get(ap_ref, np.nan)], evap_cfs).iloc[0] if ap_ref else np.nan
-    ap_dss_total = convert_flow(pd.Series([ap_dss_total_cfs]), flow_unit).iloc[0] if pd.notna(ap_dss_total_cfs) else np.nan
-
     obs_val_cfs = np.nan
     obs_date = None
     if obs_aportes is not None and isinstance(obs_aportes, pd.DataFrame) and not obs_aportes.empty:
@@ -1151,24 +1225,26 @@ def show_aporte_reservoir_metrics(
     if pd.notna(obs_val_cfs) and obs_date is not None:
         nearest_obs = _nearest_ap_percentile(base, cfg, obs_date, obs_val_cfs, dss_add_cfs=clean_evap_cfs(evap_cfs))
 
+    indicador_pct = int(nearest_obs.get("percentile", pct_ref)) if nearest_obs else int(pct_ref)
+    ap_pct_map = ordered_percentile_map_by_value(base, ap_cols, ref_row=ref_row)
+    ap_ref, ap_ref_pct = pick_percentile_column(ap_cols, indicador_pct, pct_map=ap_pct_map)
+
+    ap_dss_total_cfs = ap_total_dss_cfs([ref_row.get(ap_ref, np.nan)], evap_cfs).iloc[0] if ap_ref else np.nan
+    ap_dss_total = convert_flow(pd.Series([ap_dss_total_cfs]), flow_unit).iloc[0] if pd.notna(ap_dss_total_cfs) else np.nan
+
     # Hidrogeneración DSS recomendada: usa el mismo percentil operativo del aporte más cercano.
     hp_rec_val = np.nan
     hp_rec_label = "—"
-    if nearest_obs and hp_cols:
-        # La hidrogeneración recomendada debe seguir el percentil AP corregido
-        # como probabilidad de excedencia, no el sufijo crudo de la columna AP.
-        indicador_pct = int(nearest_obs.get("percentile", pct_ref))
-        hp_col, hp_pct = pick_percentile_column(hp_cols, indicador_pct)
-        if hp_col is not None:
-            hp_rec_val = float(ref_row.get(hp_col, np.nan))
-            hp_rec_label = f"P{hp_pct}" if hp_pct is not None else nearest_obs["label"]
-    elif hp_cols:
-        hp_col = next((c for c in hp_cols if exceedance_pct(c) == pct_ref), hp_cols[0])
+    hp_col, hp_pct = pick_percentile_column(hp_cols, indicador_pct)
+    if hp_col is not None:
         hp_rec_val = float(ref_row.get(hp_col, np.nan))
-        hp_rec_label = f"P{pct_ref}"
+        hp_rec_label = f"P{hp_pct}" if hp_pct is not None else f"P{indicador_pct}"
 
     st.markdown("#### 🌧️ Aporte observado, AP DSS ajustado e hidrogeneración")
-    st.caption(f"{SIMULATION_NOTE} · AP total DSS estimado = AP neto DSS + evaporación.")
+    st.caption(
+        f"{SIMULATION_NOTE} · AP total DSS estimado = AP neto DSS + evaporación. "
+        "Las tarjetas usan el percentil más cercano al aporte observado cuando está disponible."
+    )
 
     m1, m2, m3, m4, m5, m6 = st.columns([1.05, 0.85, 1.15, 1.05, 1.10, 1.05])
     m1.metric(
@@ -1179,7 +1255,7 @@ def show_aporte_reservoir_metrics(
     m2.metric("Fecha aporte obs.", f"{obs_date:%d-%m-%Y}" if obs_date is not None else "—")
     m3.metric("Evaporación aplicada (p³/s)", f"{clean_evap_cfs(evap_cfs):,.1f}")
     m4.metric(
-        f"AP total DSS P{ap_pct_map.get(ap_ref, exceedance_pct(ap_ref))} ({unit_label(flow_unit)})",
+        f"AP total DSS P{ap_ref_pct if ap_ref_pct is not None else '—'} ({unit_label(flow_unit)})",
         f"{ap_dss_total:,.2f}" if pd.notna(ap_dss_total) else "—",
     )
     if nearest_obs:
@@ -1227,7 +1303,7 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
     with st.expander("🗓️ Filtro de período", expanded=True):
         filtered = date_filter(daily, f"{res_key}_res")
 
-    show_header_metrics(filtered, cfg, flow_unit, obs_niveles)
+    show_header_metrics(filtered, cfg, flow_unit, obs_niveles, obs_aportes, evap_cfs, pct_ref)
     if obs_niveles is not None and not obs_niveles.empty:
         last = obs_niveles[obs_niveles["Valor"].notna()].sort_values("Fecha_dia")
         if not last.empty:
@@ -1245,7 +1321,7 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
 
     # --- NP con observado ---
     st.markdown("### 📈 Nivel proyectado vs observado")
-    default_np = [c for c in np_cols if any(x in c for x in ["50", "90", "10"])]
+    default_np = [c for c in np_cols if any(x in c for x in ["10", "50", "90"])]
     sel_np = st.multiselect("Series NP", np_cols, default=default_np, key=f"{res_key}_np")
 
     obs_col_in_df = None
@@ -1280,7 +1356,7 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
         ap_df_all, ordered_ap_cols_all, ap_pct_map = make_ordered_ap_columns(
             filtered, ap_cols, flow_unit, add_cfs=clean_evap_cfs(evap_cfs)
         )
-        pcts_available = sorted(set(ap_pct_map.values()), reverse=True)
+        pcts_available = sorted(set(ap_pct_map.values()))
         default_pcts = pcts_available
         sel_pcts = st.multiselect(
             "Percentiles AP",
@@ -1362,7 +1438,7 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
             total_cols = []
             # Sum EG+EP por percentil
             pcts_found = sorted(
-                set(exceedance_pct(c) for c in eg_cols + ep_cols), reverse=True
+                set(exceedance_pct(c) for c in eg_cols + ep_cols)
             )
             for pct in pcts_found:
                 eg_c = next((c for c in eg_cols if exceedance_pct(c) == pct), None)
@@ -1376,8 +1452,8 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
                 total_cols.append(nc)
             sel_esc = st.multiselect(
                 "Probabilidades esclusajes",
-                [exceedance_pct(c) for c in eg_cols],
-                default=[p for p in [90, 50, 10] if p in [exceedance_pct(c) for c in eg_cols]],
+                sorted(set(exceedance_pct(c) for c in eg_cols)),
+                default=[p for p in [10, 50, 90] if p in set(exceedance_pct(c) for c in eg_cols)],
                 format_func=lambda x: f"P{x}", key="gat_esc",
             )
             plot_esc_cols = [c for c in total_cols if any(f"P{p}" in c for p in sel_esc)]
@@ -1589,7 +1665,7 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
 
         fig = go.Figure()
         # Todos los NP en gris fino, el de referencia en azul, observado en rojo
-        for col in np_cols:
+        for col in order_cols_wet_to_dry(np_cols):
             pct = exceedance_pct(col)
             is_ref = (pct == pct_ref)
             fig.add_trace(go.Scatter(
@@ -1826,7 +1902,7 @@ def tab_aporte_obs_embalse(
         obs_f = obs_f.dropna(subset=["Fecha_dia", "Aporte total observado (p³/s)"]).sort_values("Fecha_dia")
 
     ap_pct_map = ordered_percentile_map_by_value(daily, ap_cols)
-    pcts_available = sorted(set(ap_pct_map.values()), reverse=True)
+    pcts_available = sorted(set(ap_pct_map.values()))
     default_p = [p for p in [90, 50, 10] if p in pcts_available] or pcts_available[:3]
     sel_pcts = st.multiselect(
         f"Percentiles AP total DSS estimado — {embalse}",
@@ -2198,6 +2274,7 @@ def tab_comparativo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_
         alh_cols = [c for c in alh_cols_all if exceedance_pct(c) in pcts]
         st.caption("En AP se corrige la etiqueta como probabilidad de excedencia: menor AP → P95; mayor AP → P5. En el visor Plotly se ordena P5 arriba y P95 abajo.")
     else:
+        st.caption("El visor Plotly se ordena de húmedo a seco: P5 arriba y P95 abajo.")
         gat_cols = [c for c in raw_gat_cols if exceedance_pct(c) in pcts]
         alh_cols = [c for c in raw_alh_cols if exceedance_pct(c) in pcts]
         gat_plot = gat_f.copy()
@@ -2274,101 +2351,306 @@ def tab_comparativo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_
 # PESTAÑA 7 — APORTE INSTANTÁNEO
 # ─────────────────────────────────────────────────────────────────────
 
-def tab_aporte_instantaneo(dss_bytes: bytes, flow_unit: str, pct_ref: int = 50) -> None:
+def tab_aporte_instantaneo(
+    dss_bytes: bytes,
+    flow_unit: str,
+    pct_ref_gat: int = 50,
+    pct_ref_alh: int = 50,
+    obs_gat_aporte: Optional[pd.DataFrame] = None,
+    obs_alh_aporte: Optional[pd.DataFrame] = None,
+    evap_gat_cfs: float = 0.0,
+    evap_alh_cfs: float = 0.0,
+) -> None:
     """Pestaña de aporte instantáneo.
 
-    Mantiene el radar como referencia visual, pero el foco de la pestaña es
-    comparar aportes instantáneos totales contra AP total DSS estimado:
-        AP total DSS estimado = AP neto DSS + evaporación
+    Muestra el visor meteorológico y compara aportes instantáneos/manuales,
+    aportes observados de Aquarius/BulkExport y AP total DSS estimado.
     """
     st.subheader("⚡ Aporte instantáneo")
     st.caption(
-        "Ingrese el aporte total observado/estimado y el caudal evaporado en p³/s. "
-        "La comparación se hace contra **AP total DSS estimado = AP neto DSS + evaporación**."
+        "Visor de referencia meteorológica y comparación contra Aquarius/BulkExport y DSS. "
+        "El DSS se compara como **AP total DSS estimado = AP neto DSS + evaporación**."
     )
     st.caption(SIMULATION_NOTE)
 
+    try:
+        gat_raw = load_dss_sheet(dss_bytes, RESERVOIR_CONFIG["gatun"]["sheet"])
+        alh_raw = load_dss_sheet(dss_bytes, RESERVOIR_CONFIG["alhajuela"]["sheet"])
+        gat_d = to_daily(gat_raw, RESERVOIR_CONFIG["gatun"])
+        alh_d = to_daily(alh_raw, RESERVOIR_CONFIG["alhajuela"])
+    except Exception as exc:
+        st.error(f"Error DSS: {exc}")
+        return
+
     c_img, c_ctrl = st.columns([1.15, 1.25])
     with c_img:
-        st.markdown("#### Aporte instantáneo meteorológico de referencia")
+        st.markdown("#### Visor — aporte instantáneo")
         try:
             ts = pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
             components.html(f"""
             <div style="border:1px solid rgba(0,62,105,.18);border-radius:14px;padding:10px;background:#f8fafc">
                 <img src="{RADAR_URL}?t={ts}" style="width:100%;border-radius:10px;" />
                 <div style="font-size:12px;color:#667085;margin-top:6px;">
-                    Aporte instantáneo Canal · {pd.Timestamp.now():%d-%m-%Y %H:%M}
+                    Aporte instantáneo · Radar meteorológico Canal · {pd.Timestamp.now():%d-%m-%Y %H:%M}
                 </div>
             </div>""", height=560)
             if st.checkbox("Auto-recargar cada 5 min", key="ap_inst_auto"):
                 components.html("<script>setTimeout(()=>window.parent.location.reload(),300000);</script>", height=0)
         except Exception as exc:
-            st.warning(f"No se pudo mostrar el radar: {exc}")
+            st.warning(f"No se pudo mostrar el visor: {exc}")
 
     with c_ctrl:
-        st.markdown("#### Comparar aporte instantáneo con DSS")
-        ref_date = st.date_input("Fecha de referencia DSS", value=today_panama().date(), key="apinst_ref")
-        unit_obs = st.selectbox("Unidad del aporte observado", ["cfs", "m³/s", "hm³/d"],
+        st.markdown("#### Comparar aporte instantáneo / Aquarius / DSS")
+        ref_date = st.date_input("Fecha de referencia DSS para entrada manual", value=today_panama().date(), key="apinst_ref")
+        unit_obs = st.selectbox("Unidad del aporte manual", ["cfs", "m³/s", "hm³/d"],
                                 format_func=unit_label, key="apinst_unit")
-        st.markdown("##### Aportes totales observados")
+        st.markdown("##### Entrada manual opcional")
         g1, g2 = st.columns(2)
-        obs_g = g1.number_input(f"GAT total obs. ({unit_label(unit_obs)})", min_value=0.0, step=10.0, key="apinst_g")
-        obs_a = g2.number_input(f"ALHA total obs. ({unit_label(unit_obs)})", min_value=0.0, step=10.0, key="apinst_a")
-        st.markdown("##### Evaporación a sumar al AP neto DSS")
+        obs_g = g1.number_input(f"GAT aporte instantáneo ({unit_label(unit_obs)})", min_value=0.0, step=10.0, key="apinst_g")
+        obs_a = g2.number_input(f"ALHA aporte instantáneo ({unit_label(unit_obs)})", min_value=0.0, step=10.0, key="apinst_a")
+        st.markdown("##### Evaporación usada para ajustar AP DSS")
         e1, e2 = st.columns(2)
-        evap_g = e1.number_input("Evap. GAT (p³/s)", min_value=0.0, value=0.0, step=10.0, format="%.3f", key="apinst_evap_g")
-        evap_a = e2.number_input("Evap. ALHA (p³/s)", min_value=0.0, value=0.0, step=10.0, format="%.3f", key="apinst_evap_a")
+        evap_g = e1.number_input("Evap. GAT (p³/s)", min_value=0.0, value=float(clean_evap_cfs(evap_gat_cfs)), step=10.0, format="%.3f", key="apinst_evap_g")
+        evap_a = e2.number_input("Evap. ALHA (p³/s)", min_value=0.0, value=float(clean_evap_cfs(evap_alh_cfs)), step=10.0, format="%.3f", key="apinst_evap_a")
         st.info("Fórmula: **AP total DSS estimado = AP neto DSS + evaporación**.")
 
-        if obs_g > 0 or obs_a > 0:
-            try:
-                gat_raw = load_dss_sheet(dss_bytes, RESERVOIR_CONFIG["gatun"]["sheet"])
-                alh_raw = load_dss_sheet(dss_bytes, RESERVOIR_CONFIG["alhajuela"]["sheet"])
-                gat_d = to_daily(gat_raw, RESERVOIR_CONFIG["gatun"])
-                alh_d = to_daily(alh_raw, RESERVOIR_CONFIG["alhajuela"])
-            except Exception as exc:
-                st.error(f"Error DSS: {exc}")
-                return
-
-            results = []
-            for obs_val, evap_cfs, daily, cfg, nombre in [
-                (obs_g, evap_g, gat_d, RESERVOIR_CONFIG["gatun"],     "Gatún"),
-                (obs_a, evap_a, alh_d, RESERVOIR_CONFIG["alhajuela"], "Alhajuela / Madden"),
-            ]:
-                if obs_val <= 0:
-                    continue
-                obs_cfs = scalar_to_cfs(obs_val, unit_obs)
-                nearest = _nearest_ap_percentile(
-                    daily, cfg, pd.to_datetime(ref_date), obs_cfs, dss_add_cfs=clean_evap_cfs(evap_cfs)
-                )
-                if not nearest:
-                    results.append({
-                        "Embalse": nombre,
-                        "Estado": "⚪ Sin AP DSS",
-                    })
-                    continue
-                obs_converted = convert_flow(pd.Series([obs_cfs]), flow_unit).iloc[0]
-                dss_converted = convert_flow(pd.Series([nearest["dss_total_cfs"]]), flow_unit).iloc[0]
-                results.append({
-                    "Embalse": nombre,
-                    f"Aporte total obs. ({unit_label(flow_unit)})": round(float(obs_converted), 3),
-                    "Evap. sumada al DSS (p³/s)": round(clean_evap_cfs(evap_cfs), 3),
-                    "Percentil AP total DSS más cercano": nearest["label"],
-                    f"AP total DSS ({unit_label(flow_unit)})": round(float(dss_converted), 3),
-                    "Diferencia Obs-DSS (p³/s)": round(float(nearest["diff_cfs"]), 3),
-                    "Dif. relativa (%)": round(float(nearest["rel_pct"]), 2),
-                    "Estado": nearest["estado"],
-                    "Fecha DSS usada": nearest["date"].strftime("%d-%m-%Y"),
-                })
-            if results:
-                st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+    def _last_aquarius(odf: Optional[pd.DataFrame]) -> Optional[Tuple[pd.Timestamp, float, str]]:
+        if not _valid_df(odf):
+            return None
+        tmp = clamp_observed_future_dates(odf, "Fecha_dia")
+        tmp = tmp[tmp["Valor"].notna()].copy()
+        tmp["Fecha_dia"] = pd.to_datetime(tmp["Fecha_dia"], errors="coerce").dt.normalize()
+        tmp = tmp[tmp["Fecha_dia"].notna()].sort_values("Fecha_dia")
+        tmp_past = tmp[tmp["Fecha_dia"] <= today_panama()]
+        if not tmp_past.empty:
+            r = tmp_past.iloc[-1]
+        elif not tmp.empty:
+            r = tmp.iloc[-1]
         else:
-            st.caption("Ingrese un aporte observado mayor que cero para calcular el percentil DSS más cercano.")
+            return None
+        return pd.to_datetime(r["Fecha_dia"]), float(r["Valor"]), str(r.get("Fuente", "Aquarius/BulkExport"))
+
+    comparisons = []
+    inputs = []
+    aq_g = _last_aquarius(obs_gat_aporte)
+    aq_a = _last_aquarius(obs_alh_aporte)
+    if aq_g:
+        inputs.append(("Gatún", "Aquarius/BulkExport", aq_g[0], aq_g[1], "cfs", evap_g, gat_d, RESERVOIR_CONFIG["gatun"], aq_g[2], pct_ref_gat))
+    if aq_a:
+        inputs.append(("Alhajuela / Madden", "Aquarius/BulkExport", aq_a[0], aq_a[1], "cfs", evap_a, alh_d, RESERVOIR_CONFIG["alhajuela"], aq_a[2], pct_ref_alh))
+    if obs_g > 0:
+        inputs.append(("Gatún", "Manual instantáneo", pd.to_datetime(ref_date), float(obs_g), unit_obs, evap_g, gat_d, RESERVOIR_CONFIG["gatun"], "Entrada manual", pct_ref_gat))
+    if obs_a > 0:
+        inputs.append(("Alhajuela / Madden", "Manual instantáneo", pd.to_datetime(ref_date), float(obs_a), unit_obs, evap_a, alh_d, RESERVOIR_CONFIG["alhajuela"], "Entrada manual", pct_ref_alh))
+
+    for embalse, fuente_tipo, fecha_ref, obs_val, obs_unit, evap, daily, cfg, fuente, pct_ref in inputs:
+        obs_cfs = obs_val if obs_unit == "cfs" else scalar_to_cfs(obs_val, obs_unit)
+        nearest = _nearest_ap_percentile(
+            daily, cfg, fecha_ref, obs_cfs, dss_add_cfs=clean_evap_cfs(evap)
+        )
+        obs_converted = convert_flow(pd.Series([obs_cfs]), flow_unit).iloc[0]
+        row = {
+            "Embalse": embalse,
+            "Fuente": fuente_tipo,
+            "Archivo/serie": fuente,
+            "Fecha usada": pd.to_datetime(fecha_ref).strftime("%d-%m-%Y"),
+            f"Aporte observado ({unit_label(flow_unit)})": round(float(obs_converted), 3),
+            "Aporte observado (p³/s)": round(float(obs_cfs), 3),
+            "Evap. sumada al DSS (p³/s)": round(clean_evap_cfs(evap), 3),
+        }
+        if nearest:
+            dss_converted = convert_flow(pd.Series([nearest["dss_total_cfs"]]), flow_unit).iloc[0]
+            diff_converted = convert_flow(pd.Series([nearest["diff_cfs"]]), flow_unit).iloc[0]
+            row.update({
+                "Percentil AP DSS más cercano": nearest["label"],
+                f"AP total DSS ({unit_label(flow_unit)})": round(float(dss_converted), 3),
+                f"Obs-DSS ({unit_label(flow_unit)})": round(float(diff_converted), 3),
+                "Diferencia Obs-DSS (p³/s)": round(float(nearest["diff_cfs"]), 3),
+                "Dif. relativa (%)": round(float(nearest["rel_pct"]), 2),
+                "Estado": nearest["estado"],
+                "Fecha DSS usada": nearest["date"].strftime("%d-%m-%Y"),
+            })
+        else:
+            row.update({"Percentil AP DSS más cercano": "—", "Estado": "⚪ Sin AP DSS"})
+        comparisons.append(row)
+
+    st.markdown("#### Resultado comparativo")
+    if comparisons:
+        out = pd.DataFrame(comparisons)
+        st.dataframe(out, use_container_width=True, hide_index=True)
+        csv = out.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ Descargar comparación de aporte instantáneo", csv,
+                           "aporte_instantaneo_aquarius_dss.csv", "text/csv", key="apinst_dl")
+
+        if PLOTLY_OK:
+            plot = out.copy()
+            y_obs = f"Aporte observado ({unit_label(flow_unit)})"
+            y_dss = f"AP total DSS ({unit_label(flow_unit)})"
+            if y_dss in plot.columns:
+                long = plot[["Embalse", "Fuente", y_obs, y_dss]].melt(
+                    id_vars=["Embalse", "Fuente"], var_name="Serie", value_name=unit_label(flow_unit)
+                )
+                fig = px.bar(long, x="Embalse", y=unit_label(flow_unit), color="Serie", barmode="group",
+                             facet_col="Fuente", title="Aporte observado vs AP total DSS estimado")
+                fig.update_layout(height=420, hovermode="x unified")
+                st.plotly_chart(fig, use_container_width=True, key="apinst_bar")
+    else:
+        st.caption("No hay aporte Aquarius/BulkExport disponible y no se ingresó aporte manual mayor que cero.")
 
 
 # Alias para compatibilidad con versiones anteriores
 def tab_radar(dss_bytes: bytes, flow_unit: str) -> None:
-    tab_aporte_instantaneo(dss_bytes, flow_unit, pct_ref=50)
+    tab_aporte_instantaneo(dss_bytes, flow_unit)
+
+
+
+def build_percentile_export_table(
+    daily: pd.DataFrame,
+    cfg: Dict,
+    pct_ref: int,
+    flow_unit: str,
+    evap_cfs: float = 0.0,
+) -> pd.DataFrame:
+    """Construye tabla diaria para exportar el percentil elegido por embalse."""
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    base = daily.copy()
+    base["Fecha_dia"] = pd.to_datetime(base["Fecha_dia"], errors="coerce").dt.normalize()
+    base = base[base["Fecha_dia"].notna()].sort_values("Fecha_dia")
+    token = cfg["token"]
+
+    np_col, np_pct = pick_percentile_column(cols_by_prefix(base, "NP", token), pct_ref)
+    hp_col, hp_pct = pick_percentile_column(cols_by_prefix(base, "HP", token), pct_ref)
+    v_col, v_pct = pick_percentile_column(cols_by_prefix(base, "V", token), pct_ref)
+
+    ap_cols = cols_by_prefix(base, "AP", token)
+    ap_pct_map = ordered_percentile_map_by_value(base, ap_cols)
+    ap_col, ap_pct = pick_percentile_column(ap_cols, pct_ref, pct_map=ap_pct_map)
+
+    eg_col, eg_pct = pick_percentile_column(cols_by_prefix(base, "EG", token), pct_ref)
+    ep_col, ep_pct = pick_percentile_column(cols_by_prefix(base, "EP", token), pct_ref)
+
+    out = pd.DataFrame({
+        "Fecha": base["Fecha_dia"],
+        "Embalse": cfg["name"],
+        "Percentil solicitado": f"P{pct_ref}",
+        "Percentiles usados": (
+            f"NP P{np_pct if np_pct is not None else '—'} · "
+            f"HP P{hp_pct if hp_pct is not None else '—'} · "
+            f"AP P{ap_pct if ap_pct is not None else '—'} · "
+            f"V P{v_pct if v_pct is not None else '—'} · "
+            f"EG P{eg_pct if eg_pct is not None else '—'} · "
+            f"EP P{ep_pct if ep_pct is not None else '—'}"
+        ),
+    })
+
+    out[f"NP P{np_pct if np_pct is not None else pct_ref} (ft PLD)"] = pd.to_numeric(base[np_col], errors="coerce") if np_col else np.nan
+    out[f"HP P{hp_pct if hp_pct is not None else pct_ref} (MW)"] = pd.to_numeric(base[hp_col], errors="coerce") if hp_col else np.nan
+
+    if ap_col:
+        ap_total_cfs = ap_total_dss_cfs(base[ap_col], evap_cfs)
+        out[f"AP neto DSS P{ap_pct if ap_pct is not None else pct_ref} (p³/s)"] = pd.to_numeric(base[ap_col], errors="coerce")
+        out[f"Evaporación sumada AP DSS (p³/s)"] = clean_evap_cfs(evap_cfs)
+        out[f"AP total DSS P{ap_pct if ap_pct is not None else pct_ref} (p³/s)"] = ap_total_cfs
+        out[f"AP total DSS P{ap_pct if ap_pct is not None else pct_ref} ({unit_label(flow_unit)})"] = convert_flow(ap_total_cfs, flow_unit)
+    else:
+        out[f"AP total DSS P{pct_ref} ({unit_label(flow_unit)})"] = np.nan
+
+    if v_col:
+        out[f"Vertido DSS P{v_pct if v_pct is not None else pct_ref} (p³/s)"] = pd.to_numeric(base[v_col], errors="coerce")
+        out[f"Vertido DSS P{v_pct if v_pct is not None else pct_ref} ({unit_label(flow_unit)})"] = convert_flow(base[v_col], flow_unit)
+    else:
+        out[f"Vertido DSS P{pct_ref} ({unit_label(flow_unit)})"] = np.nan
+
+    if eg_col:
+        out[f"EG esclusajes P{eg_pct if eg_pct is not None else pct_ref} (p³/s)"] = pd.to_numeric(base[eg_col], errors="coerce")
+        out[f"EG esclusajes P{eg_pct if eg_pct is not None else pct_ref} ({unit_label(flow_unit)})"] = convert_flow(base[eg_col], flow_unit)
+    if ep_col:
+        out[f"EP esclusajes P{ep_pct if ep_pct is not None else pct_ref} (p³/s)"] = pd.to_numeric(base[ep_col], errors="coerce")
+        out[f"EP esclusajes P{ep_pct if ep_pct is not None else pct_ref} ({unit_label(flow_unit)})"] = convert_flow(base[ep_col], flow_unit)
+    if eg_col or ep_col:
+        parts = []
+        if eg_col:
+            parts.append(pd.to_numeric(base[eg_col], errors="coerce"))
+        if ep_col:
+            parts.append(pd.to_numeric(base[ep_col], errors="coerce"))
+        total_cfs = pd.concat(parts, axis=1).sum(axis=1, min_count=1)
+        out[f"Total esclusajes EG+EP ({unit_label(flow_unit)})"] = convert_flow(total_cfs, flow_unit)
+
+    for c in out.columns:
+        if c not in ("Fecha", "Embalse", "Percentil solicitado", "Percentiles usados"):
+            out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
+    return out
+
+
+def tab_exportar_percentil(
+    dss_bytes: bytes,
+    flow_unit: str,
+    pct_ref_gat: int,
+    pct_ref_alh: int,
+    evap_gat_cfs: float = 0.0,
+    evap_alh_cfs: float = 0.0,
+) -> None:
+    """Pestaña para exportar el percentil elegido por embalse."""
+    st.subheader("⬇️ Exportar percentil DSS")
+    st.caption("Exporta el percentil escogido para el embalse seleccionado, incluyendo nivel, hidrogeneración, aportes, vertidos y esclusajes cuando existan en el DSS.")
+
+    embalse_op = st.selectbox("Embalse", ["Gatún", "Alhajuela / Madden"], key="exp_embalse")
+    res_key = "gatun" if embalse_op == "Gatún" else "alhajuela"
+    cfg = RESERVOIR_CONFIG[res_key]
+    pct_default = int(pct_ref_gat if res_key == "gatun" else pct_ref_alh)
+    pct = st.selectbox(
+        "Percentil a exportar",
+        PERCENTILE_ORDER,
+        index=PERCENTILE_ORDER.index(pct_default) if pct_default in PERCENTILE_ORDER else PERCENTILE_ORDER.index(50),
+        format_func=lambda x: f"P{x}",
+        key="exp_pct",
+    )
+    evap = evap_gat_cfs if res_key == "gatun" else evap_alh_cfs
+
+    try:
+        raw = load_dss_sheet(dss_bytes, cfg["sheet"])
+        daily = to_daily(raw, cfg)
+    except Exception as exc:
+        st.error(f"Error cargando DSS: {exc}")
+        return
+    if daily.empty:
+        st.warning("No se pudo construir el diario DSS para exportación.")
+        return
+
+    table = build_percentile_export_table(daily, cfg, int(pct), flow_unit, evap)
+    if table.empty:
+        st.warning("No hay datos para exportar.")
+        return
+
+    with st.expander("🗓️ Filtro de período para exportar", expanded=True):
+        mn, mx = table["Fecha"].min().date(), table["Fecha"].max().date()
+        c1, c2 = st.columns(2)
+        s = c1.date_input("Desde", value=mn, min_value=mn, max_value=mx, key="exp_s")
+        e = c2.date_input("Hasta", value=mx, min_value=mn, max_value=mx, key="exp_e")
+    if s <= e:
+        table = table[(table["Fecha"].dt.date >= s) & (table["Fecha"].dt.date <= e)].copy()
+    else:
+        st.warning("Fecha inicial mayor que final. Se exporta el período completo.")
+
+    st.dataframe(table, use_container_width=True, hide_index=True, height=520)
+    fname_base = f"export_{cfg['token']}_P{int(pct)}".replace(" ", "_")
+    csv = table.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("⬇️ Descargar CSV", csv, f"{fname_base}.csv", "text/csv", key="exp_csv")
+
+    try:
+        bio = BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+            table.to_excel(writer, index=False, sheet_name=f"{cfg['token']}_P{int(pct)}"[:31])
+        st.download_button(
+            "⬇️ Descargar Excel",
+            bio.getvalue(),
+            f"{fname_base}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="exp_xlsx",
+        )
+    except Exception as exc:
+        st.warning(f"No se pudo generar Excel; use el CSV. Detalle: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -2946,6 +3228,8 @@ def main() -> None:
         "🌧️ Aporte ALHA obs",
         "🔀 Comparativo",
         "⚡ Hidrogeneración DSS",
+        "⚡ Aporte instantáneo",
+        "⬇️ Exportar",
         "📘 Instructivo",
     ])
 
@@ -2964,6 +3248,10 @@ def main() -> None:
     with tabs[6]:
         _run_tab("Hidrogeneración DSS", tab_hp_semanal, dss_bytes)
     with tabs[7]:
+        _run_tab("Aporte instantáneo", tab_aporte_instantaneo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
+    with tabs[8]:
+        _run_tab("Exportar", tab_exportar_percentil, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, evap_gat_cfs, evap_alh_cfs)
+    with tabs[9]:
         _run_tab("Instructivo", tab_instructivo)
 
     st.markdown(
