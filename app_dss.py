@@ -45,7 +45,7 @@ st.set_page_config(
 )
 
 APP_TITLE   = "DSS Simulación 2026 · Embalses ACP"
-AUTHOR_NOTE = "JFRodriguez · Hidrólogo / Oceanógrafo Físico · ACP-HIMH"
+AUTHOR_NOTE = "· Hidrólogo / Oceanógrafo Físico · ACP-HIMH"
 SIMULATION_NOTE = "Simulación realizada por JFRodriguez"
 PROJ_NOTE   = "Proyecciones basadas en el decenio 2015-2024."
 VIEW_FILE   = "dss_views.txt"
@@ -74,7 +74,7 @@ DATA_DIR_NAME = "data"
 CFS_TO_M3S     = 0.028316846592
 CFS_TO_HM3_DAY = CFS_TO_M3S * 86400 / 1_000_000
 
-PERCENTILE_ORDER = [95, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5]
+PERCENTILE_ORDER = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95]
 EXCEEDANCE_COLORS = {
     95: "#001f5b", 90: "#003f88", 80: "#005f99", 70: "#0077b6",
     60: "#0096c7", 50: "#48cae4", 40: "#90e0ef",
