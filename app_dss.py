@@ -2896,7 +2896,7 @@ def tab_instructivo() -> None:
     st.markdown("""
 ### Objetivo general
 
-Este dashboard apoya la interpretación operativa de las simulaciones DSS 2026 para los embalses **Gatún** y **Alhajuela/Madden**. Integra resultados del archivo DSS, datos observados tipo BulkExport/Aquarius, percentiles hidrológicos, niveles proyectados, aportes, vertidos e hidrogeneración recomendada.
+Este dashboard apoya la interpretación operativa de las simulaciones DSS 2026 para los embalses **Gatún** y **Alhajuela/Madden**. Integra resultados del archivo DSS, datos observados tipo BulkExport/Aquarius, percentiles hidrológicos, niveles proyectados, aportes, vertidos, esclusajes e hidrogeneración DSS.
 
 El propósito no es reemplazar el criterio hidrológico ni la coordinación operativa, sino ofrecer una vista rápida y consistente para responder preguntas como:
 
@@ -2904,35 +2904,51 @@ El propósito no es reemplazar el criterio hidrológico ni la coordinación oper
 - ¿Qué percentil DSS representa mejor la condición actual?
 - ¿Los aportes observados se parecen más a un escenario seco, medio o húmedo?
 - ¿Qué hidrogeneración DSS está asociada al percentil operativo evaluado?
-- ¿Existen señales tempranas de desviación que requieran revisión?
+- ¿Cómo se compara el aporte instantáneo/manual con Aquarius y con el DSS?
+- ¿Qué información puedo exportar para un percentil específico?
 
 ---
 
-### ¿Para qué se usa el modelo DSS?
+### Novedades integradas en esta versión
 
-El modelo DSS se utiliza como una herramienta de apoyo a la decisión para evaluar posibles trayectorias futuras de los embalses bajo diferentes escenarios hidrológicos y operativos. En este dashboard, el DSS permite revisar:
+Esta versión incorpora mejoras puntuales para la lectura operativa:
 
-- **NP:** nivel proyectado del embalse, en ft PLD.
-- **AP:** aportes del embalse, interpretados en la app como AP neto DSS.
-- **HP:** hidrogeneración proyectada o recomendada por el escenario DSS.
-- **V:** vertidos o descargas por aliviadero/estructuras, según la variable disponible.
-- **EG / EP:** consumos asociados a esclusajes en Gatún, cuando están disponibles en el DSS.
+1. **Percentil más cercano en las tarjetas principales.**  
+   Las tarjetas superiores ya no muestran solamente un P50 fijo. Ahora buscan el percentil DSS más cercano al dato observado disponible:
+   - **NP cercano:** se calcula con el nivel observado.
+   - **AP DSS cercano:** se calcula con el aporte observado de Aquarius/BulkExport, considerando evaporación.
+   - **HP cercano o recomendada:** se asocia al percentil operativo más cercano, especialmente al percentil del aporte cuando existe dato observado.
 
-La simulación DSS debe interpretarse como un conjunto de escenarios. Cada percentil representa una trayectoria posible, no una predicción única. Por eso se recomienda comparar el dato observado con varias curvas, no solamente con P50.
+2. **Orden visual húmedo-seco en las gráficas.**  
+   Las gráficas y el visor unificado de Plotly se ordenan de **húmedo a seco**: **P5 arriba** y **P95 abajo**. Este criterio aplica a niveles, hidrogeneración, aportes, vertidos y esclusajes cuando las series estén disponibles.
+
+3. **Pestaña Aporte instantáneo.**  
+   Se agregó una pestaña para ver el visor meteorológico/radar y comparar:
+   - aporte de Aquarius/BulkExport;
+   - aporte manual instantáneo ingresado por el usuario;
+   - AP total DSS estimado.
+
+4. **Pestaña Exportar.**  
+   Se agregó una pestaña para exportar el percentil seleccionado por embalse, incluyendo nivel, hidrogeneración, aportes, vertidos y esclusajes cuando existan en el DSS.
+
+5. **Selectores independientes por embalse.**  
+   Gatún y Alhajuela/Madden tienen percentiles de referencia separados. Esto permite evaluar un embalse bajo P95 y el otro bajo P50, por ejemplo, sin mezclar las condiciones.
 
 ---
 
 ### Cómo interpretar los percentiles DSS
 
-Los percentiles se leen como escenarios de probabilidad de excedencia:
+Los percentiles se interpretan como escenarios de probabilidad de excedencia:
 
-- **P95:** condición más seca o de menor aporte. Se ubica abajo en las gráficas de aportes.
+- **P5:** condición más húmeda o de mayor aporte.
 - **P50:** condición media o central.
-- **P5:** condición más húmeda o de mayor aporte. Se ubica arriba en las gráficas de aportes.
+- **P95:** condición más seca o de menor aporte.
 
-En las gráficas de **AP / Aportes**, el visor se ordena visualmente de húmedo a seco: **P5 arriba** y **P95 abajo**. Esto facilita verificar rápidamente si el aporte observado se acerca a una condición seca, media o húmeda.
+En el dashboard se mantiene el siguiente orden visual:
 
-Para AP, la app corrige la etiqueta por magnitud cuando es necesario, manteniendo esta interpretación:
+`P5 → P10 → P20 → P30 → P40 → P50 → P60 → P70 → P80 → P90 → P95`
+
+Esto significa que el valor más húmedo debe aparecer arriba en el visor y el valor más seco abajo. Para **AP / Aportes**, la app corrige la etiqueta por magnitud cuando es necesario, usando esta lógica:
 
 `menor AP → P95`  
 `mayor AP → P5`
@@ -2944,145 +2960,77 @@ Para AP, la app corrige la etiqueta por magnitud cuando es necesario, manteniend
 La app puede trabajar con archivos locales o cargados manualmente desde la barra lateral.
 
 **Archivo DSS:**
-- Coloca `SimulacionDSS_2026.xlsx` en la carpeta `data`, o cárgalo manualmente desde la barra lateral.
+- Colocar `SimulacionDSS_2026.xlsx` en la carpeta `data`, o cargarlo manualmente desde la barra lateral.
 - La app también busca variantes del nombre del archivo DSS si existen copias nuevas.
 
 **Archivos observados:**
-- Coloca los `BulkExport*.csv` o CSV normalizados en la carpeta `data`, o súbelos desde la barra lateral.
+- Colocar los `BulkExport*.csv` o CSV normalizados en la carpeta `data`, o subirlos desde la barra lateral.
 - La app reconoce niveles y aportes observados para Gatún y Alhajuela/Madden.
 - La serie **Lake-Res elevation.Telem Radar@MAD** se usa para el nivel observado de Alhajuela/Madden cuando está disponible.
 - Los CSV subidos manualmente tienen prioridad sobre los archivos locales.
 
-Después de reemplazar un Excel o CSV, usa **Recargar archivos** para limpiar caché y actualizar los cálculos.
+Después de reemplazar un Excel o CSV, usar **Recargar archivos** para limpiar caché y actualizar los cálculos.
 
 ---
 
-### Barra lateral: cómo utilizarla correctamente
+### Barra lateral: controles principales
 
-La barra lateral es el panel de control principal del dashboard. Desde allí se cargan los archivos, se actualizan los datos y se definen los parámetros que afectan la visualización e interpretación de los resultados. Se recomienda configurarla antes de revisar las pestañas de análisis.
+#### 1. Unidad de caudal / flujo
 
-#### 1. Carga del archivo DSS
+Permite seleccionar cómo se muestran aportes, vertidos y consumos hidráulicos:
 
-En la sección **Archivos DSS** se debe cargar el archivo principal de simulación, normalmente denominado `SimulacionDSS_2026.xlsx`.
+- `p³/s`: pies cúbicos por segundo.
+- `m³/s`: metros cúbicos por segundo.
+- `hm³/d`: hectómetros cúbicos por día.
 
-Existen dos formas de usarlo:
+Al cambiar esta opción, se actualizan las métricas, gráficas, tablas, comparativos y exportaciones relacionadas con AP, V, EG, EP y aportes observados. Los niveles permanecen en **ft PLD** y la hidrogeneración en **MW**.
 
-- **Carga automática:** colocar el archivo DSS dentro de la carpeta `data` del proyecto. La app lo buscará automáticamente al iniciar.
-- **Carga manual:** usar el botón de carga de la barra lateral para seleccionar el Excel DSS desde la computadora.
+#### 2. Percentil de referencia Gatún y Alhajuela/Madden
 
-Si se carga un archivo manualmente, ese archivo tendrá prioridad durante la sesión. Si se reemplaza el Excel DSS o se actualizan archivos CSV, se debe presionar **Recargar archivos** para limpiar la caché y obligar a la app a leer los datos más recientes.
+Estos selectores funcionan como referencia operativa para cada embalse. Se usan principalmente en:
 
-#### 2. Botón Recargar archivos
+- **Manejo / Decisión**;
+- **Comparativo**;
+- **Aporte instantáneo**;
+- **Exportar**;
+- métricas o tablas que requieren un percentil fijo.
 
-El botón **Recargar archivos** se usa cuando se cambia o reemplaza algún archivo de entrada, por ejemplo:
+Importante: las tarjetas que dicen **percentil cercano** pueden mostrar un percentil diferente al seleccionado porque la app calcula automáticamente el percentil más parecido al dato observado. Es decir, el selector define la referencia operativa, pero el indicador cercano se calcula con el nivel o aporte observado.
 
-- nuevo Excel DSS;
-- nuevos CSV de Aquarius/BulkExport;
-- actualización de niveles observados;
-- actualización de aportes observados;
-- corrección o sustitución de archivos dentro de la carpeta `data`.
+#### 3. Evaporación GAT y Evaporación ALHA
 
-Este botón no cambia los cálculos manualmente; solo fuerza a la app a volver a leer los archivos disponibles.
-
-#### 3. Unidad de caudal / flujo
-
-La opción **Unidad de caudal / flujo** permite seleccionar cómo se muestran los aportes, vertidos y comparativos hidráulicos:
-
-- `p³/s`: pies cúbicos por segundo, unidad base usual de muchas salidas DSS.
-- `m³/s`: metros cúbicos por segundo, útil para reportes técnicos en unidades internacionales.
-- `hm³/d`: hectómetros cúbicos por día, útil para interpretar volúmenes diarios de balance.
-
-Al cambiar esta opción, la app actualiza las métricas, gráficas, tablas y comparativos relacionados con AP, V, EG, EP y aportes observados. Los niveles se mantienen en **ft PLD** y la hidrogeneración se mantiene en **MW**.
-
-#### 4. Percentiles de referencia
-
-La barra lateral tiene dos selectores independientes:
-
-- **Percentil de referencia Gatún**
-- **Percentil de referencia Alhajuela/Madden**
-
-Estos percentiles se usan para las métricas principales, la pestaña **Manejo / Decisión**, los promedios de horizonte y la comparación operativa de cada embalse. No es obligatorio usar el mismo percentil para ambos embalses, porque Gatún y Alhajuela/Madden pueden responder a condiciones hidrológicas diferentes.
-
-La interpretación general es:
-
-- **P95:** escenario más seco o de menor aporte.
-- **P50:** escenario central o medio.
-- **P5:** escenario más húmedo o de mayor aporte.
-
-En la pestaña **Manejo / Decisión**, la columna de percentil de referencia indica el percentil seleccionado por el usuario, mientras que las columnas de valores muestran los resultados DSS asociados al percentil utilizado para nivel, aporte, vertido e hidrogeneración.
-
-#### 5. Evaporación GAT y Evaporación ALHA
-
-Los campos **Evaporación GAT** y **Evaporación ALHA** se ingresan en `p³/s`. Estos valores se usan para ajustar el aporte DSS de cada embalse mediante la relación:
+Los campos de evaporación se ingresan en `p³/s` y se aplican por embalse mediante la relación:
 
 `AP total DSS estimado = AP neto DSS + caudal evaporado`
 
-Este ajuste permite comparar de forma más consistente el AP DSS con el aporte observado. La app siempre suma la evaporación al AP neto DSS; no la resta. Si no se desea aplicar ajuste por evaporación, se debe dejar el valor en `0.0`.
-
-#### 6. Glosario lateral
-
-El glosario de la barra lateral resume las siglas principales usadas en el DSS:
-
-- **NP:** nivel proyectado.
-- **HP:** hidrogeneración.
-- **AP:** aportes.
-- **V:** vertidos.
-- **EG / EP:** consumos por esclusajes, cuando están disponibles.
-- **P95...P5:** probabilidades de excedencia o escenarios percentiles.
-
-Este glosario sirve como referencia rápida para interpretar las pestañas sin volver al instructivo completo.
-
-#### 7. Orden recomendado de configuración
-
-Antes de analizar los resultados, se recomienda configurar la barra lateral en este orden:
-
-1. Verificar que el archivo DSS esté cargado correctamente.
-2. Confirmar que los CSV observados estén en la carpeta `data` o cargados manualmente.
-3. Presionar **Recargar archivos** si se reemplazó algún archivo.
-4. Seleccionar la unidad de caudal/flujo requerida para el análisis.
-5. Seleccionar el percentil de referencia para Gatún.
-6. Seleccionar el percentil de referencia para Alhajuela/Madden.
-7. Ingresar la evaporación de Gatún y Alhajuela/Madden, si aplica.
-8. Revisar primero la pestaña **Manejo / Decisión** y luego las pestañas específicas de cada embalse.
-
----
-
-### Aportes DSS, aportes observados y evaporación
-
-El DSS se interpreta en esta app como **AP neto**. Para compararlo con el aporte total observado, la app calcula:
-
-`AP total DSS estimado = AP neto DSS + caudal evaporado`
-
-Este ajuste es importante porque el aporte observado puede representar una condición total del sistema, mientras que el DSS puede estar expresado como aporte neto. La app está blindada para que el caudal evaporado **siempre se sume** al AP neto DSS y nunca se reste.
-
-La evaporación se ingresa en `p³/s` para cada embalse. Luego la app convierte el resultado a la unidad seleccionada por el usuario.
+Este ajuste permite comparar mejor el AP DSS con el aporte observado. La app está blindada para **sumar** la evaporación al AP neto DSS y no restarla. Si no se desea aplicar ajuste, dejar el valor en `0.0`.
 
 ---
 
 ### Pestaña GATÚN DSS
 
-Esta pestaña permite revisar Gatún en detalle:
+Permite revisar Gatún en detalle:
 
-- Nivel proyectado DSS vs nivel observado.
-- Hidrogeneración DSS por percentiles.
-- AP total DSS estimado y aporte observado.
-- Vertidos DSS.
-- Consumos por esclusajes EG + EP, cuando estén disponibles.
-- Tabla diaria descargable con los valores DSS.
+- nivel proyectado DSS vs nivel observado;
+- hidrogeneración DSS por percentiles;
+- AP total DSS estimado y aporte observado;
+- vertidos DSS;
+- consumos por esclusajes EG + EP, cuando estén disponibles;
+- tabla diaria descargable.
 
-Se recomienda usarla para validar si Gatún se comporta según el percentil de referencia o si el observado se acerca a otra trayectoria.
+Las tarjetas superiores muestran el percentil más cercano al dato observado disponible. La gráfica mantiene el orden visual **P5 húmedo arriba** y **P95 seco abajo**.
 
 ---
 
 ### Pestaña ALHAJUELA DSS
 
-Esta pestaña permite revisar Alhajuela/Madden en detalle:
+Permite revisar Alhajuela/Madden en detalle:
 
-- Nivel proyectado DSS vs nivel observado.
-- Hidrogeneración DSS.
-- AP total DSS estimado y aporte observado.
-- Vertidos DSS.
-- Tabla diaria descargable.
+- nivel proyectado DSS vs nivel observado;
+- hidrogeneración DSS;
+- AP total DSS estimado y aporte observado;
+- vertidos DSS;
+- tabla diaria descargable.
 
 La serie Radar@MAD se utiliza como referencia observada de nivel cuando está disponible. Si no se encuentra, la app continúa funcionando con los datos DSS y los CSV locales/subidos disponibles.
 
@@ -3090,9 +3038,7 @@ La serie Radar@MAD se utiliza como referencia observada de nivel cuando está di
 
 ### Pestaña Manejo / Decisión
 
-Esta pestaña resume el estado ejecutivo por embalse. Debe ser la primera revisión operativa.
-
-Incluye:
+Esta pestaña resume el estado ejecutivo por embalse y debe revisarse primero. Incluye:
 
 - **Estado:** semáforo de comparación entre nivel observado y nivel DSS.
 - **Obs. LKH:** último nivel observado disponible.
@@ -3106,68 +3052,129 @@ Incluye:
 - Promedios del horizonte seleccionado para AP, V y HP.
 - Cambio esperado de nivel dentro del horizonte seleccionado.
 
-El semáforo usa el umbral operativo configurado para cada embalse:
+El semáforo usa umbrales operativos por embalse:
 
-- **🟢 En rango:** diferencia dentro del margen normal.
-- **🟠 Atención:** la diferencia alcanza 70% del umbral.
-- **🔴 Revisar:** la diferencia iguala o supera el umbral.
+- **Gatún:** 0.10 ft.
+- **Alhajuela/Madden:** 0.60 ft.
 
-Los umbrales por defecto son:
-
-- Gatún: **0.10 ft**
-- Alhajuela/Madden: **0.60 ft**
+La lectura recomendada es comparar el semáforo con el percentil cercano al observado y con el percentil de referencia seleccionado.
 
 ---
 
-### Pestañas de aporte observado
+### Pestañas Aporte GAT obs y Aporte ALHA obs
 
-Las pestañas **Aporte GAT obs** y **Aporte ALHA obs** comparan el aporte observado con el AP total DSS estimado.
+Estas pestañas comparan el aporte observado de Aquarius/BulkExport con el AP total DSS estimado.
 
-La interpretación recomendada es:
+Interpretación rápida:
 
 - Si el observado está cerca de **P95**, la condición se parece a un escenario seco.
 - Si el observado está cerca de **P50**, la condición se parece a un escenario medio.
 - Si el observado está cerca de **P5**, la condición se parece a un escenario húmedo.
 
-Estas pestañas ayudan a identificar si la hidrología real está alineada con el percentil operativo usado o si conviene revisar otro escenario.
+La comparación usa:
+
+`AP total DSS estimado = AP neto DSS + evaporación`
 
 ---
 
 ### Pestaña Comparativo
 
-La pestaña comparativa permite revisar Gatún y Alhajuela/Madden lado a lado. Es útil para ver si ambos embalses están respondiendo de forma consistente o si uno presenta mayor desviación respecto al DSS.
+Permite revisar Gatún y Alhajuela/Madden lado a lado. Es útil para ver si ambos embalses están respondiendo de forma consistente o si uno presenta mayor desviación respecto al DSS.
 
-En AP, el comparativo mantiene la lectura de percentiles:
+El comparativo mantiene el orden visual de percentiles:
 
-- **P5:** más húmedo / mayor aporte.
-- **P95:** más seco / menor aporte.
+`P5 húmedo → P95 seco`
+
+Cuando se selecciona AP, también puede mostrar el aporte observado de cada embalse si los CSV están disponibles.
 
 ---
 
 ### Pestaña Hidrogeneración DSS
 
-Esta pestaña resume la hidrogeneración DSS por semana operativa. La semana operativa se calcula de **sábado a viernes**.
+Resume la hidrogeneración DSS por semana operativa. La semana operativa se calcula de **sábado a viernes**.
 
 Para 2026:
 
 - Del 30-may al 05-jun corresponde a la **semana 23**.
 - Desde el 06-jun inicia la **semana 24**.
 
-La pestaña permite revisar el patrón semanal de hidrogeneración por embalse y relacionarlo con el percentil operativo evaluado.
+La variable **Hidrogeneración DSS** inicia en la semana operativa 23. Esta pestaña permite revisar el patrón semanal de hidrogeneración por embalse y relacionarlo con el percentil operativo evaluado.
+
+---
+
+### Pestaña Aporte instantáneo
+
+Esta pestaña se usa para revisar una condición rápida de aporte contra el DSS. Incluye dos componentes:
+
+#### 1. Visor de aporte instantáneo
+
+Muestra el visor meteorológico/radar como referencia visual de lluvia o actividad convectiva. La imagen se carga con actualización temporal para evitar que el navegador muestre una versión antigua.
+
+También incluye la opción **Auto-recargar cada 5 min**, útil cuando se desea monitorear el visor durante una situación operativa.
+
+#### 2. Comparación aporte instantáneo / Aquarius / DSS
+
+Permite comparar tres fuentes:
+
+- **Aquarius/BulkExport:** último aporte observado disponible.
+- **Manual instantáneo:** valor ingresado manualmente por el usuario.
+- **DSS:** AP total DSS estimado para la fecha de referencia.
+
+Pasos recomendados:
+
+1. Seleccionar la **fecha de referencia DSS**.
+2. Seleccionar la unidad del aporte manual.
+3. Ingresar el aporte instantáneo de Gatún y/o Alhajuela si se desea comparar un valor manual.
+4. Confirmar la evaporación aplicada para cada embalse.
+5. Revisar la tabla de resultado, donde se muestra el percentil AP DSS más cercano, la diferencia Obs-DSS y el estado.
+
+La pestaña permite descargar la comparación en CSV.
+
+---
+
+### Pestaña Exportar
+
+Esta pestaña permite exportar un percentil específico para un embalse.
+
+Funcionamiento:
+
+1. Seleccionar el embalse: **Gatún** o **Alhajuela/Madden**.
+2. Seleccionar el percentil a exportar. Por defecto, la app usa el percentil de referencia escogido en la barra lateral para ese embalse.
+3. Definir el período de fechas.
+4. Revisar la tabla.
+5. Descargar en **CSV** o **Excel**.
+
+La exportación incluye, cuando existan en el DSS:
+
+- nivel NP en ft PLD;
+- hidrogeneración HP en MW;
+- AP neto DSS;
+- evaporación sumada;
+- AP total DSS en p³/s y en la unidad seleccionada;
+- vertido DSS;
+- EG y EP;
+- total de esclusajes EG+EP.
+
+La columna **Percentiles usados** muestra trazabilidad, porque en algunos casos la app usa el percentil disponible más cercano si una variable no existe exactamente con el percentil solicitado.
 
 ---
 
 ### Recomendación de uso operativo
 
-La secuencia recomendada es:
+Secuencia recomendada:
 
-1. Revisar **Manejo / Decisión** para conocer el estado general.
-2. Validar el embalse específico en **GATÚN DSS** o **ALHAJUELA DSS**.
-3. Revisar las pestañas de **aporte observado** para identificar el percentil hidrológico actual.
-4. Revisar **Hidrogeneración DSS** para confirmar la recomendación semanal.
-5. Usar **Comparativo** para evaluar ambos embalses de forma conjunta.
+1. Cargar o verificar el Excel DSS y los CSV observados.
+2. Presionar **Recargar archivos** si se actualizaron datos.
+3. Seleccionar la unidad de caudal/flujo.
+4. Seleccionar el percentil de referencia de Gatún y de Alhajuela/Madden.
+5. Ingresar evaporación por embalse si aplica.
+6. Revisar **Manejo / Decisión**.
+7. Validar cada embalse en **GATÚN DSS** y **ALHAJUELA DSS**.
+8. Revisar **Aporte GAT obs** y **Aporte ALHA obs** para identificar el percentil hidrológico actual.
+9. Usar **Aporte instantáneo** si se requiere comparar un aporte manual o monitorear el radar.
+10. Usar **Exportar** para generar una tabla del percentil operativo evaluado.
 
-La lectura final debe considerar siempre la consistencia entre nivel observado, aporte observado, percentil DSS, vertidos e hidrogeneración.
+La lectura final debe considerar siempre la consistencia entre nivel observado, aporte observado, percentil DSS, vertidos, esclusajes e hidrogeneración.
 """)
 
 # ─────────────────────────────────────────────────────────────────────
