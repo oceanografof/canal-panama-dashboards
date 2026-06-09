@@ -723,8 +723,109 @@ def make_ordered_ap_columns(df: pd.DataFrame, cols: List[str], flow_unit: str, a
     return out, new_cols, pct_map
 
 
+def _ap_daily_distribution_weights(n: int) -> np.ndarray:
+    """Pesos diarios para repartir AP semanal sin cambiar el promedio semanal DSS.
+
+    Perfil quirúrgico solicitado:
+    - evita repetir exactamente el mismo AP todos los días;
+    - inicia la semana alrededor de 90 % del AP semanal;
+    - conserva el promedio/volumen semanal del DSS porque los pesos promedian 1.
+    """
+    try:
+        n = int(n)
+    except Exception:
+        n = 0
+    if n <= 1:
+        return np.ones(max(n, 1), dtype=float)
+
+    # Suma 7.00 → promedio 1.00. No cambia el AP semanal calculado por DSS.
+    base = np.array([0.90, 0.96, 1.02, 1.10, 1.06, 1.01, 0.95], dtype=float)
+    if n == len(base):
+        weights = base.copy()
+    else:
+        # Interpola para semanas incompletas o bloques menores sin introducir dependencias.
+        x_old = np.linspace(0, len(base) - 1, len(base))
+        x_new = np.linspace(0, len(base) - 1, n)
+        weights = np.interp(x_new, x_old, base)
+
+    mean_w = float(np.nanmean(weights)) if len(weights) else 1.0
+    if not np.isfinite(mean_w) or abs(mean_w) < 1e-12:
+        return np.ones(n, dtype=float)
+    return weights / mean_w
+
+
+def _operational_week_start(fecha: pd.Series) -> pd.Series:
+    """Semana operativa sábado-viernes para repartir AP dentro de cada semana."""
+    f = pd.to_datetime(fecha, errors="coerce").dt.normalize()
+    # weekday: lunes=0 ... sábado=5. Se resta hasta el sábado anterior o actual.
+    offset = (f.dt.weekday - 5) % 7
+    return f - pd.to_timedelta(offset, unit="D")
+
+
+def normalize_weekly_ap_to_daily(daily: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
+    """Normaliza AP DSS semanal a distribución diaria, sin tocar NP/HP/V/EG/EP.
+
+    El DSS puede traer AP semanal repetido día a día. Esta función solo actúa
+    cuando detecta valores AP casi constantes dentro de una semana operativa;
+    reparte ese AP en 7 valores diarios no repetidos y conserva el promedio
+    semanal original del DSS.
+    """
+    if daily is None or daily.empty or "Fecha_dia" not in daily.columns:
+        return daily
+
+    out = daily.copy()
+    token = cfg.get("token", "") if isinstance(cfg, dict) else ""
+    ap_cols = cols_by_prefix(out, "AP", token)
+    if not ap_cols:
+        return out
+
+    out["Fecha_dia"] = pd.to_datetime(out["Fecha_dia"], errors="coerce").dt.normalize()
+    out = out[out["Fecha_dia"].notna()].sort_values("Fecha_dia").copy()
+    if out.empty:
+        return out
+
+    week_key = _operational_week_start(out["Fecha_dia"])
+
+    for col in ap_cols:
+        if col not in out.columns:
+            continue
+        series = pd.to_numeric(out[col], errors="coerce")
+        corrected = series.copy()
+
+        for _, idx in out.groupby(week_key).groups.items():
+            idx_list = list(idx)
+            vals = series.loc[idx_list].dropna()
+            n = int(len(vals))
+            if n <= 1:
+                continue
+
+            base_val = float(vals.mean())
+            if not np.isfinite(base_val) or abs(base_val) < 1e-12:
+                continue
+
+            # Cambio quirúrgico: solo normaliza cuando el AP de la semana viene
+            # repetido o prácticamente plano. Si el DSS ya trae AP diario variable,
+            # se respeta y no se modifica.
+            if vals.round(6).nunique() > 2:
+                spread = float(vals.max() - vals.min())
+                rel_spread = abs(spread / base_val) if abs(base_val) > 1e-12 else 0.0
+                if rel_spread > 0.01:
+                    continue
+
+            weights = _ap_daily_distribution_weights(n)
+            corrected.loc[vals.index] = base_val * weights
+
+        out[col] = corrected
+
+    return out
+
+
 def to_daily(df: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
-    """Horario/subhorario DSS → diario. NP=last, flujos=mean."""
+    """Horario/subhorario DSS → diario. NP=last, flujos=mean.
+
+    AP se normaliza de semanal repetido a diario distribuido, conservando el
+    promedio semanal del DSS y sin afectar el resto del dashboard.
+    """
     if df is None or df.empty:
         return pd.DataFrame()
     data = df.copy()
@@ -742,7 +843,8 @@ def to_daily(df: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
     if not agg:
         return pd.DataFrame()
     daily = data.groupby("Fecha_dia", as_index=False).agg(agg)
-    return daily.sort_values("Fecha_dia")
+    daily = daily.sort_values("Fecha_dia")
+    return normalize_weekly_ap_to_daily(daily, cfg)
 
 
 # ─────────────────────────────────────────────────────────────────────
