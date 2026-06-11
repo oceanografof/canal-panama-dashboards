@@ -1,6 +1,6 @@
 """
 💧 Dashboard Demandas de Agua por Embalse — Canal de Panamá
-Creador: JFRodriguez
+Creado para HIMH por JFRodriguez
 pip install streamlit pandas numpy plotly openpyxl pillow pyxlsb
 streamlit run app_demandas.py
 """
@@ -2885,10 +2885,11 @@ with tabs[9]:
                 df["npx_hm3"]=df["npx_m"]*MCF_TO_CFS*CFS2HM3
                 df["total_hm3"]=df["pnx_hm3"]+df["npx_hm3"]
 
-            # madspill = vertido por compuertas de fondo Madden en cfs.
-            # Se convierte directamente de cfs a hm³/día; NO es MCF/MPC.
-            if "vert_m" in df:
-                df["vert_m_hm3"] = pd.to_numeric(df["vert_m"], errors="coerce") * CFS2HM3
+        # madspill = vertido por compuertas de fondo Madden en cfs.
+        # Se convierte siempre, aunque el LakeHouse traiga consumos de esclusajes en hm³.
+        # NO se interpreta como MCF/MPC para evitar inflar el vertido.
+        if "vert_m" in df:
+            df["vert_m_hm3"] = pd.to_numeric(df["vert_m"], errors="coerce") * CFS2HM3
         # Tránsitos diarios por tipo de esclusaje:
         # se usa el PROMEDIO entre complejos y no la suma, para evitar duplicar el tránsito
         # cuando el mismo buque pasa por ambos complejos del sistema Panamax o NeoPanamax.
@@ -3119,7 +3120,7 @@ with tabs[9]:
         _escl_hm3 = _mean_col("total_hm3")
         if _escl_hm3 is None:
             _escl_hm3 = _mean_col("total_escl_hm3")
-        _pot_prom = _promedio_componentes(dv, [("mun_m_hm3", "mun_m"), ("mun_g_hm3", "mun_g")])
+        _pot_prom = _promedio_componentes(dv, [("mun_m_hm3", "mun_m", True), ("mun_g_hm3", "mun_g", True)])
         _fug_prom = _promedio_componentes(dv, [("leak_m_hm3", "leak_m", True), ("leak_g_hm3", "leak_g", True)])
         # La evaporación NO se toma de los campos de volumen del LakeHouse porque pueden venir
         # vacíos, en cero o desajustados. Se muestra el cálculo activo del app:
@@ -3182,7 +3183,7 @@ with tabs[9]:
         salidas_embalse_rows = []
         # Alhajuela / Madden
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Generación Madden", [("gen_mad_hm3", None)])
-        _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Potabilización", [("mun_m_hm3", "mun_m")])
+        _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Potabilización", [("mun_m_hm3", "mun_m", True)])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Fugas", [("leak_m_hm3", "leak_m", True)])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Vertido Madden fondo", [("vert_m_hm3", None)])
         _agregar_salida_embalse_app(salidas_embalse_rows, "Alhajuela", "Evaporación", evap_alh)
@@ -3196,7 +3197,7 @@ with tabs[9]:
             _col_total_escl = "total_hm3" if ("total_hm3" in dv and dv["total_hm3"].notna().sum() > 0) else "total_escl_hm3"
             _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Esclusajes total", [(_col_total_escl, None)])
         _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Generación Gatún", [("gen_gat_hm3", None)])
-        _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Potabilización", [("mun_g_hm3", "mun_g")])
+        _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Potabilización", [("mun_g_hm3", "mun_g", True)])
         _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Fugas", [("leak_g_hm3", "leak_g", True)])
         _agregar_salida_embalse(salidas_embalse_rows, "Gatún", "Vertido Gatún", [(None, "vert_g")])
         _agregar_salida_embalse_app(salidas_embalse_rows, "Gatún", "Evaporación", evap_gat)
@@ -3259,9 +3260,9 @@ with tabs[9]:
         # --- Potabilización y fugas comparativo 5/7/10 días ---
         st.markdown("#### 🚰 Potabilización y fugas — promedios 5, 7 y 10 días")
         comp_def = [
-            ("Potable Alhajuela", [("mun_m_hm3", "mun_m")]),
-            ("Potable Gatún", [("mun_g_hm3", "mun_g")]),
-            ("Potable total", [("mun_m_hm3", "mun_m"), ("mun_g_hm3", "mun_g")]),
+            ("Potable Alhajuela", [("mun_m_hm3", "mun_m", True)]),
+            ("Potable Gatún", [("mun_g_hm3", "mun_g", True)]),
+            ("Potable total", [("mun_m_hm3", "mun_m", True), ("mun_g_hm3", "mun_g", True)]),
             ("Fugas Alhajuela", [("leak_m_hm3", "leak_m", True)]),
             ("Fugas Gatún", [("leak_g_hm3", "leak_g", True)]),
             ("Fugas total", [("leak_m_hm3", "leak_m", True), ("leak_g_hm3", "leak_g", True)]),
@@ -3358,28 +3359,27 @@ with tabs[9]:
         # --- Salidas de agua ---
         st.markdown("#### 💧 Salidas de agua")
         sal_rows = []
-        sal_items = [
-            ("usos_hm3","Usos totales sistema","hm3"),
-            ("mun_m","Potable Alhajuela","mcf"),("mun_g","Potable Gatún","mcf"),
-            ("mun_m_hm3","Potable Alhajuela","hm3"),("mun_g_hm3","Potable Gatún","hm3"),
-            ("leak_m","Fugas Alhajuela","mcf"),("leak_g","Fugas Gatún","mcf"),
-            ("leak_m_hm3","Fugas Alhajuela","hm3"),("leak_g_hm3","Fugas Gatún","hm3"),
-            ("vert_g","Vertido Gatún","mcf"),("vert_m_hm3","Vertido Madden fondo","hm3"),
-        ]
-        # Evitar duplicados: si existe la versión hm3 directa, omitir la MCF
-        _skip_mcf = set()
-        if "mun_m_hm3" in dv and dv["mun_m_hm3"].notna().sum()>0: _skip_mcf.add("mun_m")
-        if "mun_g_hm3" in dv and dv["mun_g_hm3"].notna().sum()>0: _skip_mcf.add("mun_g")
-        if "leak_m_hm3" in dv and dv["leak_m_hm3"].notna().sum()>0: _skip_mcf.add("leak_m")
-        if "leak_g_hm3" in dv and dv["leak_g_hm3"].notna().sum()>0: _skip_mcf.add("leak_g")
-        for col_name,label,src in sal_items:
-            if col_name in _skip_mcf:
-                continue
-            if col_name in dv and dv[col_name].notna().sum()>0:
-                v = dv[col_name]
-                row = {"Parámetro":label, "Fuente":"LakeHouse"}
-                row.update(_prom_flow(v, src))
-                sal_rows.append(row)
+
+        def _add_sal_row(label, componentes, fuente="LakeHouse"):
+            prom = _promedio_componentes(dv, componentes)
+            if prom is None:
+                return
+            sal_rows.append({
+                "Parámetro": label,
+                "Fuente": fuente,
+                "Prom hm³/d": prom["hm3"],
+                "Prom cfs": prom["cfs"],
+                "Prom m³/s": prom["m3s"],
+            })
+
+        _add_sal_row("Usos totales sistema", [("usos_hm3", None)])
+        # Potabilización y fugas priorizan MCF/MPC; los campos *_hm3 quedan como respaldo.
+        _add_sal_row("Potable Alhajuela", [("mun_m_hm3", "mun_m", True)], "LakeHouse MCF/MPC")
+        _add_sal_row("Potable Gatún", [("mun_g_hm3", "mun_g", True)], "LakeHouse MCF/MPC")
+        _add_sal_row("Fugas Alhajuela", [("leak_m_hm3", "leak_m", True)], "LakeHouse MCF/MPC")
+        _add_sal_row("Fugas Gatún", [("leak_g_hm3", "leak_g", True)], "LakeHouse MCF/MPC")
+        _add_sal_row("Vertido Gatún", [(None, "vert_g")], "LakeHouse")
+        _add_sal_row("Vertido Madden fondo", [("vert_m_hm3", None)], "LakeHouse cfs")
 
         # Evaporación: se calcula desde el app, no desde LakeHouse.
         for _label, _hm3_app in [("Evaporación Gatún", evap_gat), ("Evaporación Alhajuela", evap_alh)]:
@@ -3395,7 +3395,7 @@ with tabs[9]:
 
         if sal_rows:
             st.dataframe(pd.DataFrame(sal_rows), use_container_width=True, hide_index=True)
-            st.caption("La evaporación se excluye de los campos de volumen del LakeHouse y se calcula con el app. El vertido Madden `madspill` se interpreta como cfs directo.")
+            st.caption("Potabilización y fugas priorizan MCF/MPC y usan *_hm3 solo como respaldo. La evaporación se calcula con el app. El vertido Madden `madspill` se interpreta como cfs directo.")
 
         # --- Generación ---
         st.markdown("#### ⚡ Generación hidroeléctrica")
@@ -3466,24 +3466,22 @@ with tabs[9]:
 
 # ═══ TAB 10 — INSTRUCTIVO ═══
 with tabs[10]:
-    st.subheader("📘 Instructivo de uso rápido")
+    st.subheader("📘 Instructivo operativo rápido")
     st.caption(
-        "Guía práctica para operar el dashboard con el flujo actual: LakeHouse como punto de partida, "
-        "sidebar editable, validación por pestañas y exportación final."
+        "Guía puntual para revisar datos, ajustar el escenario, validar el balance y exportar el reporte."
     )
 
-    st.markdown("""
+    st.markdown(f"""
     <div style="border:1px solid rgba(148,163,184,0.35);border-radius:18px;padding:18px 20px;background:linear-gradient(180deg,rgba(26,82,118,0.09),rgba(148,163,184,0.04));">
-        <h3 style="margin-top:0;color:#1a5276;">🧭 Flujo recomendado</h3>
-        <p style="font-size:1.02rem;line-height:1.55;margin-bottom:10px;">
-        Use este orden para evitar confusiones y mantener consistencia entre los datos reales, los supuestos operativos y el reporte final.
-        </p>
+        <h3 style="margin-top:0;color:#1a5276;">🧭 Orden recomendado de uso</h3>
         <ol style="font-size:1.02rem;line-height:1.65;margin-bottom:0;">
-            <li><b>Revise el LakeHouse:</b> vaya a <b>📂 Datos Lake House</b> y confirme fecha, hoja, últimos días disponibles y valores promedio.</li>
-            <li><b>Valide niveles:</b> en el sidebar confirme los niveles de <b>Gatún</b> y <b>Alhajuela</b>. Estos niveles alimentan el cálculo de área espejo.</li>
-            <li><b>Ajuste el escenario:</b> modifique tránsitos, generación, potable, fugas, vertidos, ZZ-Flush y evaporación solo si el escenario lo requiere.</li>
-            <li><b>Revise el balance:</b> use <b>📊 Balance</b>, <b>🏔️ Alhajuela</b> y <b>🌊 Gatún</b> para verificar que las salidas estén separadas por embalse.</li>
-            <li><b>Exporte:</b> en <b>📤 Exportar</b> genere el Excel cuando los valores ya estén validados.</li>
+            <li><b>Cargar o confirmar LakeHouse:</b> abra <b>📂 Datos Lake House</b>, verifique archivo, hoja, rango de fechas y último registro.</li>
+            <li><b>Escoger período operativo:</b> seleccione <b>5, 7 o 10 días</b>. Ese período alimenta los promedios usados como valores iniciales del sidebar.</li>
+            <li><b>Validar niveles:</b> confirme <b>Gatún</b> y <b>Alhajuela</b> en el sidebar. Estos niveles actualizan área espejo, evaporación y modelos dependientes de nivel.</li>
+            <li><b>Definir consumo de esclusajes:</b> seleccione la fuente: <b>Basado en Nivel</b>, <b>Basado en LakeHouse</b> o <b>Manual</b>.</li>
+            <li><b>Ajustar escenario:</b> revise PNX/NPX, generación, potable, fugas, vertidos, ZZ-Flush, evaporación y ahorros de agua.</li>
+            <li><b>Validar resultados:</b> use <b>📊 Balance</b>, <b>🏔️ Alhajuela</b>, <b>🌊 Gatún</b> y <b>🚢 Esclusajes</b> antes de reportar.</li>
+            <li><b>Exportar:</b> descargue el Excel en <b>📤 Exportar</b> cuando los valores estén revisados.</li>
         </ol>
     </div>
     """, unsafe_allow_html=True)
@@ -3493,9 +3491,9 @@ with tabs[10]:
     with c1:
         st.markdown(f"""
         <div class="lkh-card">
-            <div class="label">Fuente operativa</div>
-            <div class="value">LakeHouse</div>
-            <div class="sub">Carga últimos datos disponibles y deja los campos editables.</div>
+            <div class="label">LakeHouse</div>
+            <div class="value">{_dias_lkh_balance} días</div>
+            <div class="sub">Período operativo base guardado en la sesión.</div>
         </div>
         """, unsafe_allow_html=True)
     with c2:
@@ -3503,23 +3501,23 @@ with tabs[10]:
         <div class="lkh-card">
             <div class="label">Balance esclusajes</div>
             <div class="value">{balance_escl_label}</div>
-            <div class="sub">Modo usado actualmente en el cálculo principal.</div>
+            <div class="sub">Modo que alimenta el balance principal.</div>
         </div>
         """, unsafe_allow_html=True)
     with c3:
         st.markdown(f"""
         <div class="lkh-card">
-            <div class="label">Evaporación Gatún</div>
-            <div class="value">{evap_gat_mm:.2f}</div>
-            <div class="sub">mm/día · {evap_gat:.4f} hm³/d.</div>
+            <div class="label">Gatún</div>
+            <div class="value">{evap_gat:.3f}</div>
+            <div class="sub">hm³/d evaporación · {evap_gat_mm:.2f} mm/día.</div>
         </div>
         """, unsafe_allow_html=True)
     with c4:
         st.markdown(f"""
         <div class="lkh-card">
-            <div class="label">Evaporación Alhajuela</div>
-            <div class="value">{evap_alh_mm:.2f}</div>
-            <div class="sub">mm/día · {evap_alh:.4f} hm³/d.</div>
+            <div class="label">Alhajuela</div>
+            <div class="value">{evap_alh:.3f}</div>
+            <div class="sub">hm³/d evaporación · {evap_alh_mm:.2f} mm/día.</div>
         </div>
         """, unsafe_allow_html=True)
     with c5:
@@ -3527,204 +3525,75 @@ with tabs[10]:
         <div class="lkh-card">
             <div class="label">Unidad visual</div>
             <div class="value">{u_label}</div>
-            <div class="sub">Solo cambia cómo se muestran los resultados; no cambia el cálculo base.</div>
+            <div class="sub">Solo cambia la forma de visualización.</div>
         </div>
         """, unsafe_allow_html=True)
 
-    st.info(
-        f"Evaporación actual: Gatún = {evap_gat_mm:.2f} mm/día ({evap_gat:.4f} hm³/d) y "
-        f"Alhajuela = {evap_alh_mm:.2f} mm/día ({evap_alh:.4f} hm³/d). "
-        "Alhajuela inicia con el mismo valor de Gatún, pero se puede cambiar directamente en el sidebar."
-    )
-
-    st.markdown("### 🧩 Qué hacer en cada parte del dashboard")
-    guia_simple = pd.DataFrame([
-        {"Paso": "1", "Dónde ir": "📂 Datos Lake House", "Qué hacer": "Confirmar archivo, hoja, fechas y promedios recientes.", "Resultado esperado": "Saber si los datos base están actualizados."},
-        {"Paso": "2", "Dónde ir": "Sidebar · Niveles Operativos", "Qué hacer": "Validar niveles de Gatún y Alhajuela.", "Resultado esperado": "Área espejo y evaporación calculadas con niveles correctos."},
-        {"Paso": "3", "Dónde ir": "Sidebar · Esclusajes", "Qué hacer": "Revisar PNX/día, NPX/día y fuente de consumo.", "Resultado esperado": "Consumo de esclusajes consistente con el escenario."},
-        {"Paso": "4", "Dónde ir": "Sidebar · Generación / Potable / Fugas", "Qué hacer": "Ajustar MW, cfs de potable y cfs de fugas si aplica.", "Resultado esperado": "Salidas operativas por embalse actualizadas."},
-        {"Paso": "5", "Dónde ir": "Sidebar · Evaporación", "Qué hacer": "Revisar Gatún y ajustar Alhajuela solo si corresponde.", "Resultado esperado": "Alhajuela inicia igual que Gatún, pero queda editable."},
-        {"Paso": "6", "Dónde ir": "📊 Balance", "Qué hacer": "Revisar total, porcentajes y distribución por embalse.", "Resultado esperado": "Demanda total validada."},
-        {"Paso": "7", "Dónde ir": "📤 Exportar", "Qué hacer": "Descargar el Excel de respaldo.", "Resultado esperado": "Reporte listo para compartir."},
-    ])
-    st.dataframe(guia_simple, use_container_width=True, hide_index=True)
-
-    st.markdown("### 🗂️ Pestañas explicadas en lenguaje sencillo")
+    st.markdown("### 🧩 Mapa rápido del dashboard")
     guia_tabs = pd.DataFrame([
-        {"Pestaña": "📊 Balance", "Para qué sirve": "Ver la demanda total y cómo se reparte entre Alhajuela y Gatún.", "Revise aquí": "Total del sistema, total por embalse y porcentaje por uso."},
-        {"Pestaña": "🏔️ Alhajuela", "Para qué sirve": "Ver las salidas del sistema Madden/Alhajuela.", "Revise aquí": "Generación Madden, potable, fugas, vertidos y evaporación."},
-        {"Pestaña": "🌊 Gatún", "Para qué sirve": "Ver las salidas asociadas al embalse Gatún.", "Revise aquí": "Esclusajes, generación Gatún, potable, fugas, vertido, ZZ-Flush y evaporación."},
-        {"Pestaña": "🚢 Esclusajes", "Para qué sirve": "Analizar consumo Panamax y Neopanamax.", "Revise aquí": "PNX/día, NPX/día, consumo unitario y total diario."},
-        {"Pestaña": "⚡ Generación", "Para qué sirve": "Convertir MW en consumo de agua.", "Revise aquí": "MW, factor cfs/MW y hm³/día generados por cada planta."},
-        {"Pestaña": "💾 Ahorro de Agua", "Para qué sirve": "Evaluar ahorro por tinas, cámaras cortas, crossfilling y Turn Around.", "Revise aquí": "Ahorro total y diferencia contra el consumo base."},
-        {"Pestaña": "📐 Área Espejo", "Para qué sirve": "Validar áreas usadas para evaporación.", "Revise aquí": "Nivel, curva hipsométrica, área km² y volumen evaporado."},
-        {"Pestaña": "🔄 Conversor", "Para qué sirve": "Convertir unidades rápidamente.", "Revise aquí": "hm³/día, cfs, m³/s, MPC y acre-ft."},
-        {"Pestaña": "📤 Exportar", "Para qué sirve": "Crear archivo para reporte.", "Revise aquí": "Resumen, parámetros y descarga Excel."},
-        {"Pestaña": "📂 Datos Lake House", "Para qué sirve": "Revisar los datos reales recientes.", "Revise aquí": "Últimos 5, 7 o 10 días, consumos, generación y salidas por embalse."},
-        {"Pestaña": "📘 Instructivo", "Para qué sirve": "Guiar el uso del app.", "Revise aquí": "Pasos, recomendaciones y solución de problemas."},
+        {"Pestaña": "📊 Balance", "Uso principal": "Validar demanda total, distribución por embalse y detalle operativo.", "Revise antes de reportar": "Total sistema, Alhajuela, Gatún, fuente de cada componente."},
+        {"Pestaña": "🏔️ Alhajuela", "Uso principal": "Revisar salidas Madden/Alhajuela.", "Revise antes de reportar": "Generación Madden, potable, fugas, vertido fondo/tambor/libre y evaporación."},
+        {"Pestaña": "🌊 Gatún", "Uso principal": "Revisar salidas de Gatún.", "Revise antes de reportar": "Esclusajes, generación Gatún, potable, fugas, vertido, ZZ-Flush y evaporación."},
+        {"Pestaña": "🚢 Esclusajes", "Uso principal": "Comparar PNX/NPX y consumos unitarios.", "Revise antes de reportar": "Fuente del consumo, hm³/escl, cfs equivalente y ahorro aplicado."},
+        {"Pestaña": "⚡ Generación", "Uso principal": "Validar MW y conversión a caudal/volumen.", "Revise antes de reportar": "Factor cfs/MW, MW por planta y hm³/día."},
+        {"Pestaña": "💾 Ahorro de Agua", "Uso principal": "Evaluar tinas, cámara corta, crossfilling y Turn Around NPX.", "Revise antes de reportar": "Ahorro total y modo de balance que lo está usando."},
+        {"Pestaña": "📐 Área Espejo", "Uso principal": "Validar área por nivel y evaporación.", "Revise antes de reportar": "Curva estándar/Daily, nivel operativo, área km² y hm³/d."},
+        {"Pestaña": "📂 Datos Lake House", "Uso principal": "Confirmar datos reales recientes.", "Revise antes de reportar": "Archivo, hoja, fecha final, promedios 5/7/10 días y salidas por embalse."},
+        {"Pestaña": "📤 Exportar", "Uso principal": "Generar respaldo en Excel.", "Revise antes de reportar": "Parámetros, demandas por embalse y hoja de áreas."},
     ])
     st.dataframe(guia_tabs, use_container_width=True, hide_index=True)
 
-    st.markdown("### ⚙️ Cómo interpretar el panel lateral")
-    with st.expander("📍 Niveles operativos", expanded=True):
-        st.markdown("""
-        **Qué controla:** los niveles actuales de Gatún y Alhajuela.  
-        **Por qué importa:** cuando el área se calcula desde nivel, estos valores definen el área espejo usada en evaporación.  
-        **Recomendación:** revise primero los niveles del LakeHouse y luego modifique manualmente solo si el escenario operativo lo requiere.
-        """)
-
-    with st.expander("🚢 Tránsitos y esclusajes", expanded=True):
-        st.markdown("""
-        **Qué controla:** número de tránsitos PNX/NPX y consumo unitario de agua.  
-        **Opciones principales:**
-        - **Manual sidebar:** usa directamente los valores unitarios ingresados.
-        - **Sidebar + ahorro:** aplica ahorros al valor manual.
-        - **Modelo físico base:** calcula el consumo con nivel de Gatún.
-        - **Modelo físico + ahorro:** calcula con nivel y descuenta estrategias de ahorro.
-
-        **Recomendación:** para simulaciones operativas, deje claro en el reporte cuál fuente de consumo se usó.
-        """)
-
-    with st.expander("⚡ Hidrogeneración"):
-        st.markdown("""
-        **Qué controla:** MW de Madden y Gatún, junto con el factor cfs/MW.  
-        **Resultado:** la app convierte la generación en volumen diario de agua.  
-        **Nota:** en la pestaña LakeHouse, las columnas de energía se muestran como MWh/d y también como MW promedio horario.
-        """)
-
-    with st.expander("🚰 Potable, fugas y vertidos"):
-        st.markdown("""
-        **Qué controla:** salidas adicionales por embalse.  
-        **Cómo leerlo:** los valores se ingresan en cfs y la app los convierte a hm³/día y m³/s.  
-        **Recomendación:** verifique que las fugas y potable correspondan al embalse correcto antes de exportar.
-        """)
-
-    with st.expander("🔄 ZZ-Flush"):
-        st.markdown("""
-        **Qué controla:** horas de operación del ZZ-Flush en Cocolí y Agua Clara.  
-        **Cómo calcula:** usa un caudal instantáneo de referencia y lo convierte a volumen por horas operadas.  
-        **Recomendación:** deje en cero si el escenario no considera ZZ-Flush.
-        """)
-
-    with st.expander("☀️ Evaporación"):
-        st.markdown(f"""
-        **Qué controla:** la lámina diaria de evaporación en mm/día y el área espejo del embalse.  
-        **Criterio aplicado:** Alhajuela queda con el mismo valor inicial de Gatún para facilitar escenarios homogéneos.  
-        **Valores actuales:** Gatún = **{evap_gat_mm:.2f} mm/día** ({evap_gat:.4f} hm³/d) y Alhajuela = **{evap_alh_mm:.2f} mm/día** ({evap_alh:.4f} hm³/d).  
-        **Cómo modificarlo:** edite directamente **Lámina Gatún (mm/día)** o **Lámina Alhajuela (mm/día)**; no hay interruptor ni sincronización automática.  
-        **Fórmula usada:** evaporación hm³/día = lámina mm/día × área km² × 0.001.
-        """)
-
-    st.markdown("### 📂 Uso recomendado del LakeHouse")
-    st.markdown("""
-    1. Coloque el archivo **LakeHouse*.xlsx** en la misma carpeta del app, o súbalo en **📂 Datos Lake House**.  
-    2. Confirme que la hoja seleccionada sea la correcta.  
-    3. Revise el rango de fechas leído por la app y el **último registro disponible**.  
-    4. Compare promedios de **5, 7 y 10 días** cuando necesite validar estabilidad de los datos.  
-    5. Recuerde que el selector **5 / 7 / 10 días** recalcula las tarjetas de promedios, salidas por embalse, consumos operativos y descarga CSV del período seleccionado.  
-    6. Use la sección de **salidas por embalse** para verificar que Alhajuela y Gatún estén separados correctamente.  
-    7. Si necesita soporte externo, descargue el CSV del período seleccionado.
-    """)
-
-    st.markdown("### 🆕 Criterios técnicos incorporados en esta versión")
-    criterios_lkh = pd.DataFrame([
-        {
-            "Elemento": "Promedio 5 / 7 / 10 días",
-            "Criterio aplicado": "La app usa exactamente los últimos N registros disponibles del LakeHouse, no una ventana inclusiva por fecha.",
-            "Dónde verificar": "📂 Datos Lake House · Promedios operativos y Salidas de agua por embalse.",
-        },
-        {
-            "Elemento": "Niveles de Gatún y Alhajuela",
-            "Criterio aplicado": "Los niveles se toman del último día disponible; no se promedian, porque representan condición operativa inicial.",
-            "Dónde verificar": "Tarjetas superiores de 📂 Datos Lake House y sidebar de niveles operativos.",
-        },
-        {
-            "Elemento": "Evaporación",
-            "Criterio aplicado": "No se toma del LakeHouse. Siempre se calcula en el app con lámina mm/día × área km² × 0.001 por embalse.",
-            "Dónde verificar": "📊 Balance · Detalle operativo del balance y ☀️ Evaporación aplicada.",
-        },
-        {
-            "Elemento": "Potabilización",
-            "Criterio aplicado": "Cuando hay LakeHouse, se priorizan columnas MCF/MPC (`munic_mad` y `munic_gat`) y se convierten a hm³/d, cfs y m³/s.",
-            "Dónde verificar": "📊 Balance · Detalle operativo del balance y 📂 Datos Lake House.",
-        },
-        {
-            "Elemento": "Fugas",
-            "Criterio aplicado": "Cuando hay LakeHouse, se priorizan columnas MCF/MPC (`leak_mad` y `leak_gat`) para evitar valores *_hm3 desajustados.",
-            "Dónde verificar": "📊 Balance · Detalle operativo del balance y 📂 Datos Lake House.",
-        },
-        {
-            "Elemento": "Esclusajes",
-            "Criterio aplicado": "El consumo se muestra una sola vez y se calcula con PNX + NPX según el período seleccionado y la fuente de consumo activa.",
-            "Dónde verificar": "Tarjeta Consumo esclusajes y pestaña 🚢 Esclusajes.",
-        },
+    st.markdown("### 📌 Reglas técnicas que debe recordar")
+    reglas = pd.DataFrame([
+        {"Elemento": "Niveles", "Criterio": "Se toman del último registro válido del LakeHouse y luego quedan editables en el sidebar."},
+        {"Elemento": "Promedios 5/7/10 días", "Criterio": "Se calculan con los últimos N registros disponibles, no por ventana inclusiva de calendario."},
+        {"Elemento": "Esclusajes", "Criterio": "PNX y NPX se promedian entre complejos para evitar duplicar el tránsito."},
+        {"Elemento": "Potabilización y fugas", "Criterio": "Se priorizan columnas MCF/MPC del LakeHouse; *_hm3 se usa como respaldo."},
+        {"Elemento": "Vertido fondo Madden", "Criterio": "`madspill` se interpreta como cfs directo y se convierte a hm³/día."},
+        {"Elemento": "Evaporación", "Criterio": "No se toma del LakeHouse. Se calcula como lámina mm/día × área km² × 0.001."},
+        {"Elemento": "Unidad visual", "Criterio": "Cambiar hm³/día, cfs o m³/s solo cambia la visualización; el cálculo base queda en hm³/día."},
     ])
-    st.dataframe(criterios_lkh, use_container_width=True, hide_index=True)
+    st.dataframe(reglas, use_container_width=True, hide_index=True)
 
-    st.warning(
-        "Para control de calidad: si cambia de 5 a 7 o 10 días, los promedios del LakeHouse deben cambiar en las tarjetas "
-        "de consumo, potabilización, fugas, generación y salidas por embalse. La evaporación puede mantenerse igual si no cambia "
-        "la lámina o el nivel, porque se calcula desde el app y no desde el LakeHouse."
-    )
-
-    st.markdown("### 📏 Unidades principales")
-    unidades = pd.DataFrame([
-        {"Unidad": "hm³/día", "Lectura sencilla": "Volumen diario de agua.", "Dónde aparece": "Balance, embalses, esclusajes, evaporación y exportación."},
-        {"Unidad": "cfs", "Lectura sencilla": "Caudal en pies cúbicos por segundo.", "Dónde aparece": "Potable, fugas, vertidos, generación y conversiones."},
-        {"Unidad": "m³/s", "Lectura sencilla": "Caudal en sistema internacional.", "Dónde aparece": "Conversor, tablas y equivalencias."},
-        {"Unidad": "MPC / MCF", "Lectura sencilla": "Millones de pies cúbicos.", "Dónde aparece": "LakeHouse y conversor."},
-        {"Unidad": "hm³/escl", "Lectura sencilla": "Agua usada por esclusaje.", "Dónde aparece": "Pestaña Esclusajes y parámetros de consumo."},
-        {"Unidad": "MW", "Lectura sencilla": "Potencia de generación.", "Dónde aparece": "Sidebar y pestaña Generación."},
-        {"Unidad": "MWh/d", "Lectura sencilla": "Energía diaria.", "Dónde aparece": "Datos LakeHouse; se divide entre 24 para obtener MW promedio."},
-    ])
-    st.dataframe(unidades, use_container_width=True, hide_index=True)
-
-    st.markdown("### 🧪 Lista rápida antes de enviar un reporte")
+    st.markdown("### 🧪 Lista de verificación antes de enviar")
     chk1, chk2, chk3 = st.columns(3)
     with chk1:
         st.markdown("""
-        **Datos base**
-        - Archivo LakeHouse correcto.
+        **Datos**
+        - LakeHouse correcto.
         - Hoja correcta.
-        - Rango de fechas y último registro revisados.
-        - Promedio seleccionado (**5, 7 o 10 días**) validado.
-        - Confirmar que la evaporación proviene del **App calculado**, no del LakeHouse.
+        - Último registro revisado.
+        - Período 5/7/10 días confirmado.
         """)
     with chk2:
         st.markdown("""
         **Escenario**
-        - Niveles correctos.
+        - Niveles revisados.
         - PNX/NPX revisados.
-        - MW de generación correctos.
-        - Potable, fugas y vertidos revisados.
+        - Generación, potable y fugas revisadas.
+        - Vertidos y ZZ-Flush revisados.
         """)
     with chk3:
         st.markdown("""
-        **Resultados**
+        **Resultado**
         - Balance total razonable.
         - Embalses separados.
-        - Evaporación revisada: Alhajuela inicia igual que Gatún, pero puede quedar distinta si el escenario lo requiere.
+        - Evaporación validada.
         - Excel exportado.
         """)
 
-    st.markdown("### 🛠️ Problemas comunes")
+    st.markdown("### 🛠️ Problemas comunes y solución rápida")
     problemas = pd.DataFrame([
-        {"Situación": "No carga el LakeHouse", "Solución": "Use un archivo llamado LakeHouse*.xlsx, colóquelo junto al app o súbalo desde Datos Lake House."},
-        {"Situación": "Los valores cambiaron al abrir la app", "Solución": "La app usa el LakeHouse como punto inicial; luego puede editar manualmente en el sidebar."},
-        {"Situación": "Cambio 5/7/10 días y algunos valores no cambian", "Solución": "Revise si ese campo proviene del último día, como niveles, o si es calculado por el app, como evaporación. Los promedios LakeHouse sí deben actualizarse."},
-        {"Situación": "Evaporación aparece como LakeHouse", "Solución": "No debe usarse LakeHouse para evaporación; verifique que la fuente indique App calculado y que use lámina × área."},
-        {"Situación": "Potabilización o fugas salen muy altas", "Solución": "Revise que se estén usando columnas MCF/MPC (`munic_*` y `leak_*`) y no valores *_hm3 desajustados del LakeHouse."},
-        {"Situación": "Alhajuela tiene la misma evaporación que Gatún", "Solución": "Es el valor inicial por defecto. Edite directamente Lámina Alhajuela (mm/día) si requiere una lámina diferente."},
-        {"Situación": "El área espejo no parece correcta", "Solución": "Revise el nivel operativo y la curva hipsométrica seleccionada: Estándar o Daily."},
-        {"Situación": "El consumo de esclusajes no coincide", "Solución": "Revise la fuente del balance principal: manual, manual con ahorro, modelo físico o modelo físico con ahorro."},
-        {"Situación": "Necesito compartir resultados", "Solución": "Use Exportar para descargar el Excel; use Datos Lake House para descargar el CSV del período."},
+        {"Situación": "No carga el LakeHouse", "Solución": "Verifique que sea .xlsx, que no esté abierto en Excel y que la hoja tenga columna de fecha."},
+        {"Situación": "El sidebar cambió al abrir la app", "Solución": "La app toma LakeHouse como punto inicial. Después de cargarlo, todos los campos quedan editables."},
+        {"Situación": "Cambio 5/7/10 días y niveles no cambian", "Solución": "Es normal: los niveles usan el último registro; los promedios operativos sí cambian con 5/7/10 días."},
+        {"Situación": "Potable o fugas se ven altos", "Solución": "Revise columnas MCF/MPC (`munic_*`, `leak_*`). La app las prioriza sobre *_hm3."},
+        {"Situación": "Vertido fondo Madden no coincide", "Solución": "Verifique `madspill`: debe estar en cfs; la app lo convierte directamente a hm³/día."},
+        {"Situación": "Evaporación no coincide con LakeHouse", "Solución": "La evaporación se calcula dentro del app con lámina y área, no con el volumen del LakeHouse."},
     ])
     st.dataframe(problemas, use_container_width=True, hide_index=True)
 
-    st.success(
-        "Recomendación final: valide primero Datos Lake House, luego ajuste el sidebar, revise Balance y finalmente exporte el Excel."
-    )
-
+    st.success("Flujo recomendado: Datos LakeHouse → niveles y escenario en sidebar → Balance → Exportar.")
 
 # ═══ FOOTER ═══
 st.markdown("---")

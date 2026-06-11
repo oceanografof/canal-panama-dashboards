@@ -56,6 +56,7 @@ MAX_ZIP_UNCOMPRESSED_BYTES = 220 * 1024 * 1024
 ALLOWED_ROOT_FILES = {
     "LakeHouse_Data.xlsx",
     "app_dss.py",
+    "app_demandas.py",
     "download_data.py",
     "actualizar.bat",
     "requirements.txt",
