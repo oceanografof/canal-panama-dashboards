@@ -4,11 +4,65 @@ Creado para HIMH por JFRodriguez
 pip install streamlit pandas numpy plotly openpyxl pillow pyxlsb
 streamlit run app_demandas.py
 """
-import streamlit as st, pandas as pd, numpy as np, datetime, io, base64, os
+import streamlit as st, pandas as pd, numpy as np, datetime, io, base64, os, tempfile
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="💧 Demandas — Canal de Panamá", page_icon="💧", layout="wide")
+
+
+# ── Contador consecutivo persistente (una vez por sesión) ─────────────────────
+def _counter_state_file() -> str:
+    """Ubicación persistente del contador consecutivo del app."""
+    base_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    candidate_dirs = [
+        os.path.join(base_dir, ".app_state"),
+        os.path.join(os.getcwd(), ".app_state"),
+        os.path.join(tempfile.gettempdir(), "app_demandas_state"),
+    ]
+
+    for folder in candidate_dirs:
+        try:
+            os.makedirs(folder, exist_ok=True)
+            test_file = os.path.join(folder, ".write_test")
+            with open(test_file, "w", encoding="utf-8") as fh:
+                fh.write("ok")
+            try:
+                os.remove(test_file)
+            except Exception:
+                pass
+            return os.path.join(folder, "contador_consecutivo.txt")
+        except Exception:
+            continue
+
+    return os.path.join(tempfile.gettempdir(), "contador_consecutivo_app_demandas.txt")
+
+
+def get_consecutive_counter() -> int:
+    """Incrementa una sola vez por sesión y conserva el consecutivo entre ejecuciones."""
+    session_key = "_contador_consecutivo_app_demandas"
+    if session_key in st.session_state:
+        return int(st.session_state[session_key])
+
+    counter_file = _counter_state_file()
+
+    try:
+        with open(counter_file, "r", encoding="utf-8") as fh:
+            raw_value = fh.read().strip()
+        current_value = int(raw_value) if raw_value.isdigit() else 0
+    except Exception:
+        current_value = 0
+
+    next_value = current_value + 1
+
+    try:
+        with open(counter_file, "w", encoding="utf-8") as fh:
+            fh.write(str(next_value))
+    except Exception:
+        pass
+
+    st.session_state[session_key] = next_value
+    return next_value
 
 # ── Ajuste visual general: métricas más legibles sin alterar la lógica ─────────
 st.markdown("""
@@ -820,7 +874,10 @@ if _sb_logos:
         f"<div style='text-align:center;margin-bottom:8px;display:flex;"
         f"align-items:center;justify-content:center;gap:8px;'>{_sb_logos}</div>",
         unsafe_allow_html=True)
-st.sidebar.markdown("## 💧 Demandas de Agua\nCanal de Panamá\n---")
+st.sidebar.markdown("## 💧 Demandas de Agua\nCanal de Panamá")
+_contador_consecutivo = get_consecutive_counter()
+st.sidebar.caption(f"🔢 Consecutivo: {_contador_consecutivo:06d}")
+st.sidebar.markdown("---")
 
 # ═══ BÚSQUEDA LOCAL UNIFICADA DE LAKEHOUSE ══════════════════════════════════
 def _buscar_lakehouse_local():

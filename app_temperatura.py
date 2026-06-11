@@ -78,6 +78,52 @@ def metric_card(title: str, value: str, subtitle: str = "", color: str = "#f8f9f
     )
 
 
+def _counter_state_file() -> Path:
+    """Ubicación persistente del contador consecutivo del app."""
+    candidate_dirs = [
+        Path(__file__).resolve().parent / ".app_state",
+        Path.cwd() / ".app_state",
+        Path(tempfile.gettempdir()) / "app_temperatura_state",
+    ]
+
+    for folder in candidate_dirs:
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            test_file = folder / ".write_test"
+            test_file.write_text("ok", encoding="utf-8")
+            test_file.unlink(missing_ok=True)
+            return folder / "contador_consecutivo.txt"
+        except Exception:
+            continue
+
+    return Path(tempfile.gettempdir()) / "contador_consecutivo_app_temperatura.txt"
+
+
+def get_consecutive_counter() -> int:
+    """Incrementa una sola vez por sesión y conserva el consecutivo entre ejecuciones."""
+    session_key = "_contador_consecutivo_app_temperatura"
+    if session_key in st.session_state:
+        return int(st.session_state[session_key])
+
+    counter_file = _counter_state_file()
+
+    try:
+        raw_value = counter_file.read_text(encoding="utf-8").strip()
+        current_value = int(raw_value) if raw_value.isdigit() else 0
+    except Exception:
+        current_value = 0
+
+    next_value = current_value + 1
+
+    try:
+        counter_file.write_text(str(next_value), encoding="utf-8")
+    except Exception:
+        pass
+
+    st.session_state[session_key] = next_value
+    return next_value
+
+
 def infer_station_from_name(name: str) -> str:
     n = name.upper()
     if "AMA" in n:
@@ -946,6 +992,8 @@ for logo in logo_candidates:
 
 st.sidebar.markdown("## 🌡️ Dashboard Integrado")
 st.sidebar.markdown("**Canal de Panamá · HIMH**")
+_contador_consecutivo = get_consecutive_counter()
+st.sidebar.caption(f"🔢 Consecutivo: {_contador_consecutivo:06d}")
 st.sidebar.markdown("---")
 
 temp_option_keys = list(temp_frames.keys())

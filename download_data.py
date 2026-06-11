@@ -57,11 +57,23 @@ ALLOWED_ROOT_FILES = {
     "LakeHouse_Data.xlsx",
     "app_dss.py",
     "app_demandas.py",
+    "app_temperatura.py",
     "download_data.py",
     "actualizar.bat",
     "requirements.txt",
     ".gitignore",
 }
+
+# Apps Streamlit del repositorio que pueden subirse automáticamente.
+# Esto evita que cada nueva app tipo app_temperatura.py, app_AyS.py,
+# app_simulacion_dss.py, etc. bloquee el commit seguro.
+# La seguridad se mantiene porque antes de permitirlas se aplican:
+#   1) bloqueo por nombre sensible,
+#   2) revisión de posibles credenciales con scan_for_secrets(),
+#   3) solo archivos Python en la raíz del repo.
+ALLOWED_ROOT_APP_PATTERNS = (
+    "app_*.py",
+)
 
 # Nunca subir automáticamente archivos sensibles, aunque estén modificados.
 BLOCKED_PATH_PATTERNS = (
@@ -299,11 +311,26 @@ def is_path_blocked(path: str) -> bool:
     return any(pattern.lower() in p or pattern.lower() == name for pattern in BLOCKED_PATH_PATTERNS)
 
 
+def is_allowed_root_app_file(path: str) -> bool:
+    """Permite apps Streamlit de la raíz sin abrir permisos generales.
+
+    Ejemplos permitidos: app_temperatura.py, app_demandas.py, app_AyS.py.
+    No permite subcarpetas ni nombres con patrones sensibles como token/secret.
+    """
+    p = path.replace("\\", "/")
+    name = Path(p).name
+    if "/" in p:
+        return False
+    if is_path_blocked(p):
+        return False
+    return any(fnmatch.fnmatch(name, pat) for pat in ALLOWED_ROOT_APP_PATTERNS)
+
+
 def is_allowed_to_commit(path: str) -> bool:
     p = path.replace("\\", "/")
     if is_path_blocked(p):
         return False
-    if "/" not in p and p in ALLOWED_ROOT_FILES:
+    if "/" not in p and (p in ALLOWED_ROOT_FILES or is_allowed_root_app_file(p)):
         return True
     if p.startswith("data/") and Path(p).name in EXPECTED_DATA_FILES:
         return True
