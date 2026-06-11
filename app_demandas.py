@@ -876,7 +876,18 @@ if _sb_logos:
         unsafe_allow_html=True)
 st.sidebar.markdown("## 💧 Demandas de Agua\nCanal de Panamá")
 _contador_consecutivo = get_consecutive_counter()
-st.sidebar.caption(f"🔢 Consecutivo: {_contador_consecutivo:06d}")
+st.sidebar.markdown(
+    f"""
+    <div style="display:flex; align-items:center; gap:8px; margin:2px 0 10px 0;">
+        <span style="font-weight:800; color:#004b7a; font-size:1.02rem; letter-spacing:0.2px;">ACP-HIMH</span>
+        <span style="display:inline-flex; align-items:center; gap:6px; background:#004b7a; color:#ffffff; border-radius:9px; padding:4px 10px; font-weight:800; font-size:0.86rem; line-height:1.1; box-shadow:0 1px 3px rgba(0,0,0,0.12);">
+            <span style="font-size:0.92rem;">👁️</span>
+            <span>{_contador_consecutivo:,}</span>
+        </span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.sidebar.markdown("---")
 
 # ═══ BÚSQUEDA LOCAL UNIFICADA DE LAKEHOUSE ══════════════════════════════════
