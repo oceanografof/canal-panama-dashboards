@@ -1779,10 +1779,19 @@ def clean_evap_cfs(evap_cfs: float) -> float:
 def ap_total_dss_cfs(ap_neto_cfs, evap_cfs: float) -> pd.Series:
     """AP total DSS estimado = AP neto DSS + caudal evaporado.
 
+    Cambio quirúrgico para ambos embalses (Gatún y Alhajuela/Madden):
+    la evaporación se suma explícitamente al aporte neto DSS y nunca se resta.
     Acepta escalares o Series y retorna una Series numérica en p³/s.
     """
-    ap = pd.to_numeric(pd.Series(ap_neto_cfs), errors="coerce")
-    return ap + clean_evap_cfs(evap_cfs)
+    ap_neto = pd.to_numeric(pd.Series(ap_neto_cfs), errors="coerce")
+    evaporacion = clean_evap_cfs(evap_cfs)
+
+    # Fórmula única usada en todas las pestañas, métricas, gráficas y exportaciones:
+    # AP total DSS = AP neto DSS + evaporación.
+    ap_total = ap_neto.copy()
+    validos = ap_neto.notna()
+    ap_total.loc[validos] = ap_neto.loc[validos] + evaporacion
+    return ap_total
 
 
 # ─────────────────────────────────────────────────────────────────────
