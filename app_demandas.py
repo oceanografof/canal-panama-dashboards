@@ -849,6 +849,23 @@ _logo_cp_mime, _logo_cp = _logo_b64("CP_RGB_p_Ver.jpg")
 def f3u(hm3):
     return f"{hm3:.3f} hm³/d · {hm3/CFS2HM3:.0f} cfs · {hm3*HM3D2M3S:.1f} m³/s"
 
+
+def fmt_sig(value, sig=3):
+    """Formatea un número con cifras significativas y evita residuos binarios (p. ej. 27.0999999)."""
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not np.isfinite(x):
+        return "—"
+    if x == 0:
+        return "0." + ("0" * max(sig - 1, 0))
+    decimals = sig - int(np.floor(np.log10(abs(x)))) - 1
+    if decimals > 0:
+        return f"{x:.{decimals}f}"
+    return f"{round(x, decimals):.0f}"
+
+
 def tbl(usos, total, nombre, dem_t):
     rows = []
     for nm, (h, c, _) in usos.items():
@@ -1495,8 +1512,8 @@ modo_balance_esclusajes = st.sidebar.radio(
 )
 
 st.sidebar.markdown("### 🚢 Esclusajes")
-n_pnx = st.sidebar.slider("PNX/día", min_value=0.0, max_value=40.0, step=0.5, format="%.1f", key="n_pnx_lkh")
-n_npx = st.sidebar.slider("NPX/día", min_value=0.0, max_value=20.0, step=0.5, format="%.1f", key="n_npx_lkh")
+n_pnx = st.sidebar.slider("Panamax (PNX) / día", min_value=0.0, max_value=40.0, step=0.5, format="%.1f", key="n_pnx_lkh")
+n_npx = st.sidebar.slider("NeoPanamax (NPX) / día", min_value=0.0, max_value=20.0, step=0.5, format="%.1f", key="n_npx_lkh")
 n_t   = n_pnx + n_npx
 
 st.sidebar.markdown("### 📐 Consumo por esclusaje")
@@ -1840,7 +1857,12 @@ k1,k2,k3,k4,k5,k6 = st.columns(6)
 k1.metric("Total",       f"{dem_total*u_cv:.2f} {u_label}")
 k2.metric("Alhajuela",   f"{alh_total*u_cv:.2f} {u_label}")
 k3.metric("Gatún",       f"{gat_total*u_cv:.2f} {u_label}")
-k4.metric("Esclusajes",  f"{n_t}/día")
+with k4:
+    st.metric("Esclusajes", f"{fmt_sig(n_t, 3)}/día")
+    st.caption(
+        f"Panamax: **{fmt_sig(n_pnx, 3)}** · "
+        f"NeoPanamax: **{fmt_sig(n_npx, 3)}**"
+    )
 k5.metric("Generación",  f"{gm_mw+gg_mw} MW")
 k6.metric("Evaporación", f"{evap_tot:.2f} hm³/d")
 
@@ -2154,11 +2176,17 @@ with tabs[2]:
 # ═══ TAB 3 — ESCLUSAJES ═══
 with tabs[3]:
     st.subheader("🚢 Dashboard de Esclusajes")
-    ek1,ek2,ek3,ek4 = st.columns(4)
-    ek1.metric("Total esclusajes",f"{n_t}/día")
-    ek2.metric("Consumo total",   f3u(dem_escl))
-    ek3.metric("% de demanda",    f"{dem_escl/max(dem_total,.001)*100:.1f}%")
-    ek4.metric("Vol prom/escl",   f"{dem_escl/max(n_t,1):.3f} hm³")
+
+    # Tránsitos: se muestran por separado y el total se limita a 3 cifras significativas.
+    tr1, tr2, tr3 = st.columns(3)
+    tr1.metric("Total de tránsitos", f"{fmt_sig(n_t, 3)}/día")
+    tr2.metric("Panamax (PNX)", f"{fmt_sig(n_pnx, 3)}/día")
+    tr3.metric("NeoPanamax (NPX)", f"{fmt_sig(n_npx, 3)}/día")
+
+    ek1, ek2, ek3 = st.columns(3)
+    ek1.metric("Consumo total", f3u(dem_escl))
+    ek2.metric("% de demanda", f"{dem_escl/max(dem_total,.001)*100:.1f}%")
+    ek3.metric("Volumen promedio/tránsito", f"{dem_escl/max(n_t,1):.3f} hm³")
 
     # Consumo unitario - controlado desde sidebar
     st.markdown("---")
@@ -3534,28 +3562,93 @@ with tabs[9]:
 
 # ═══ TAB 10 — INSTRUCTIVO ═══
 with tabs[10]:
-    st.subheader("📘 Instructivo operativo rápido")
+    st.subheader("📘 Instructivo operativo fácil")
     st.caption(
-        "Guía puntual para revisar datos, ajustar el escenario, validar el balance y exportar el reporte."
+        "Siga el orden 1 → 6. Cada paso indica dónde entrar, qué revisar y qué resultado debe confirmar."
     )
 
-    st.markdown(f"""
-    <div style="border:1px solid rgba(148,163,184,0.35);border-radius:18px;padding:18px 20px;background:linear-gradient(180deg,rgba(26,82,118,0.09),rgba(148,163,184,0.04));">
-        <h3 style="margin-top:0;color:#1a5276;">🧭 Orden recomendado de uso</h3>
-        <ol style="font-size:1.02rem;line-height:1.65;margin-bottom:0;">
-            <li><b>Cargar o confirmar LakeHouse:</b> abra <b>📂 Datos Lake House</b>, verifique archivo, hoja, rango de fechas y último registro.</li>
-            <li><b>Escoger período operativo:</b> seleccione <b>5, 7 o 10 días</b>. Ese período alimenta los promedios usados como valores iniciales del sidebar.</li>
-            <li><b>Validar niveles:</b> confirme <b>Gatún</b> y <b>Alhajuela</b> en el sidebar. Estos niveles actualizan área espejo, evaporación y modelos dependientes de nivel.</li>
-            <li><b>Definir consumo de esclusajes:</b> seleccione la fuente: <b>Basado en Nivel</b>, <b>Basado en LakeHouse</b> o <b>Manual</b>.</li>
-            <li><b>Ajustar escenario:</b> revise PNX/NPX, generación, potable, fugas, vertidos, ZZ-Flush, evaporación y ahorros de agua.</li>
-            <li><b>Validar resultados:</b> use <b>📊 Balance</b>, <b>🏔️ Alhajuela</b>, <b>🌊 Gatún</b> y <b>🚢 Esclusajes</b> antes de reportar.</li>
-            <li><b>Exportar:</b> descargue el Excel en <b>📤 Exportar</b> cuando los valores estén revisados.</li>
-        </ol>
-    </div>
-    """, unsafe_allow_html=True)
+    st.info(
+        f"**Escenario mostrado:** Panamax {fmt_sig(n_pnx, 3)}/día + "
+        f"NeoPanamax {fmt_sig(n_npx, 3)}/día = **{fmt_sig(n_t, 3)} tránsitos/día** · "
+        f"Balance de esclusajes: **{balance_escl_label}**."
+    )
+
+    st.markdown("### 🚀 Inicio rápido en 6 pasos")
+    paso1, paso2 = st.columns(2)
+    with paso1:
+        st.markdown("""
+        #### 1️⃣ Cargue y confirme los datos
+        Entre a **📂 Datos Lake House** y:
+        1. Seleccione o cargue el archivo `.xlsx`.
+        2. Confirme la hoja y la fecha del último registro.
+        3. Elija el período operativo de **5, 7 o 10 días**.
+
+        **Resultado esperado:** la app informa que LakeHouse fue aplicado y deja los valores editables.
+        """)
+    with paso2:
+        st.markdown("""
+        #### 2️⃣ Revise los niveles operativos
+        En el sidebar, abra **📍 Niveles Operativos** y confirme:
+        - **Nivel Gatún (ft)**.
+        - **Nivel Alhajuela (ft)**.
+
+        Los niveles actualizan el área del embalse, la evaporación y los cálculos que dependen del nivel.
+        """)
+
+    paso3, paso4 = st.columns(2)
+    with paso3:
+        st.markdown("""
+        #### 3️⃣ Ingrese los tránsitos diarios
+        En **🚢 Esclusajes**, ajuste:
+        - **Panamax (PNX) / día**.
+        - **NeoPanamax (NPX) / día**.
+
+        El total aparece en el encabezado con **3 cifras significativas** y también se muestra separado por tipo de tránsito.
+        """)
+    with paso4:
+        st.markdown("""
+        #### 4️⃣ Defina cómo calcular esclusajes
+        Revise dos controles distintos:
+        - **Fuente vol/tránsito:** Nivel, LakeHouse o Manual.
+        - **Usar en el balance:** Manual, Sidebar + ahorro, Modelo físico base o Modelo físico + ahorro.
+
+        **Importante:** la primera opción define el volumen unitario; la segunda decide qué consumo entra al balance principal.
+        """)
+
+    paso5, paso6 = st.columns(2)
+    with paso5:
+        st.markdown("""
+        #### 5️⃣ Ajuste las demás demandas
+        Revise en el sidebar:
+        - Generación Madden y Gatún.
+        - Potabilización y fugas.
+        - Vertidos, ZZ-Flush y evaporación.
+        - Ahorros por tinas, cámara corta, crossfilling y Turn Around NPX.
+        """)
+    with paso6:
+        st.markdown("""
+        #### 6️⃣ Valide y exporte
+        Revise en este orden:
+        1. **📊 Balance**: total y distribución por embalse.
+        2. **🏔️ Alhajuela** y **🌊 Gatún**: componentes individuales.
+        3. **🚢 Esclusajes**: tránsitos, volumen unitario y consumo.
+        4. **📤 Exportar**: descargue el Excel final.
+        """)
+
+    st.markdown("### 🎛️ Qué modifica cada control principal")
+    controles = pd.DataFrame([
+        {"Control": "Período 5/7/10 días", "Dónde": "📂 Datos Lake House", "Efecto": "Cambia los promedios operativos que alimentan los valores iniciales del sidebar."},
+        {"Control": "Nivel Gatún", "Dónde": "Sidebar · Niveles Operativos", "Efecto": "Actualiza área Gatún, evaporación y consumos dependientes del nivel."},
+        {"Control": "Nivel Alhajuela", "Dónde": "Sidebar · Niveles Operativos", "Efecto": "Actualiza área Alhajuela, evaporación y generación Madden dependiente del nivel."},
+        {"Control": "Panamax/NeoPanamax por día", "Dónde": "Sidebar · Esclusajes", "Efecto": "Cambia la cantidad de tránsitos y el consumo diario de esclusajes."},
+        {"Control": "Fuente vol/tránsito", "Dónde": "Sidebar · Consumo por esclusaje", "Efecto": "Define el hm³ por tránsito PNX y NPX."},
+        {"Control": "Usar en el balance", "Dónde": "Sidebar · Fuente de consumo", "Efecto": "Define si el balance usa valores del sidebar o del modelo físico, con o sin ahorro."},
+        {"Control": "Unidad visual", "Dónde": "Final del sidebar", "Efecto": "Solo cambia la presentación entre hm³/día, cfs y m³/s; no altera el cálculo base."},
+    ])
+    st.dataframe(controles, use_container_width=True, hide_index=True)
 
     st.markdown("### ✅ Estado actual del cálculo")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(f"""
         <div class="lkh-card">
@@ -3567,42 +3660,52 @@ with tabs[10]:
     with c2:
         st.markdown(f"""
         <div class="lkh-card">
-            <div class="label">Balance esclusajes</div>
-            <div class="value">{balance_escl_label}</div>
-            <div class="sub">Modo que alimenta el balance principal.</div>
+            <div class="label">Tránsitos diarios</div>
+            <div class="value">{fmt_sig(n_t, 3)}</div>
+            <div class="sub">Panamax {fmt_sig(n_pnx, 3)} · NeoPanamax {fmt_sig(n_npx, 3)}.</div>
         </div>
         """, unsafe_allow_html=True)
     with c3:
         st.markdown(f"""
         <div class="lkh-card">
-            <div class="label">Gatún</div>
-            <div class="value">{evap_gat:.3f}</div>
-            <div class="sub">hm³/d evaporación · {evap_gat_mm:.2f} mm/día.</div>
+            <div class="label">Balance esclusajes</div>
+            <div class="value">{balance_escl_label}</div>
+            <div class="sub">Modo que alimenta el balance principal.</div>
         </div>
         """, unsafe_allow_html=True)
+
+    c4, c5, c6 = st.columns(3)
     with c4:
         st.markdown(f"""
         <div class="lkh-card">
-            <div class="label">Alhajuela</div>
-            <div class="value">{evap_alh:.3f}</div>
-            <div class="sub">hm³/d evaporación · {evap_alh_mm:.2f} mm/día.</div>
+            <div class="label">Evaporación Gatún</div>
+            <div class="value">{evap_gat:.3f}</div>
+            <div class="sub">hm³/d · {evap_gat_mm:.2f} mm/día.</div>
         </div>
         """, unsafe_allow_html=True)
     with c5:
         st.markdown(f"""
         <div class="lkh-card">
+            <div class="label">Evaporación Alhajuela</div>
+            <div class="value">{evap_alh:.3f}</div>
+            <div class="sub">hm³/d · {evap_alh_mm:.2f} mm/día.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c6:
+        st.markdown(f"""
+        <div class="lkh-card">
             <div class="label">Unidad visual</div>
             <div class="value">{u_label}</div>
-            <div class="sub">Solo cambia la forma de visualización.</div>
+            <div class="sub">Solo cambia la forma de presentación.</div>
         </div>
         """, unsafe_allow_html=True)
 
     st.markdown("### 🧩 Mapa rápido del dashboard")
     guia_tabs = pd.DataFrame([
-        {"Pestaña": "📊 Balance", "Uso principal": "Validar demanda total, distribución por embalse y detalle operativo.", "Revise antes de reportar": "Total sistema, Alhajuela, Gatún, fuente de cada componente."},
+        {"Pestaña": "📊 Balance", "Uso principal": "Validar demanda total, distribución por embalse y detalle operativo.", "Revise antes de reportar": "Total sistema, Alhajuela, Gatún y fuente de cada componente."},
         {"Pestaña": "🏔️ Alhajuela", "Uso principal": "Revisar salidas Madden/Alhajuela.", "Revise antes de reportar": "Generación Madden, potable, fugas, vertido fondo/tambor/libre y evaporación."},
         {"Pestaña": "🌊 Gatún", "Uso principal": "Revisar salidas de Gatún.", "Revise antes de reportar": "Esclusajes, generación Gatún, potable, fugas, vertido, ZZ-Flush y evaporación."},
-        {"Pestaña": "🚢 Esclusajes", "Uso principal": "Comparar PNX/NPX y consumos unitarios.", "Revise antes de reportar": "Fuente del consumo, hm³/escl, cfs equivalente y ahorro aplicado."},
+        {"Pestaña": "🚢 Esclusajes", "Uso principal": "Comparar tránsitos Panamax/NeoPanamax y consumos unitarios.", "Revise antes de reportar": "Cantidad por tipo, total, fuente del consumo, hm³/escl, cfs equivalente y ahorro aplicado."},
         {"Pestaña": "⚡ Generación", "Uso principal": "Validar MW y conversión a caudal/volumen.", "Revise antes de reportar": "Factor cfs/MW, MW por planta y hm³/día."},
         {"Pestaña": "💾 Ahorro de Agua", "Uso principal": "Evaluar tinas, cámara corta, crossfilling y Turn Around NPX.", "Revise antes de reportar": "Ahorro total y modo de balance que lo está usando."},
         {"Pestaña": "📐 Área Espejo", "Uso principal": "Validar área por nivel y evaporación.", "Revise antes de reportar": "Curva estándar/Daily, nivel operativo, área km² y hm³/d."},
@@ -3615,7 +3718,7 @@ with tabs[10]:
     reglas = pd.DataFrame([
         {"Elemento": "Niveles", "Criterio": "Se toman del último registro válido del LakeHouse y luego quedan editables en el sidebar."},
         {"Elemento": "Promedios 5/7/10 días", "Criterio": "Se calculan con los últimos N registros disponibles, no por ventana inclusiva de calendario."},
-        {"Elemento": "Esclusajes", "Criterio": "PNX y NPX se promedian entre complejos para evitar duplicar el tránsito."},
+        {"Elemento": "Tránsitos", "Criterio": "PNX y NPX se promedian entre complejos para evitar duplicar el tránsito; el total se muestra con 3 cifras significativas."},
         {"Elemento": "Potabilización y fugas", "Criterio": "Se priorizan columnas MCF/MPC del LakeHouse; *_hm3 se usa como respaldo."},
         {"Elemento": "Vertido fondo Madden", "Criterio": "`madspill` se interpreta como cfs directo y se convierte a hm³/día."},
         {"Elemento": "Evaporación", "Criterio": "No se toma del LakeHouse. Se calcula como lámina mm/día × área km² × 0.001."},
@@ -3637,13 +3740,14 @@ with tabs[10]:
         st.markdown("""
         **Escenario**
         - Niveles revisados.
-        - PNX/NPX revisados.
+        - Panamax y NeoPanamax revisados.
         - Generación, potable y fugas revisadas.
-        - Vertidos y ZZ-Flush revisados.
+        - Vertidos, ZZ-Flush y ahorros revisados.
         """)
     with chk3:
         st.markdown("""
         **Resultado**
+        - Total de tránsitos correcto.
         - Balance total razonable.
         - Embalses separados.
         - Evaporación validada.
@@ -3655,13 +3759,14 @@ with tabs[10]:
         {"Situación": "No carga el LakeHouse", "Solución": "Verifique que sea .xlsx, que no esté abierto en Excel y que la hoja tenga columna de fecha."},
         {"Situación": "El sidebar cambió al abrir la app", "Solución": "La app toma LakeHouse como punto inicial. Después de cargarlo, todos los campos quedan editables."},
         {"Situación": "Cambio 5/7/10 días y niveles no cambian", "Solución": "Es normal: los niveles usan el último registro; los promedios operativos sí cambian con 5/7/10 días."},
+        {"Situación": "El total de tránsitos no es el esperado", "Solución": "Revise por separado Panamax (PNX) y NeoPanamax (NPX) en el sidebar. El total es la suma de ambos."},
         {"Situación": "Potable o fugas se ven altos", "Solución": "Revise columnas MCF/MPC (`munic_*`, `leak_*`). La app las prioriza sobre *_hm3."},
         {"Situación": "Vertido fondo Madden no coincide", "Solución": "Verifique `madspill`: debe estar en cfs; la app lo convierte directamente a hm³/día."},
         {"Situación": "Evaporación no coincide con LakeHouse", "Solución": "La evaporación se calcula dentro del app con lámina y área, no con el volumen del LakeHouse."},
     ])
     st.dataframe(problemas, use_container_width=True, hide_index=True)
 
-    st.success("Flujo recomendado: Datos LakeHouse → niveles y escenario en sidebar → Balance → Exportar.")
+    st.success("Ruta recomendada: Datos LakeHouse → Niveles → Tránsitos → Fuente de esclusajes → Balance → Exportar.")
 
 # ═══ FOOTER ═══
 st.markdown("---")
