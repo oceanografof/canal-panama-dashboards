@@ -152,7 +152,7 @@ SERIES_CONFIG = [
         "unit_id": 70,
         "interval": "PointsAsRecorded",
         "time_aligned": "True",
-        "date_range": "Days7",
+        "date_range": "Years1",
         "calendar": "CALENDARYEAR2",
         "out_name": "Lake_Res_elevation_Telem_Radar_MAD.csv",
         "label": "Nivel Lake-Res Telem Radar @ MAD",
