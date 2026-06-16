@@ -1845,7 +1845,7 @@ with hdr_c2:
         "<h1 style='color:#1a5276;margin-bottom:0;text-align:center;'>"
         "💧 Demandas de Agua por Embalse</h1>"
         "<p style='color:#5d6d7e;margin-top:-4px;text-align:center;'>"
-        "Canal de Panamá · <b>HIMH — Sección de Hidrología</b> · Creador: JFRodriguez</p>",
+        "Canal de Panamá · <b>HIMH — Sección de Hidrología</b> · Creado para HIMH por: JFRodriguez</p>",
         unsafe_allow_html=True)
 with hdr_c3:
     # Logo HIMH — derecha
