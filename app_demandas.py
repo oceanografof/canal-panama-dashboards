@@ -117,8 +117,8 @@ CFS2M3S  = 1 / 35.3147         # m³/s por cada cfs
 M3S2CFS  = 35.3147
 HM3D2M3S = 1e6 / 86400         # m³/s por cada hm³/d
 MCF_TO_CFS = 1_000_000.0 / 86400.0  # MCF/MPC por día → cfs
-MPC_TO_HM3 = 0.0283168        # 1 millón de pies³ → hm³
-HM3_TO_MPC = 1 / MPC_TO_HM3
+MPC_TO_HM3 = 0.028316846592  # 1 MPC (millón de pies³) → hm³
+HM3_TO_MPC = 1 / MPC_TO_HM3   # 1 hm³ → MPC
 ACREFT_PER_HM3 = 810.7132
 ZZ_FLUSH_M3S = 333.5          # caudal instantáneo de referencia; 2 h ≈ 2.40 hm³
 AHORA    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -2742,15 +2742,16 @@ with tabs[7]:
     with cv2:
         st.markdown("### Volumen")
         m2 = st.radio("Desde:",["hm³","MPC","acre-ft"],horizontal=True,key="mv")
+        st.caption("MPC = millones de pies cúbicos. La conversión funciona en ambos sentidos: hm³ ↔ MPC.")
         v2 = st.number_input("Valor ",0.0,999999.0,1.0,key="vv")
         if m2=="hm³":
-            st.success(f"**{v2:.4f} hm³** = {v2*HM3_TO_MPC:.2f} MPC = {v2*ACREFT_PER_HM3:.1f} acre-ft")
+            st.success(f"**{v2:,.4f} hm³** = **{v2*HM3_TO_MPC:,.4f} MPC** = {v2*ACREFT_PER_HM3:,.1f} acre-ft")
         elif m2=="MPC":
-            h=v2*MPC_TO_HM3
-            st.success(f"**{v2:.2f} MPC** = {h:.4f} hm³ = {h*ACREFT_PER_HM3:.1f} acre-ft")
+            h = v2*MPC_TO_HM3
+            st.success(f"**{v2:,.4f} MPC** = **{h:,.6f} hm³** = {h*ACREFT_PER_HM3:,.1f} acre-ft")
         else:
-            h=v2/ACREFT_PER_HM3
-            st.success(f"**{v2:.1f} acre-ft** = {h:.4f} hm³ = {h*HM3_TO_MPC:.2f} MPC")
+            h = v2/ACREFT_PER_HM3
+            st.success(f"**{v2:,.1f} acre-ft** = {h:,.6f} hm³ = {h*HM3_TO_MPC:,.4f} MPC")
     st.markdown("---")
     st.dataframe(pd.DataFrame([
         {"cfs":r,"m³/s":round(r*CFS2M3S,3),"hm³/día":round(r*CFS2HM3,4),"hm³/mes":round(r*CFS2HM3*30,2)}
