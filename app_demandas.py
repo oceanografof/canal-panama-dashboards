@@ -1237,7 +1237,7 @@ def _aplicar_defaults_operativos_lkh_si_corresponde(n_dias=5):
 @st.cache_data(show_spinner=False)
 def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
     """Lee promedios detallados de salidas por embalse desde LakeHouse.
-    Se usa solo para mostrar un resumen en la pestaña Balance; no altera los cálculos principales.
+    Alimenta los KPI superiores y el resumen de Balance; no altera los cálculos principales.
     """
     try:
         import openpyxl
@@ -1309,6 +1309,17 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                 "vert_g_mcf": _find(header_l, exact=["gatspill"]),
                 "evap_m_hm3": _find(header_l, exact=["vol_evap_ala_hm3"]),
                 "evap_g_hm3": _find(header_l, exact=["vol_evap_gat_hm3"]),
+                # Totales y datos auxiliares para los KPI superiores.
+                "total_consumo_hm3": _find(header_l, exact=["agua_consumida_ala_gat_hm3"]),
+                "usos_hm3": _find(header_l, exact=["usos_hm3"]),
+                "zz_ccl_hm3": _find(header_l, exact=["ccl_zz_flush"]),
+                "zz_acl_hm3": _find(header_l, exact=["acl_zz_flush"]),
+                "mad_mwh": _find(header_l, exact=["madmwh"]),
+                "gat_mwh": _find(header_l, exact=["gatmwh"]),
+                "n_g": _find(header_l, exact=["numlockgat"]),
+                "n_p": _find(header_l, exact=["numlockpm"]),
+                "n_a": _find(header_l, exact=["numlockac", "numlockacl"]),
+                "n_c": _find(header_l, exact=["numlockccl"]),
             }
 
             ult = []
@@ -1411,11 +1422,43 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
             ]
             if not any(x.get("hm3") is not None for x in detalle):
                 continue
+
+            def _mean_row_sum(keys):
+                vals_rows = []
+                for r in ult:
+                    vals = [_num(r.get(k)) for k in keys]
+                    vals = [v for v in vals if v is not None]
+                    if vals:
+                        vals_rows.append(sum(vals))
+                return _mean(vals_rows)
+
+            def _mean_row_pair(keys):
+                vals_rows = []
+                for r in ult:
+                    vals = [_num(r.get(k)) for k in keys]
+                    vals = [v for v in vals if v is not None]
+                    if vals:
+                        vals_rows.append(float(np.mean(vals)))
+                return _mean(vals_rows)
+
+            _mad_mwh_prom = _mean([_num(r.get("mad_mwh")) for r in ult])
+            _gat_mwh_prom = _mean([_num(r.get("gat_mwh")) for r in ult])
+
             return {
                 "hoja": hoja,
                 "n_dias": int(n_dias),
                 "fecha_ultimo": ult[-1].get("fecha"),
                 "detalle": detalle,
+                # Total oficial del LakeHouse (incluye evaporación cuando está disponible).
+                "total_consumo_hm3": _mean([_num(r.get("total_consumo_hm3")) for r in ult]),
+                "usos_hm3": _mean([_num(r.get("usos_hm3")) for r in ult]),
+                "zz_flush_hm3": _mean_row_sum(["zz_ccl_hm3", "zz_acl_hm3"]),
+                # Potencia media del período: MWh/día ÷ 24 = MW medios.
+                "mad_mw": (_mad_mwh_prom / 24.0) if _mad_mwh_prom is not None else None,
+                "gat_mw": (_gat_mwh_prom / 24.0) if _gat_mwh_prom is not None else None,
+                # Tránsitos: promedio entre complejos para evitar duplicar buques.
+                "n_pnx": _mean_row_pair(["n_g", "n_p"]),
+                "n_npx": _mean_row_pair(["n_a", "n_c"]),
             }
     except Exception:
         return None
@@ -1865,6 +1908,125 @@ with k4:
     )
 k5.metric("Generación",  f"{gm_mw+gg_mw} MW")
 k6.metric("Evaporación", f"{evap_tot:.2f} hm³/d")
+
+# ── Resumen operativo superior: App / LakeHouse / comparación ────────────────
+st.markdown("#### 📌 Consumos por componente — fuente seleccionable")
+_src_col, _dias_col = st.columns([2.25, 1.0])
+with _src_col:
+    fuente_kpis_superiores = st.radio(
+        "Fuente de los valores",
+        ["Calculado por app", "Promedio LakeHouse", "Comparar App vs LakeHouse"],
+        index=0,
+        horizontal=True,
+        key="fuente_kpis_superiores",
+        help=(
+            "Solo cambia la presentación de estos KPI. No modifica los cálculos del balance ni los controles del sidebar."
+        ),
+    )
+with _dias_col:
+    _dias_kpi_opciones = [5, 7, 10]
+    try:
+        _dias_kpi_actual = int(st.session_state.get("dias_op", 5))
+    except Exception:
+        _dias_kpi_actual = 5
+    _dias_kpi_index = _dias_kpi_opciones.index(_dias_kpi_actual) if _dias_kpi_actual in _dias_kpi_opciones else 0
+    dias_kpi_superiores = st.radio(
+        "Promedio LakeHouse",
+        options=_dias_kpi_opciones,
+        index=_dias_kpi_index,
+        horizontal=True,
+        key="dias_op",
+        help="Selecciona los últimos 5, 7 o 10 registros/días para todos los promedios del LakeHouse.",
+    )
+
+_detalle_kpi_lkh = (_info_balance_lkh or {}).get("detalle", [])
+
+def _sumar_kpi_lkh(condicion):
+    _vals = []
+    for _item in _detalle_kpi_lkh:
+        try:
+            _valor = _item.get("hm3")
+            if _valor is not None and pd.notna(_valor) and condicion(str(_item.get("Uso", ""))):
+                _vals.append(float(_valor))
+        except Exception:
+            continue
+    return float(sum(_vals)) if _vals else None
+
+_kpi_lkh = {
+    "Fugas": _sumar_kpi_lkh(lambda x: x == "Fugas"),
+    "Agua potable": _sumar_kpi_lkh(lambda x: x == "Potabilización"),
+    "Vertidos": _sumar_kpi_lkh(lambda x: x.startswith("Vertido")),
+    "Hidrogeneración": _sumar_kpi_lkh(lambda x: x.startswith("Generación")),
+    "Esclusajes": _sumar_kpi_lkh(lambda x: x.startswith("Esclusajes")),
+}
+# Total comparable con el app: suma todos los componentes LakeHouse por embalse,
+# incluida evaporación y ZZ-Flush. El total oficial reportado por LakeHouse se conserva
+# aparte porque normalmente excluye la transferencia por hidrogeneración Madden.
+_kpi_lkh_total_reportado = (_info_balance_lkh or {}).get("total_consumo_hm3")
+_partes_total_lkh = [
+    _item.get("hm3") for _item in _detalle_kpi_lkh
+    if _item.get("hm3") is not None and pd.notna(_item.get("hm3"))
+]
+_zz_lkh = (_info_balance_lkh or {}).get("zz_flush_hm3")
+if _zz_lkh is not None and pd.notna(_zz_lkh):
+    _partes_total_lkh.append(float(_zz_lkh))
+_kpi_lkh["Consumo total"] = float(sum(map(float, _partes_total_lkh))) if _partes_total_lkh else None
+
+_kpi_app = {
+    "Fugas": alh_fug + gat_fug,
+    "Agua potable": alh_pot + gat_pot,
+    "Vertidos": alh_vert + gat_ver,
+    "Hidrogeneración": gen_tot,
+    "Esclusajes": dem_escl,
+    "Consumo total": dem_total,
+}
+
+def _fmt_kpi_hm3(valor):
+    try:
+        return f"{float(valor):.2f} hm³/d" if valor is not None and pd.notna(valor) else "N/D"
+    except Exception:
+        return "N/D"
+
+def _mostrar_kpi_operativo(columna, etiqueta, valor_app, valor_lkh):
+    _app_ok = valor_app is not None and pd.notna(valor_app)
+    _lkh_ok = valor_lkh is not None and pd.notna(valor_lkh)
+    if fuente_kpis_superiores == "Promedio LakeHouse":
+        _principal = valor_lkh
+        _delta = f"App: {_fmt_kpi_hm3(valor_app)}" if _app_ok else None
+    elif fuente_kpis_superiores == "Comparar App vs LakeHouse":
+        _principal = valor_app
+        if _app_ok and _lkh_ok:
+            _delta = f"LKH {dias_kpi_superiores}d: {float(valor_lkh):.2f} · Δ {float(valor_app)-float(valor_lkh):+.2f} hm³/d"
+        elif _lkh_ok:
+            _delta = f"LKH {dias_kpi_superiores}d: {float(valor_lkh):.2f} hm³/d"
+        else:
+            _delta = "LakeHouse no disponible"
+    else:
+        _principal = valor_app
+        _delta = f"LKH {dias_kpi_superiores}d: {float(valor_lkh):.2f} hm³/d" if _lkh_ok else "LakeHouse no disponible"
+    columna.metric(etiqueta, _fmt_kpi_hm3(_principal), delta=_delta, delta_color="off")
+
+_ck1, _ck2, _ck3, _ck4, _ck5, _ck6 = st.columns(6)
+for _col, _nombre in zip(
+    [_ck1, _ck2, _ck3, _ck4, _ck5, _ck6],
+    ["Fugas", "Agua potable", "Vertidos", "Hidrogeneración", "Esclusajes", "Consumo total"],
+):
+    _mostrar_kpi_operativo(_col, _nombre, _kpi_app[_nombre], _kpi_lkh.get(_nombre))
+
+if _info_balance_lkh:
+    try:
+        _fecha_kpi_lkh = pd.to_datetime(_info_balance_lkh.get("fecha_ultimo")).date()
+    except Exception:
+        _fecha_kpi_lkh = _info_balance_lkh.get("fecha_ultimo", "")
+    st.caption(
+        f"LakeHouse: hoja **{_info_balance_lkh.get('hoja', '')}** · promedio de los últimos "
+        f"**{_info_balance_lkh.get('n_dias', dias_kpi_superiores)} días/registros** · "
+        f"último dato **{_fecha_kpi_lkh}**. El consumo total comparable suma todos los componentes, "
+        f"evaporación y ZZ-Flush; el total directo reportado por LakeHouse es "
+        f"**{_fmt_kpi_hm3(_kpi_lkh_total_reportado)}**. El KPI Vertidos no incluye ZZ-Flush."
+    )
+else:
+    st.caption("No se detectó un LakeHouse válido; se mantienen visibles los valores calculados por el app.")
 
 # KPIs adicionales para evaporación por embalse
 ek1, ek2 = st.columns(2)
@@ -3052,18 +3214,16 @@ with tabs[9]:
     if dl is not None and len(dl)>0:
         total_dias = (dl["fecha"].max()-dl["fecha"].min()).days
         st.markdown("---")
-        _dias_opciones = [5, 7, 10]
         try:
-            _dias_actual = int(st.session_state.get("dias_op", 5))
+            dias_sel = int(st.session_state.get("dias_op", 5))
         except Exception:
-            _dias_actual = 5
-        _dias_index = _dias_opciones.index(_dias_actual) if _dias_actual in _dias_opciones else 0
-        dias_sel = st.radio("📅 Promedio de los últimos N días",
-            options=_dias_opciones, index=_dias_index, horizontal=True, key="dias_op",
-            help=(
-                "Seleccione 5, 7 o 10 registros/días. Esta selección actualiza "
-                "los valores del LakeHouse usados por las tarjetas, el sidebar y el balance principal."
-            ))
+            dias_sel = 5
+        if dias_sel not in (5, 7, 10):
+            dias_sel = 5
+        st.info(
+            f"📅 Promedio activo: **últimos {dias_sel} días/registros**. "
+            "Puede cambiarlo en la sección superior «Consumos por componente»."
+        )
 
         # Usar exactamente los últimos N registros/días disponibles, no una ventana inclusiva por fecha.
         # Esto evita que, por ejemplo, "5 días" incluya 6 registros al restar 5 días al último dato.
@@ -3638,7 +3798,8 @@ with tabs[10]:
 
     st.markdown("### 🎛️ Qué modifica cada control principal")
     controles = pd.DataFrame([
-        {"Control": "Período 5/7/10 días", "Dónde": "📂 Datos Lake House", "Efecto": "Cambia los promedios operativos que alimentan los valores iniciales del sidebar."},
+        {"Control": "Período 5/7/10 días", "Dónde": "Parte superior · Consumos por componente", "Efecto": "Cambia los promedios LakeHouse mostrados arriba y los valores iniciales del sidebar."},
+        {"Control": "Fuente de valores App/LakeHouse", "Dónde": "Parte superior · Consumos por componente", "Efecto": "Permite ver el cálculo actual, el promedio LakeHouse o ambos sin modificar el balance."},
         {"Control": "Nivel Gatún", "Dónde": "Sidebar · Niveles Operativos", "Efecto": "Actualiza área Gatún, evaporación y consumos dependientes del nivel."},
         {"Control": "Nivel Alhajuela", "Dónde": "Sidebar · Niveles Operativos", "Efecto": "Actualiza área Alhajuela, evaporación y generación Madden dependiente del nivel."},
         {"Control": "Panamax/NeoPanamax por día", "Dónde": "Sidebar · Esclusajes", "Efecto": "Cambia la cantidad de tránsitos y el consumo diario de esclusajes."},
