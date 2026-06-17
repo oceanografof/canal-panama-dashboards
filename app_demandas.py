@@ -108,6 +108,50 @@ div[data-testid="stMetricValue"] {
     color: rgba(148, 163, 184, 0.95);
     margin-top: 5px;
 }
+
+/* Visor principal limpio: tarjetas por embalse */
+.flow-card {
+    border: 1px solid rgba(148, 163, 184, 0.28);
+    border-radius: 15px;
+    padding: 14px 16px;
+    min-height: 132px;
+    margin-bottom: 12px;
+    background: rgba(255,255,255,0.025);
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+}
+.flow-card-alh { border-top: 4px solid #3498db; }
+.flow-card-gat { border-top: 4px solid #1a5276; }
+.flow-card .flow-label {
+    font-size: 0.84rem;
+    font-weight: 750;
+    color: rgba(100, 116, 139, 0.98);
+    margin-bottom: 5px;
+}
+.flow-card .flow-value {
+    font-size: 1.62rem;
+    font-weight: 800;
+    line-height: 1.12;
+    color: inherit;
+}
+.flow-card .flow-conv {
+    font-size: 0.82rem;
+    margin-top: 7px;
+    color: rgba(100, 116, 139, 0.95);
+}
+.flow-card .flow-source {
+    display: inline-block;
+    font-size: 0.72rem;
+    margin-top: 7px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.14);
+    color: rgba(100, 116, 139, 0.98);
+}
+.flow-card .flow-compare {
+    font-size: 0.76rem;
+    margin-top: 5px;
+    color: rgba(100, 116, 139, 0.95);
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1303,9 +1347,9 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                 "fug_g_hm3": _find(header_l, exact=["leak_gat_hm3"]),
                 "fug_m_mcf": _find(header_l, exact=["leak_mad"]),
                 "fug_g_mcf": _find(header_l, exact=["leak_gat"]),
-                # madspill corresponde a compuertas de fondo Madden en cfs.
-                # No convertirlo como MCF/MPC para evitar inflar el vertido.
-                "vert_m_cfs": _find(header_l, exact=["madspill"]),
+                # madspill corresponde al volumen diario vertido en Madden,
+                # expresado por LakeHouse en MPC/MCF (millones de pies³ por día).
+                "vert_m_mcf": _find(header_l, exact=["madspill"]),
                 "vert_g_mcf": _find(header_l, exact=["gatspill"]),
                 "evap_m_hm3": _find(header_l, exact=["vol_evap_ala_hm3"]),
                 "evap_g_hm3": _find(header_l, exact=["vol_evap_gat_hm3"]),
@@ -1360,24 +1404,6 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                         return mcf * MCF_TO_CFS_LOCAL * CFS2HM3
                 return None
 
-            def _hm3_component_cfs(cfs_keys=None):
-                """Convierte columnas LakeHouse que ya vienen en cfs a hm³/día.
-
-                Se usa para madspill / compuertas de fondo Madden.
-                No aplica conversión MCF/MPC porque eso infla el valor.
-                """
-                cfs_keys = cfs_keys or []
-                vals_cfs = []
-                for r in ult:
-                    vals = [_num(r.get(k)) for k in cfs_keys]
-                    vals = [v for v in vals if v is not None]
-                    if vals:
-                        vals_cfs.append(sum(vals))
-                cfs = _mean(vals_cfs)
-                if cfs is not None:
-                    return cfs * CFS2HM3
-                return None
-
             def _hm3_component_mcf_first(mcf_keys=None, hm3_keys=None, max_hm3=None):
                 """Primero MCF/MPC por día del LakeHouse; hm³/día solo como respaldo validado."""
                 mcf_keys = mcf_keys or []
@@ -1410,7 +1436,7 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                 {"Embalse": "Alhajuela / Madden", "Uso": "Generación Madden", "hm3": _hm3_component(["gen_mad_hm3"])},
                 {"Embalse": "Alhajuela / Madden", "Uso": "Potabilización", "hm3": _hm3_component_mcf_first(["pot_m_mcf"], ["pot_m_hm3"], max_hm3=3.0)},
                 {"Embalse": "Alhajuela / Madden", "Uso": "Fugas", "hm3": _hm3_component_mcf_first(["fug_m_mcf"], ["fug_m_hm3"], max_hm3=1.5)},
-                {"Embalse": "Alhajuela / Madden", "Uso": "Vertido Madden fondo", "hm3": _hm3_component_cfs(["vert_m_cfs"])},
+                {"Embalse": "Alhajuela / Madden", "Uso": "Vertido Madden", "hm3": _hm3_component([], ["vert_m_mcf"])},
                 {"Embalse": "Alhajuela / Madden", "Uso": "Evaporación", "hm3": _hm3_component(["evap_m_hm3"])},
                 {"Embalse": "Gatún", "Uso": "Esclusajes PNX", "hm3": _hm3_component(["gat_hm3", "pm_hm3"], ["gat_mcf", "pm_mcf"])},
                 {"Embalse": "Gatún", "Uso": "Esclusajes NPX", "hm3": _hm3_component(["acl_hm3", "ccl_hm3"], ["acl_mcf", "ccl_mcf"])},
@@ -1909,9 +1935,9 @@ with k4:
 k5.metric("Generación",  f"{gm_mw+gg_mw} MW")
 k6.metric("Evaporación", f"{evap_tot:.2f} hm³/d")
 
-# ── Resumen operativo superior: App / LakeHouse / comparación ────────────────
-st.markdown("#### 📌 Consumos por componente — fuente seleccionable")
-_src_col, _dias_col = st.columns([2.25, 1.0])
+# ── Visor principal limpio: App / LakeHouse / comparación ────────────────────
+st.markdown("#### 📌 Variables operativas por embalse")
+_src_col, _dias_col = st.columns([2.35, 1.0])
 with _src_col:
     fuente_kpis_superiores = st.radio(
         "Fuente de los valores",
@@ -1920,7 +1946,8 @@ with _src_col:
         horizontal=True,
         key="fuente_kpis_superiores",
         help=(
-            "Solo cambia la presentación de estos KPI. No modifica los cálculos del balance ni los controles del sidebar."
+            "Cambia únicamente los valores mostrados en este visor. "
+            "No modifica los cálculos del balance ni los controles del sidebar."
         ),
     )
 with _dias_col:
@@ -1936,125 +1963,175 @@ with _dias_col:
         index=_dias_kpi_index,
         horizontal=True,
         key="dias_op",
-        help="Selecciona los últimos 5, 7 o 10 registros/días para todos los promedios del LakeHouse.",
+        help="Selecciona los últimos 5, 7 o 10 registros/días para los promedios del LakeHouse.",
     )
 
 _detalle_kpi_lkh = (_info_balance_lkh or {}).get("detalle", [])
+_kpi_lkh_total_reportado = (_info_balance_lkh or {}).get("total_consumo_hm3")
+_zz_lkh = (_info_balance_lkh or {}).get("zz_flush_hm3")
 
-def _sumar_kpi_lkh(condicion):
-    _vals = []
+
+def _buscar_detalle_lkh(embalse, uso=None, prefijo_uso=None):
+    _valores = []
     for _item in _detalle_kpi_lkh:
         try:
+            if str(_item.get("Embalse", "")) != str(embalse):
+                continue
+            _uso_item = str(_item.get("Uso", ""))
+            _coincide = (_uso_item == uso) if uso is not None else _uso_item.startswith(str(prefijo_uso or ""))
             _valor = _item.get("hm3")
-            if _valor is not None and pd.notna(_valor) and condicion(str(_item.get("Uso", ""))):
-                _vals.append(float(_valor))
+            if _coincide and _valor is not None and pd.notna(_valor):
+                _valores.append(float(_valor))
         except Exception:
             continue
-    return float(sum(_vals)) if _vals else None
+    return float(sum(_valores)) if _valores else None
 
-_kpi_lkh = {
-    "Fugas": _sumar_kpi_lkh(lambda x: x == "Fugas"),
-    "Agua potable": _sumar_kpi_lkh(lambda x: x == "Potabilización"),
-    "Vertidos": _sumar_kpi_lkh(lambda x: x.startswith("Vertido")),
-    "Hidrogeneración": _sumar_kpi_lkh(lambda x: x.startswith("Generación")),
-    "Esclusajes": _sumar_kpi_lkh(lambda x: x.startswith("Esclusajes")),
+
+_detalle_principal_lkh = {
+    "alh_gen":  _buscar_detalle_lkh("Alhajuela / Madden", uso="Generación Madden"),
+    "alh_pot":  _buscar_detalle_lkh("Alhajuela / Madden", uso="Potabilización"),
+    "alh_fug":  _buscar_detalle_lkh("Alhajuela / Madden", uso="Fugas"),
+    "alh_ver":  _buscar_detalle_lkh("Alhajuela / Madden", prefijo_uso="Vertido"),
+    "alh_evap": _buscar_detalle_lkh("Alhajuela / Madden", uso="Evaporación"),
+    "gat_pnx":  _buscar_detalle_lkh("Gatún", uso="Esclusajes PNX"),
+    "gat_npx":  _buscar_detalle_lkh("Gatún", uso="Esclusajes NPX"),
+    "gat_gen":  _buscar_detalle_lkh("Gatún", uso="Generación Gatún"),
+    "gat_pot":  _buscar_detalle_lkh("Gatún", uso="Potabilización"),
+    "gat_fug":  _buscar_detalle_lkh("Gatún", uso="Fugas"),
+    "gat_ver":  _buscar_detalle_lkh("Gatún", prefijo_uso="Vertido"),
+    "gat_flush": float(_zz_lkh) if _zz_lkh is not None and pd.notna(_zz_lkh) else None,
+    "gat_evap": _buscar_detalle_lkh("Gatún", uso="Evaporación"),
 }
-# Total comparable con el app: suma todos los componentes LakeHouse por embalse,
-# incluida evaporación y ZZ-Flush. El total oficial reportado por LakeHouse se conserva
-# aparte porque normalmente excluye la transferencia por hidrogeneración Madden.
-_kpi_lkh_total_reportado = (_info_balance_lkh or {}).get("total_consumo_hm3")
-_partes_total_lkh = [
-    _item.get("hm3") for _item in _detalle_kpi_lkh
-    if _item.get("hm3") is not None and pd.notna(_item.get("hm3"))
+
+_detalle_principal_app_alh = [
+    ("Generación Madden", gen_alh, _detalle_principal_lkh["alh_gen"]),
+    ("Potabilización", alh_pot, _detalle_principal_lkh["alh_pot"]),
+    ("Fugas", alh_fug, _detalle_principal_lkh["alh_fug"]),
+    ("Vertido Madden", alh_vert, _detalle_principal_lkh["alh_ver"]),
+    ("Evaporación", evap_alh, _detalle_principal_lkh["alh_evap"]),
 ]
-_zz_lkh = (_info_balance_lkh or {}).get("zz_flush_hm3")
-if _zz_lkh is not None and pd.notna(_zz_lkh):
-    _partes_total_lkh.append(float(_zz_lkh))
-_kpi_lkh["Consumo total"] = float(sum(map(float, _partes_total_lkh))) if _partes_total_lkh else None
+_detalle_principal_app_gat = [
+    ("Esclusajes PNX", dem_pnx, _detalle_principal_lkh["gat_pnx"]),
+    ("Esclusajes NPX", dem_npx, _detalle_principal_lkh["gat_npx"]),
+    ("Generación Gatún", gen_gat, _detalle_principal_lkh["gat_gen"]),
+    ("Potabilización", gat_pot, _detalle_principal_lkh["gat_pot"]),
+    ("Fugas", gat_fug, _detalle_principal_lkh["gat_fug"]),
+    ("Vertido Gatún", gat_ver, _detalle_principal_lkh["gat_ver"]),
+    ("ZZ-Flush", dem_flush, _detalle_principal_lkh["gat_flush"]),
+    ("Evaporación", evap_gat, _detalle_principal_lkh["gat_evap"]),
+]
 
-_kpi_app = {
-    "Fugas": alh_fug + gat_fug,
-    "Agua potable": alh_pot + gat_pot,
-    "Vertidos": alh_vert + gat_ver,
-    "Hidrogeneración": gen_tot,
-    "Esclusajes": dem_escl,
-    "Consumo total": dem_total,
-}
 
-def _fmt_kpi_hm3(valor):
-    try:
-        return f"{float(valor):.2f} hm³/d" if valor is not None and pd.notna(valor) else "N/D"
-    except Exception:
-        return "N/D"
-
-def _mostrar_kpi_operativo(columna, etiqueta, valor_app, valor_lkh):
+def _seleccionar_flujo_principal(valor_app, valor_lkh):
     _app_ok = valor_app is not None and pd.notna(valor_app)
     _lkh_ok = valor_lkh is not None and pd.notna(valor_lkh)
-    if fuente_kpis_superiores == "Promedio LakeHouse":
-        _principal = valor_lkh
-        _delta = f"App: {_fmt_kpi_hm3(valor_app)}" if _app_ok else None
-    elif fuente_kpis_superiores == "Comparar App vs LakeHouse":
-        _principal = valor_app
-        if _app_ok and _lkh_ok:
-            _delta = f"LKH {dias_kpi_superiores}d: {float(valor_lkh):.2f} · Δ {float(valor_app)-float(valor_lkh):+.2f} hm³/d"
-        elif _lkh_ok:
-            _delta = f"LKH {dias_kpi_superiores}d: {float(valor_lkh):.2f} hm³/d"
-        else:
-            _delta = "LakeHouse no disponible"
-    else:
-        _principal = valor_app
-        _delta = f"LKH {dias_kpi_superiores}d: {float(valor_lkh):.2f} hm³/d" if _lkh_ok else "LakeHouse no disponible"
-    columna.metric(etiqueta, _fmt_kpi_hm3(_principal), delta=_delta, delta_color="off")
+    _comparacion = None
 
-_ck1, _ck2, _ck3, _ck4, _ck5, _ck6 = st.columns(6)
-for _col, _nombre in zip(
-    [_ck1, _ck2, _ck3, _ck4, _ck5, _ck6],
-    ["Fugas", "Agua potable", "Vertidos", "Hidrogeneración", "Esclusajes", "Consumo total"],
-):
-    _mostrar_kpi_operativo(_col, _nombre, _kpi_app[_nombre], _kpi_lkh.get(_nombre))
+    if fuente_kpis_superiores == "Promedio LakeHouse":
+        if _lkh_ok:
+            return float(valor_lkh), f"LakeHouse · {dias_kpi_superiores} días", None
+        return (float(valor_app) if _app_ok else None), "App · respaldo", "LakeHouse: N/D"
+
+    if fuente_kpis_superiores == "Comparar App vs LakeHouse":
+        if _lkh_ok:
+            _comparacion = f"LakeHouse: {float(valor_lkh):.3f} hm³/d"
+        else:
+            _comparacion = "LakeHouse: N/D"
+        return (float(valor_app) if _app_ok else None), "App calculado", _comparacion
+
+    return (float(valor_app) if _app_ok else None), "App calculado", None
+
+
+def _tarjeta_flujo_principal(etiqueta, valor_app, valor_lkh, clase_embalse):
+    _hm3, _fuente, _comparacion = _seleccionar_flujo_principal(valor_app, valor_lkh)
+    if _hm3 is None or pd.isna(_hm3):
+        _valor_txt = "N/D"
+        _conversion_txt = "cfs: N/D · m³/s: N/D"
+    else:
+        _hm3 = float(_hm3)
+        _valor_txt = f"{_hm3:.3f} hm³/d"
+        _conversion_txt = f"{_hm3 / CFS2HM3:.1f} cfs · {_hm3 * HM3D2M3S:.2f} m³/s"
+
+    _comparacion_html = f'<div class="flow-compare">{_comparacion}</div>' if _comparacion else ""
+    st.markdown(
+        f"""
+        <div class="flow-card {clase_embalse}">
+            <div class="flow-label">{etiqueta}</div>
+            <div class="flow-value">{_valor_txt}</div>
+            <div class="flow-conv">{_conversion_txt}</div>
+            <div class="flow-source">{_fuente}</div>
+            {_comparacion_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+st.markdown("##### 🏔️ Alhajuela / Madden")
+_cols_det_alh = st.columns(5)
+for _col, (_etiqueta, _valor_app, _valor_lkh) in zip(_cols_det_alh, _detalle_principal_app_alh):
+    with _col:
+        _tarjeta_flujo_principal(_etiqueta, _valor_app, _valor_lkh, "flow-card-alh")
+
+st.markdown("##### 🌊 Gatún")
+_cols_det_gat = st.columns(4)
+for _i, (_etiqueta, _valor_app, _valor_lkh) in enumerate(_detalle_principal_app_gat):
+    with _cols_det_gat[_i % len(_cols_det_gat)]:
+        _tarjeta_flujo_principal(_etiqueta, _valor_app, _valor_lkh, "flow-card-gat")
 
 if _info_balance_lkh:
     try:
         _fecha_kpi_lkh = pd.to_datetime(_info_balance_lkh.get("fecha_ultimo")).date()
     except Exception:
         _fecha_kpi_lkh = _info_balance_lkh.get("fecha_ultimo", "")
+    _total_lkh_txt = (
+        f"{float(_kpi_lkh_total_reportado):.2f} hm³/d"
+        if _kpi_lkh_total_reportado is not None and pd.notna(_kpi_lkh_total_reportado)
+        else "N/D"
+    )
     st.caption(
-        f"LakeHouse: hoja **{_info_balance_lkh.get('hoja', '')}** · promedio de los últimos "
-        f"**{_info_balance_lkh.get('n_dias', dias_kpi_superiores)} días/registros** · "
-        f"último dato **{_fecha_kpi_lkh}**. El consumo total comparable suma todos los componentes, "
-        f"evaporación y ZZ-Flush; el total directo reportado por LakeHouse es "
-        f"**{_fmt_kpi_hm3(_kpi_lkh_total_reportado)}**. El KPI Vertidos no incluye ZZ-Flush."
+        f"LakeHouse: hoja **{_info_balance_lkh.get('hoja', '')}** · "
+        f"promedio **{_info_balance_lkh.get('n_dias', dias_kpi_superiores)} días** · "
+        f"último dato **{_fecha_kpi_lkh}** · total directo reportado **{_total_lkh_txt}**. "
+        "Los campos `madspill` y `gatspill` se interpretan como MPC/MCF por día."
     )
 else:
-    st.caption("No se detectó un LakeHouse válido; se mantienen visibles los valores calculados por el app.")
-
-# KPIs adicionales para evaporación por embalse
-ek1, ek2 = st.columns(2)
-ek1.metric("Evap Alhajuela", f"{evap_alh:.4f} hm³/d ({evap_alh/CFS2HM3:.1f} cfs)")
-ek2.metric("Evap Gatún",     f"{evap_gat:.4f} hm³/d ({evap_gat/CFS2HM3:.1f} cfs)")
-
-# Consumo unitario aplicado en el balance principal — visible en grande
-uk1, uk2 = st.columns(2)
-uk1.metric(
-    "PNX unitario usado en balance",
-    f"{vp_balance:.4f} hm³/escl",
-    delta=f"{vp_balance/CFS2HM3:.1f} cfs · {vp_balance*HM3D2M3S:.2f} m³/s equiv.",
-    delta_color="off"
-)
-uk2.metric(
-    "NPX unitario usado en balance",
-    f"{vn_balance:.4f} hm³/escl",
-    delta=f"{vn_balance/CFS2HM3:.1f} cfs · {vn_balance*HM3D2M3S:.2f} m³/s equiv.",
-    delta_color="off"
-)
+    st.caption("LakeHouse no disponible; el visor mantiene los valores calculados por el app.")
 
 _dias_lkh_balance = int((_info_defaults_lkh or {}).get("n_dias", st.session_state.get("dias_op", 5) or 5))
-st.caption(
-    f"Balance de esclusajes: **{balance_escl_label}** · "
-    f"Fuente vol/tránsito: **{fuente_consumo_escl}** · "
-    f"período LakeHouse base: **últimos {_dias_lkh_balance} días** · "
-    f"Ahorro Turn Around NPX aplicado: {ahorro_turnaround_aplicado:.4f} hm³/d"
-)
+with st.expander("⚙️ Detalles complementarios del cálculo", expanded=False):
+    _dc1, _dc2, _dc3, _dc4 = st.columns(4)
+    _dc1.metric(
+        "Evap. Alhajuela",
+        f"{evap_alh:.4f} hm³/d",
+        delta=f"{evap_alh/CFS2HM3:.1f} cfs · {evap_alh*HM3D2M3S:.2f} m³/s",
+        delta_color="off",
+    )
+    _dc2.metric(
+        "Evap. Gatún",
+        f"{evap_gat:.4f} hm³/d",
+        delta=f"{evap_gat/CFS2HM3:.1f} cfs · {evap_gat*HM3D2M3S:.2f} m³/s",
+        delta_color="off",
+    )
+    _dc3.metric(
+        "PNX unitario",
+        f"{vp_balance:.4f} hm³/escl",
+        delta=f"{vp_balance/CFS2HM3:.1f} cfs · {vp_balance*HM3D2M3S:.2f} m³/s equiv.",
+        delta_color="off",
+    )
+    _dc4.metric(
+        "NPX unitario",
+        f"{vn_balance:.4f} hm³/escl",
+        delta=f"{vn_balance/CFS2HM3:.1f} cfs · {vn_balance*HM3D2M3S:.2f} m³/s equiv.",
+        delta_color="off",
+    )
+    st.caption(
+        f"Balance de esclusajes: **{balance_escl_label}** · "
+        f"fuente vol/tránsito: **{fuente_consumo_escl}** · "
+        f"período LakeHouse base: **últimos {_dias_lkh_balance} días** · "
+        f"ahorro Turn Around NPX aplicado: **{ahorro_turnaround_aplicado:.4f} hm³/d**."
+    )
+
 st.markdown("---")
 
 
@@ -3144,11 +3221,10 @@ with tabs[9]:
                 df["npx_hm3"]=df["npx_m"]*MCF_TO_CFS*CFS2HM3
                 df["total_hm3"]=df["pnx_hm3"]+df["npx_hm3"]
 
-        # madspill = vertido por compuertas de fondo Madden en cfs.
-        # Se convierte siempre, aunque el LakeHouse traiga consumos de esclusajes en hm³.
-        # NO se interpreta como MCF/MPC para evitar inflar el vertido.
+        # madspill = volumen diario vertido en Madden en MPC/MCF
+        # (millones de pies³ por día). Se convierte directamente a hm³/día.
         if "vert_m" in df:
-            df["vert_m_hm3"] = pd.to_numeric(df["vert_m"], errors="coerce") * CFS2HM3
+            df["vert_m_hm3"] = pd.to_numeric(df["vert_m"], errors="coerce") * MPC_TO_HM3
         # Tránsitos diarios por tipo de esclusaje:
         # se usa el PROMEDIO entre complejos y no la suma, para evitar duplicar el tránsito
         # cuando el mismo buque pasa por ambos complejos del sistema Panamax o NeoPanamax.
@@ -3222,7 +3298,7 @@ with tabs[9]:
             dias_sel = 5
         st.info(
             f"📅 Promedio activo: **últimos {dias_sel} días/registros**. "
-            "Puede cambiarlo en la sección superior «Consumos por componente»."
+            "Puede cambiarlo en la sección superior «Variables operativas por embalse»."
         )
 
         # Usar exactamente los últimos N registros/días disponibles, no una ventana inclusiva por fecha.
@@ -3442,7 +3518,7 @@ with tabs[9]:
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Generación Madden", [("gen_mad_hm3", None)])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Potabilización", [("mun_m_hm3", "mun_m", True)])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Fugas", [("leak_m_hm3", "leak_m", True)])
-        _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Vertido Madden fondo", [("vert_m_hm3", None)])
+        _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Vertido Madden", [("vert_m_hm3", None)])
         _agregar_salida_embalse_app(salidas_embalse_rows, "Alhajuela", "Evaporación", evap_alh)
 
         # Gatún: si existen PNX/NPX separados se muestran por separado; si no, se usa total de esclusajes.
@@ -3636,7 +3712,7 @@ with tabs[9]:
         _add_sal_row("Fugas Alhajuela", [("leak_m_hm3", "leak_m", True)], "LakeHouse MCF/MPC")
         _add_sal_row("Fugas Gatún", [("leak_g_hm3", "leak_g", True)], "LakeHouse MCF/MPC")
         _add_sal_row("Vertido Gatún", [(None, "vert_g")], "LakeHouse")
-        _add_sal_row("Vertido Madden fondo", [("vert_m_hm3", None)], "LakeHouse cfs")
+        _add_sal_row("Vertido Madden", [("vert_m_hm3", None)], "LakeHouse cfs")
 
         # Evaporación: se calcula desde el app, no desde LakeHouse.
         for _label, _hm3_app in [("Evaporación Gatún", evap_gat), ("Evaporación Alhajuela", evap_alh)]:
@@ -3652,7 +3728,7 @@ with tabs[9]:
 
         if sal_rows:
             st.dataframe(pd.DataFrame(sal_rows), use_container_width=True, hide_index=True)
-            st.caption("Potabilización y fugas priorizan MCF/MPC y usan *_hm3 solo como respaldo. La evaporación se calcula con el app. El vertido Madden `madspill` se interpreta como cfs directo.")
+            st.caption("Potabilización y fugas priorizan MCF/MPC y usan *_hm3 solo como respaldo. La evaporación se calcula con el app. El vertido Madden `madspill` se interpreta como MPC/MCF por día.")
 
         # --- Generación ---
         st.markdown("#### ⚡ Generación hidroeléctrica")
@@ -3798,8 +3874,8 @@ with tabs[10]:
 
     st.markdown("### 🎛️ Qué modifica cada control principal")
     controles = pd.DataFrame([
-        {"Control": "Período 5/7/10 días", "Dónde": "Parte superior · Consumos por componente", "Efecto": "Cambia los promedios LakeHouse mostrados arriba y los valores iniciales del sidebar."},
-        {"Control": "Fuente de valores App/LakeHouse", "Dónde": "Parte superior · Consumos por componente", "Efecto": "Permite ver el cálculo actual, el promedio LakeHouse o ambos sin modificar el balance."},
+        {"Control": "Período 5/7/10 días", "Dónde": "Parte superior · Variables operativas por embalse", "Efecto": "Cambia los promedios LakeHouse mostrados arriba y los valores iniciales del sidebar."},
+        {"Control": "Fuente de valores App/LakeHouse", "Dónde": "Parte superior · Variables operativas por embalse", "Efecto": "Permite ver el cálculo actual, el promedio LakeHouse o ambos sin modificar el balance."},
         {"Control": "Nivel Gatún", "Dónde": "Sidebar · Niveles Operativos", "Efecto": "Actualiza área Gatún, evaporación y consumos dependientes del nivel."},
         {"Control": "Nivel Alhajuela", "Dónde": "Sidebar · Niveles Operativos", "Efecto": "Actualiza área Alhajuela, evaporación y generación Madden dependiente del nivel."},
         {"Control": "Panamax/NeoPanamax por día", "Dónde": "Sidebar · Esclusajes", "Efecto": "Cambia la cantidad de tránsitos y el consumo diario de esclusajes."},
@@ -3882,7 +3958,7 @@ with tabs[10]:
         {"Elemento": "Promedios 5/7/10 días", "Criterio": "Se calculan con los últimos N registros disponibles, no por ventana inclusiva de calendario."},
         {"Elemento": "Tránsitos", "Criterio": "PNX y NPX se promedian entre complejos para evitar duplicar el tránsito; el total se muestra con 3 cifras significativas."},
         {"Elemento": "Potabilización y fugas", "Criterio": "Se priorizan columnas MCF/MPC del LakeHouse; *_hm3 se usa como respaldo."},
-        {"Elemento": "Vertido fondo Madden", "Criterio": "`madspill` se interpreta como cfs directo y se convierte a hm³/día."},
+        {"Elemento": "Vertido fondo Madden", "Criterio": "`madspill` se interpreta como MPC/MCF por día y se convierte a hm³/día."},
         {"Elemento": "Evaporación", "Criterio": "No se toma del LakeHouse. Se calcula como lámina mm/día × área km² × 0.001."},
         {"Elemento": "Unidad visual", "Criterio": "Cambiar hm³/día, cfs o m³/s solo cambia la visualización; el cálculo base queda en hm³/día."},
     ])
@@ -3923,7 +3999,7 @@ with tabs[10]:
         {"Situación": "Cambio 5/7/10 días y niveles no cambian", "Solución": "Es normal: los niveles usan el último registro; los promedios operativos sí cambian con 5/7/10 días."},
         {"Situación": "El total de tránsitos no es el esperado", "Solución": "Revise por separado Panamax (PNX) y NeoPanamax (NPX) en el sidebar. El total es la suma de ambos."},
         {"Situación": "Potable o fugas se ven altos", "Solución": "Revise columnas MCF/MPC (`munic_*`, `leak_*`). La app las prioriza sobre *_hm3."},
-        {"Situación": "Vertido fondo Madden no coincide", "Solución": "Verifique `madspill`: debe estar en cfs; la app lo convierte directamente a hm³/día."},
+        {"Situación": "Vertido fondo Madden no coincide", "Solución": "Verifique `madspill`: debe estar en MPC/MCF por día; la app lo convierte directamente a hm³/día."},
         {"Situación": "Evaporación no coincide con LakeHouse", "Solución": "La evaporación se calcula dentro del app con lámina y área, no con el volumen del LakeHouse."},
     ])
     st.dataframe(problemas, use_container_width=True, hide_index=True)
