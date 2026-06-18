@@ -22,6 +22,11 @@ def _dias_lkh_seguros(default: int = 5) -> int:
     return valor if valor in (5, 7, 10) else int(default)
 
 
+# Valor seguro disponible desde el inicio para cualquier bloque del dashboard.
+# Se actualiza nuevamente cuando se carga el LakeHouse.
+_dias_lkh_balance = _dias_lkh_seguros()
+
+
 # ── Contador consecutivo persistente (una vez por sesión) ─────────────────────
 def _counter_state_file() -> str:
     """Ubicación persistente del contador consecutivo del app."""
@@ -1566,11 +1571,8 @@ _info_defaults_lkh = _aplicar_defaults_operativos_lkh_si_corresponde(_dias_defau
 _info_balance_lkh = _obtener_balance_detallado_lkh(_dias_defaults_lkh)
 # Período LakeHouse disponible para todo el app, incluso cuando la fuente de
 # consumo por esclusaje no está configurada como 'Basado en LakeHouse'.
-# Evita NameError en Balance e Instructivo.
-try:
-    _dias_lkh_balance = int((_info_balance_lkh or {}).get('n_dias', _dias_defaults_lkh))
-except Exception:
-    _dias_lkh_balance = int(_dias_defaults_lkh)
+# La variable ya existe desde el inicio y aquí se actualiza con el período real.
+_dias_lkh_balance = _dias_lkh_seguros(_dias_defaults_lkh)
 # Valores de respaldo si no existe LakeHouse; se definen antes de crear los widgets.
 st.session_state.setdefault("nivel_gat_op", 87.0)
 st.session_state.setdefault("nivel_alh_op", 252.0)
@@ -2194,7 +2196,7 @@ def _tarjeta_flujo_principal(
     else:
         _hm3 = float(_hm3)
         _valor_txt = f"{_hm3:.3f} hm³/d"
-        _conversion_txt = f"{_hm3 / CFS2HM3:.1f} cfs · {_hm3 * HM3D2M3S:.2f} m³/s"
+        _conversion_txt = f"{_hm3 / CFS2HM3:.1f} p³/s · {_hm3 * HM3D2M3S:.2f} m³/s"
 
     _nota = nota_lkh if _origen == "lkh" and nota_lkh else nota_app
     _nota_html = (
@@ -2236,20 +2238,18 @@ for _i, _item in enumerate(_detalle_principal_app_alh):
 
 st.markdown("##### 🌊 Gatún")
 
-# ── Resumen único de esclusajes dentro del embalse Gatún ────────────────────
+# ── Esclusajes integrados en el mismo visor de Gatún ─────────────────────────
 def _numero_valido(_valor):
     return _valor is not None and pd.notna(_valor)
 
 
 def _resumen_esclusajes_seleccionado():
-    """Devuelve cantidad, volumen y unitario PNX/NPX según la fuente visible."""
+    """Devuelve cantidad y consumo PNX/NPX según la fuente visible."""
     _app = {
         "pnx_n": float(n_pnx),
         "npx_n": float(n_npx),
         "pnx_hm3": float(dem_pnx),
         "npx_hm3": float(dem_npx),
-        "pnx_unit": float(vp_balance),
-        "npx_unit": float(vn_balance),
         "fuente": "Calculado por app",
     }
 
@@ -2264,18 +2264,11 @@ def _resumen_esclusajes_seleccionado():
     )
     _lkh = None
     if _lkh_disponible:
-        _pnx_n = float(_n_pnx_lkh)
-        _npx_n = float(_n_npx_lkh)
-        _pnx_hm3 = float(_detalle_principal_lkh["gat_pnx"])
-        _npx_hm3 = float(_detalle_principal_lkh["gat_npx"])
         _lkh = {
-            "pnx_n": _pnx_n,
-            "npx_n": _npx_n,
-            "pnx_hm3": _pnx_hm3,
-            "npx_hm3": _npx_hm3,
-            # Unitario derivado del consumo y la cantidad promedio del LakeHouse.
-            "pnx_unit": (_pnx_hm3 / _pnx_n) if _pnx_n > 0 else 0.0,
-            "npx_unit": (_npx_hm3 / _npx_n) if _npx_n > 0 else 0.0,
+            "pnx_n": float(_n_pnx_lkh),
+            "npx_n": float(_n_npx_lkh),
+            "pnx_hm3": float(_detalle_principal_lkh["gat_pnx"]),
+            "npx_hm3": float(_detalle_principal_lkh["gat_npx"]),
             "fuente": f"Promedio LakeHouse · {dias_kpi_superiores} días",
         }
 
@@ -2289,67 +2282,115 @@ def _resumen_esclusajes_seleccionado():
 _escl_vis, _escl_comparar = _resumen_esclusajes_seleccionado()
 _escl_vis["total_n"] = _escl_vis["pnx_n"] + _escl_vis["npx_n"]
 _escl_vis["total_hm3"] = _escl_vis["pnx_hm3"] + _escl_vis["npx_hm3"]
-_escl_vis["total_unit"] = (
-    _escl_vis["total_hm3"] / _escl_vis["total_n"]
-    if _escl_vis["total_n"] > 0 else 0.0
-)
 
-st.markdown("###### 🚢 Esclusajes — cantidad y consumo de agua")
-_escl_c1, _escl_c2, _escl_c3 = st.columns(3)
-with _escl_c1:
-    st.markdown("**Panamax (PNX)**")
-    st.metric("Cantidad PNX", f"{fmt_sig(_escl_vis['pnx_n'], 3)}/día")
-    st.caption(
-        f"Unitario: **{_escl_vis['pnx_unit']:.4f} hm³/escl** · "
-        f"Consumo PNX: **{_escl_vis['pnx_hm3']:.3f} hm³/d**"
-    )
-with _escl_c2:
-    st.markdown("**NeoPanamax (NPX)**")
-    st.metric("Cantidad NPX", f"{fmt_sig(_escl_vis['npx_n'], 3)}/día")
-    st.caption(
-        f"Unitario: **{_escl_vis['npx_unit']:.4f} hm³/escl** · "
-        f"Consumo NPX: **{_escl_vis['npx_hm3']:.3f} hm³/d**"
-    )
-with _escl_c3:
-    st.markdown("**Total de esclusajes**")
-    st.metric("Cantidad total", f"{fmt_sig(_escl_vis['total_n'], 3)}/día")
-    _escl_total_cfs = _escl_vis["total_hm3"] / CFS2HM3
-    _escl_total_m3s = _escl_vis["total_hm3"] * HM3D2M3S
-    st.caption(
-        f"Consumo total: **{_escl_total_cfs:.1f} p³/s** · "
-        f"**{_escl_total_m3s:.2f} m³/s**"
-    )
-
-_escl_nota = (
-    f"Fuente mostrada: **{_escl_vis['fuente']}** · "
-    f"balance aplicado: **{balance_escl_label}** · "
-    f"fuente de volumen por tránsito: **{fuente_consumo_escl}**."
-)
 if _escl_comparar is not None:
-    _lkh_total_n = _escl_comparar["pnx_n"] + _escl_comparar["npx_n"]
-    _lkh_total_hm3 = _escl_comparar["pnx_hm3"] + _escl_comparar["npx_hm3"]
-    _escl_nota += (
-        f" Comparación LakeHouse: PNX **{fmt_sig(_escl_comparar['pnx_n'], 3)}/día** "
-        f"({_escl_comparar['pnx_hm3']:.3f} hm³/d), "
-        f"NPX **{fmt_sig(_escl_comparar['npx_n'], 3)}/día** "
-        f"({_escl_comparar['npx_hm3']:.3f} hm³/d), "
-        f"total **{fmt_sig(_lkh_total_n, 3)}/día** ({_lkh_total_hm3:.3f} hm³/d)."
-    )
-st.caption(_escl_nota)
+    _escl_comparar["total_n"] = _escl_comparar["pnx_n"] + _escl_comparar["npx_n"]
+    _escl_comparar["total_hm3"] = _escl_comparar["pnx_hm3"] + _escl_comparar["npx_hm3"]
 
-_cols_det_gat = st.columns(3)
-for _i, _item in enumerate(_detalle_principal_app_gat):
-    with _cols_det_gat[_i % len(_cols_det_gat)]:
-        _tarjeta_flujo_principal(
-            _item["etiqueta"],
-            _item["app"],
-            _item["lkh"],
-            "flow-card-gat",
-            solo_app=_item.get("solo_app", False),
-            nota_app=_item.get("nota_app"),
-            nota_lkh=_item.get("nota_lkh"),
-            fuente_lkh=_item.get("fuente_lkh"),
+
+def _tarjeta_esclusaje_integrada(etiqueta, cantidad, consumo_hm3, comparacion=None):
+    """Tarjeta de esclusajes: cantidad diaria y agua en p³/s y m³/s."""
+    _cantidad_txt = f"{fmt_sig(float(cantidad), 3)}/día" if _numero_valido(cantidad) else "N/D"
+    if _numero_valido(consumo_hm3):
+        _consumo_hm3 = float(consumo_hm3)
+        _agua_txt = (
+            f"Agua: {_consumo_hm3 / CFS2HM3:.1f} p³/s · "
+            f"{_consumo_hm3 * HM3D2M3S:.2f} m³/s"
         )
+    else:
+        _agua_txt = "Agua: N/D"
+
+    _comparacion_html = ""
+    if comparacion is not None:
+        _cant_cmp, _hm3_cmp = comparacion
+        if _numero_valido(_cant_cmp) and _numero_valido(_hm3_cmp):
+            _hm3_cmp = float(_hm3_cmp)
+            _comparacion_html = (
+                '<div class="flow-compare">'
+                f'LakeHouse: {fmt_sig(float(_cant_cmp), 3)}/día · '
+                f'{_hm3_cmp / CFS2HM3:.1f} p³/s · '
+                f'{_hm3_cmp * HM3D2M3S:.2f} m³/s'
+                '</div>'
+            )
+        else:
+            _comparacion_html = '<div class="flow-compare">LakeHouse: N/D</div>'
+
+    st.markdown(
+        f"""
+        <div class="flow-card flow-card-gat">
+            <div class="flow-label">{etiqueta}</div>
+            <div class="flow-value">{_cantidad_txt}</div>
+            <div class="flow-conv">{_agua_txt}</div>
+            {_comparacion_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# Un solo conjunto de tarjetas para Gatún: total, esclusajes y demás demandas.
+_gat_items_unificados = [
+    ("flujo", _detalle_principal_app_gat[0]),
+    (
+        "esclusaje",
+        {
+            "etiqueta": "Esclusajes PNX",
+            "cantidad": _escl_vis["pnx_n"],
+            "hm3": _escl_vis["pnx_hm3"],
+            "comparacion": (
+                (_escl_comparar["pnx_n"], _escl_comparar["pnx_hm3"])
+                if _escl_comparar is not None else None
+            ),
+        },
+    ),
+    (
+        "esclusaje",
+        {
+            "etiqueta": "Esclusajes NPX",
+            "cantidad": _escl_vis["npx_n"],
+            "hm3": _escl_vis["npx_hm3"],
+            "comparacion": (
+                (_escl_comparar["npx_n"], _escl_comparar["npx_hm3"])
+                if _escl_comparar is not None else None
+            ),
+        },
+    ),
+    (
+        "esclusaje",
+        {
+            "etiqueta": "Total de esclusajes",
+            "cantidad": _escl_vis["total_n"],
+            "hm3": _escl_vis["total_hm3"],
+            "comparacion": (
+                (_escl_comparar["total_n"], _escl_comparar["total_hm3"])
+                if _escl_comparar is not None else None
+            ),
+        },
+    ),
+]
+_gat_items_unificados.extend(("flujo", _item) for _item in _detalle_principal_app_gat[1:])
+
+_cols_det_gat = st.columns(4)
+for _i, (_tipo, _item) in enumerate(_gat_items_unificados):
+    with _cols_det_gat[_i % len(_cols_det_gat)]:
+        if _tipo == "esclusaje":
+            _tarjeta_esclusaje_integrada(
+                _item["etiqueta"],
+                _item["cantidad"],
+                _item["hm3"],
+                comparacion=_item.get("comparacion"),
+            )
+        else:
+            _tarjeta_flujo_principal(
+                _item["etiqueta"],
+                _item["app"],
+                _item["lkh"],
+                "flow-card-gat",
+                solo_app=_item.get("solo_app", False),
+                nota_app=_item.get("nota_app"),
+                nota_lkh=_item.get("nota_lkh"),
+                fuente_lkh=_item.get("fuente_lkh"),
+            )
 
 if _info_balance_lkh:
     _fecha_kpi_lkh = _fecha_lkh_texto(_info_balance_lkh.get("fecha_ultimo"))
