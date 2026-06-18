@@ -1481,11 +1481,11 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                 return None
 
             detalle = [
-                {"Embalse": "Alhajuela / Madden", "Uso": "Generación Madden", "hm3": _hm3_component(["gen_mad_hm3"])},
-                {"Embalse": "Alhajuela / Madden", "Uso": "Potabilización", "hm3": _hm3_component_mcf_first(["pot_m_mcf"], ["pot_m_hm3"], max_hm3=3.0)},
-                {"Embalse": "Alhajuela / Madden", "Uso": "Fugas", "hm3": _hm3_component_mcf_first(["fug_m_mcf"], ["fug_m_hm3"], max_hm3=1.5)},
-                {"Embalse": "Alhajuela / Madden", "Uso": "Vertido Madden", "hm3": _hm3_component([], ["vert_m_mcf"])},
-                {"Embalse": "Alhajuela / Madden", "Uso": "Evaporación", "hm3": _hm3_component(["evap_m_hm3"])},
+                {"Embalse": "Alhajuela ", "Uso": "Generación Madden", "hm3": _hm3_component(["gen_mad_hm3"])},
+                {"Embalse": "Alhajuela ", "Uso": "Potabilización", "hm3": _hm3_component_mcf_first(["pot_m_mcf"], ["pot_m_hm3"], max_hm3=3.0)},
+                {"Embalse": "Alhajuela ", "Uso": "Fugas", "hm3": _hm3_component_mcf_first(["fug_m_mcf"], ["fug_m_hm3"], max_hm3=1.5)},
+                {"Embalse": "Alhajuela ", "Uso": "Vertido Madden", "hm3": _hm3_component([], ["vert_m_mcf"])},
+                {"Embalse": "Alhajuela ", "Uso": "Evaporación", "hm3": _hm3_component(["evap_m_hm3"])},
                 {"Embalse": "Gatún", "Uso": "Esclusajes PNX", "hm3": _hm3_component(["gat_hm3", "pm_hm3"], ["gat_mcf", "pm_mcf"])},
                 {"Embalse": "Gatún", "Uso": "Esclusajes NPX", "hm3": _hm3_component(["acl_hm3", "ccl_hm3"], ["acl_mcf", "ccl_mcf"])},
                 {"Embalse": "Gatún", "Uso": "Generación Gatún", "hm3": _hm3_component(["gen_gat_hm3"])},
@@ -2046,10 +2046,10 @@ def _buscar_detalle_lkh(embalse, uso=None, prefijo_uso=None):
 
 
 _detalle_principal_lkh = {
-    "alh_gen":  _buscar_detalle_lkh("Alhajuela / Madden", uso="Generación Madden"),
-    "alh_pot":  _buscar_detalle_lkh("Alhajuela / Madden", uso="Potabilización"),
-    "alh_fug":  _buscar_detalle_lkh("Alhajuela / Madden", uso="Fugas"),
-    "alh_ver":  _buscar_detalle_lkh("Alhajuela / Madden", prefijo_uso="Vertido"),
+    "alh_gen":  _buscar_detalle_lkh("Alhajuela ", uso="Generación Madden"),
+    "alh_pot":  _buscar_detalle_lkh("Alhajuela ", uso="Potabilización"),
+    "alh_fug":  _buscar_detalle_lkh("Alhajuela ", uso="Fugas"),
+    "alh_ver":  _buscar_detalle_lkh("Alhajuela ", prefijo_uso="Vertido"),
     # La evaporación del LakeHouse se ignora deliberadamente: siempre usa el cálculo del app.
     "gat_pnx":  _buscar_detalle_lkh("Gatún", uso="Esclusajes PNX"),
     "gat_npx":  _buscar_detalle_lkh("Gatún", uso="Esclusajes NPX"),
@@ -2221,7 +2221,7 @@ def _tarjeta_flujo_principal(
     )
 
 
-st.markdown("##### 🏔️ Alhajuela / Madden")
+st.markdown("##### 🏔️ Alhajuela")
 _cols_det_alh = st.columns(3)
 for _i, _item in enumerate(_detalle_principal_app_alh):
     with _cols_det_alh[_i % len(_cols_det_alh)]:
@@ -2289,16 +2289,19 @@ if _escl_comparar is not None:
 
 
 def _tarjeta_esclusaje_integrada(etiqueta, cantidad, consumo_hm3, comparacion=None):
-    """Tarjeta de esclusajes: cantidad diaria y agua en p³/s y m³/s."""
+    """Tarjeta de esclusajes: cantidad diaria, volumen en hm³/d y equivalencias de caudal."""
     _cantidad_txt = f"{fmt_sig(float(cantidad), 3)}/día" if _numero_valido(cantidad) else "N/D"
+
     if _numero_valido(consumo_hm3):
         _consumo_hm3 = float(consumo_hm3)
-        _agua_txt = (
-            f"Agua: {_consumo_hm3 / CFS2HM3:.1f} p³/s · "
+        _volumen_txt = f"Consumo: {_consumo_hm3:.3f} hm³/d"
+        _conversion_txt = (
+            f"{_consumo_hm3 / CFS2HM3:.1f} p³/s · "
             f"{_consumo_hm3 * HM3D2M3S:.2f} m³/s"
         )
     else:
-        _agua_txt = "Agua: N/D"
+        _volumen_txt = "Consumo: N/D"
+        _conversion_txt = "p³/s: N/D · m³/s: N/D"
 
     _comparacion_html = ""
     if comparacion is not None:
@@ -2308,6 +2311,7 @@ def _tarjeta_esclusaje_integrada(etiqueta, cantidad, consumo_hm3, comparacion=No
             _comparacion_html = (
                 '<div class="flow-compare">'
                 f'LakeHouse: {fmt_sig(float(_cant_cmp), 3)}/día · '
+                f'{_hm3_cmp:.3f} hm³/d · '
                 f'{_hm3_cmp / CFS2HM3:.1f} p³/s · '
                 f'{_hm3_cmp * HM3D2M3S:.2f} m³/s'
                 '</div>'
@@ -2320,7 +2324,8 @@ def _tarjeta_esclusaje_integrada(etiqueta, cantidad, consumo_hm3, comparacion=No
         <div class="flow-card flow-card-gat">
             <div class="flow-label">{etiqueta}</div>
             <div class="flow-value">{_cantidad_txt}</div>
-            <div class="flow-conv">{_agua_txt}</div>
+            <div class="flow-conv"><b>{_volumen_txt}</b></div>
+            <div class="flow-conv">{_conversion_txt}</div>
             {_comparacion_html}
         </div>
         """,
@@ -2463,100 +2468,6 @@ with tabs[0]:
                 gauge={"axis":{"range":[0,100]},"bar":{"color":cl}}))
             fig_gauge.update_layout(height=160, margin=dict(l=10,r=10,t=35,b=5))
             st.plotly_chart(fig_gauge, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("🧾 Detalle operativo del balance")
-
-    def _flow_card(label, hm3_val, fuente="Balance actual"):
-        hm3_val = 0.0 if hm3_val is None or pd.isna(hm3_val) else float(hm3_val)
-        cfs_val = hm3_val / CFS2HM3
-        m3s_val = hm3_val * HM3D2M3S
-        st.markdown(
-            f"""
-            <div class="lkh-card">
-                <div class="label">{label}</div>
-                <div class="value">{hm3_val:.3f} hm³/d</div>
-                <div class="sub">{cfs_val:.1f} cfs · {m3s_val:.2f} m³/s · {fuente}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    _balance_base_det = [
-        {"Embalse": "Alhajuela / Madden", "Uso": "Generación Madden", "hm3": gen_alh},
-        {"Embalse": "Alhajuela / Madden", "Uso": "Potabilización", "hm3": alh_pot},
-        {"Embalse": "Alhajuela / Madden", "Uso": "Fugas", "hm3": alh_fug},
-        {"Embalse": "Alhajuela / Madden", "Uso": "Vertido Madden", "hm3": alh_vert},
-        {"Embalse": "Alhajuela / Madden", "Uso": "Evaporación", "hm3": evap_alh},
-        {"Embalse": "Gatún", "Uso": "Esclusajes PNX", "hm3": dem_pnx},
-        {"Embalse": "Gatún", "Uso": "Esclusajes NPX", "hm3": dem_npx},
-        {"Embalse": "Gatún", "Uso": "Generación Gatún", "hm3": gen_gat},
-        {"Embalse": "Gatún", "Uso": "Potabilización", "hm3": gat_pot},
-        {"Embalse": "Gatún", "Uso": "Fugas", "hm3": gat_fug},
-        {"Embalse": "Gatún", "Uso": "Vertido Gatún", "hm3": gat_ver},
-        {"Embalse": "Gatún", "Uso": "ZZ-Flush", "hm3": dem_flush},
-        {"Embalse": "Gatún", "Uso": "Evaporación", "hm3": evap_gat},
-    ]
-    _lkh_lookup = {}
-    if _info_balance_lkh and _info_balance_lkh.get("detalle"):
-        for _r in _info_balance_lkh.get("detalle", []):
-            _lkh_lookup[(_r.get("Embalse"), _r.get("Uso"))] = _r.get("hm3")
-
-    _detalle_balance_rows = []
-    for _r in _balance_base_det:
-        _key = (_r["Embalse"], _r["Uso"])
-        _hm3_lkh = _lkh_lookup.get(_key, None)
-
-        # IMPORTANTE:
-        # La evaporación del detalle debe salir del cálculo activo del app por embalse
-        # (lámina mm/día × área km² × 0.001), no del LakeHouse. Esto evita mostrar
-        # 0.000 hm³/d cuando el LakeHouse trae la columna de evaporación vacía o en cero.
-        _uso_l = str(_r.get("Uso", "")).strip().lower()
-        _es_evaporacion = _uso_l == "evaporación"
-        _es_fugas = _uso_l == "fugas"
-        _es_potabilizacion = _uso_l == "potabilización"
-        _usar_lkh = (not _es_evaporacion) and (_hm3_lkh is not None) and (not pd.isna(_hm3_lkh))
-
-        _hm3_val = float(_hm3_lkh) if _usar_lkh else float(_r["hm3"])
-        if _es_evaporacion:
-            _fuente_row = "App calculado"
-        elif (_es_fugas or _es_potabilizacion) and _usar_lkh:
-            _fuente_row = "LakeHouse MCF"
-        else:
-            _fuente_row = "LakeHouse" if _usar_lkh else "Balance actual"
-
-        _detalle_balance_rows.append({
-            "Embalse": _r["Embalse"],
-            "Uso": _r["Uso"],
-            "hm³/día": round(_hm3_val, 4),
-            "cfs": round(_hm3_val / CFS2HM3, 1),
-            "m³/s": round(_hm3_val * HM3D2M3S, 2),
-            "Fuente": _fuente_row,
-        })
-
-    _det_alh = [r for r in _detalle_balance_rows if r["Embalse"] == "Alhajuela / Madden"]
-    _det_gat = [r for r in _detalle_balance_rows if r["Embalse"] == "Gatún"]
-    _fuente_det_txt = "LakeHouse local/subido + respaldo balance" if _lkh_lookup else "Balance actual del sidebar"
-    st.caption(
-        f"Valor principal en hm³/día; debajo se muestran cfs y m³/s. "
-        f"Se incluyen también los componentes en cero para que el balance no oculte salidas sin uso. "
-        f"Fuente general: **{_fuente_det_txt}**. La **evaporación** siempre se toma del cálculo activo del app por embalse; "
-        f"en **potabilización** y **fugas**, cuando hay LakeHouse, se priorizan las columnas MCF/MPC (`munic_mad` / `munic_gat` y `leak_mad` / `leak_gat`) para evitar valores desajustados de *_hm3."
-    )
-
-    st.markdown("**Alhajuela / Madden**")
-    _cols_alh = st.columns(5)
-    for _i, _r in enumerate(_det_alh):
-        with _cols_alh[_i % len(_cols_alh)]:
-            _flow_card(_r["Uso"], _r["hm³/día"], _r["Fuente"])
-
-    st.markdown("**Gatún**")
-    _cols_gat = st.columns(4)
-    for _i, _r in enumerate(_det_gat):
-        with _cols_gat[_i % len(_cols_gat)]:
-            _flow_card(_r["Uso"], _r["hm³/día"], _r["Fuente"])
-
-    st.dataframe(pd.DataFrame(_detalle_balance_rows), use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.subheader("☀️ Evaporación aplicada en el balance")
@@ -3787,7 +3698,7 @@ with tabs[9]:
             })
 
         salidas_embalse_rows = []
-        # Alhajuela / Madden
+        # Alhajuela
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Generación Madden", [("gen_mad_hm3", None)])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Potabilización", [("mun_m_hm3", "mun_m", True)])
         _agregar_salida_embalse(salidas_embalse_rows, "Alhajuela", "Fugas", [("leak_m_hm3", "leak_m", True)])
