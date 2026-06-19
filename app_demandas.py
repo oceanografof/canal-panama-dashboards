@@ -939,6 +939,110 @@ def tbl(usos, total, nombre, dem_t):
     return pd.DataFrame(rows)
 
 
+
+# ── Evaporación desde archivos normalizados de Aquarius ──────────────────────
+EVAP_AQUARIUS_FILES = {
+    "mm_gat": "Evapo_Rate_Daily_Tank_CZL.csv",
+    "mm_alh": "Evapo_Rate_Daily_Tank_PMG.csv",
+    "hm3_gat": "Total_Storage_V_Evap_Gat_0_85_GAT.csv",
+    "hm3_alh": "Total_Storage_V_Evap_Alha_0_85_MAD.csv",
+}
+
+
+def _buscar_archivo_data(nombre: str) -> str | None:
+    """Busca un CSV en /data junto al app, en el cwd y como respaldo en la raíz."""
+    base_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    candidatos = [
+        os.path.join(base_dir, "data", nombre),
+        os.path.join(os.getcwd(), "data", nombre),
+        os.path.join(base_dir, nombre),
+        os.path.join(os.getcwd(), nombre),
+    ]
+    vistos = set()
+    for path in candidatos:
+        path_abs = os.path.abspath(path)
+        if path_abs in vistos:
+            continue
+        vistos.add(path_abs)
+        if os.path.isfile(path_abs):
+            return path_abs
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def _leer_ultimo_valor_aquarius(path: str, mtime_ns: int) -> dict:
+    """Lee el último valor numérico válido de un CSV normalizado por download_data.py."""
+    del mtime_ns  # Solo se usa para invalidar la caché cuando cambia el archivo.
+    df = pd.read_csv(path)
+    if df.empty:
+        raise ValueError("archivo vacío")
+
+    columnas_l = {str(c).strip().lower(): c for c in df.columns}
+    col_valor = next(
+        (columnas_l[k] for k in ("valor_raw", "valor", "value", "result") if k in columnas_l),
+        None,
+    )
+    if col_valor is None:
+        # Respaldo: primera columna con al menos un valor numérico.
+        for c in df.columns:
+            serie_num = pd.to_numeric(df[c], errors="coerce")
+            if serie_num.notna().any():
+                col_valor = c
+                break
+    if col_valor is None:
+        raise ValueError("no contiene una columna numérica reconocible")
+
+    valores = pd.to_numeric(df[col_valor], errors="coerce")
+    validos = df.loc[valores.notna()].copy()
+    if validos.empty:
+        raise ValueError("no contiene valores numéricos válidos")
+    validos["_valor"] = valores.loc[validos.index].astype(float)
+    validos = validos.loc[np.isfinite(validos["_valor"]) & (validos["_valor"] >= 0)].copy()
+    if validos.empty:
+        raise ValueError("no contiene valores no negativos válidos")
+
+    col_fecha = next(
+        (columnas_l[k] for k in ("fecha_inicio", "fecha_fin", "timestamp", "date", "fecha") if k in columnas_l),
+        None,
+    )
+    fecha_dt = None
+    fecha_txt = "N/D"
+    if col_fecha is not None:
+        validos["_fecha"] = pd.to_datetime(validos[col_fecha], errors="coerce")
+        con_fecha = validos.loc[validos["_fecha"].notna()].sort_values("_fecha")
+        if not con_fecha.empty:
+            fila = con_fecha.iloc[-1]
+            fecha_dt = fila["_fecha"]
+            fecha_txt = fecha_dt.strftime("%d/%m/%Y %H:%M")
+        else:
+            fila = validos.iloc[-1]
+            fecha_txt = str(fila.get(col_fecha, "N/D"))
+    else:
+        fila = validos.iloc[-1]
+
+    return {
+        "valor": float(fila["_valor"]),
+        "fecha": fecha_txt,
+        "fecha_dt": fecha_dt,
+        "archivo": os.path.basename(path),
+        "path": path,
+    }
+
+
+def _cargar_serie_evap_aquarius(nombre: str) -> dict:
+    """Devuelve valor/fecha o un error legible sin detener el dashboard."""
+    path = _buscar_archivo_data(nombre)
+    if not path:
+        return {"ok": False, "archivo": nombre, "error": "archivo no encontrado en la carpeta data"}
+    try:
+        stat = os.stat(path)
+        info = _leer_ultimo_valor_aquarius(path, int(stat.st_mtime_ns))
+        info["ok"] = True
+        return info
+    except Exception as exc:
+        return {"ok": False, "archivo": nombre, "path": path, "error": str(exc)}
+
+
 # ═══ SIDEBAR ═══
 # Logos: Canal de Panamá + HIMH
 _sb_logos = ""
@@ -1300,8 +1404,8 @@ def _aplicar_defaults_operativos_lkh_si_corresponde(n_dias=5):
             return None
         if st.session_state.get("_defaults_lkh_source_id") != sid_op:
             # Los vertidos se inicializan con el promedio LakeHouse del período elegido.
-            # La evaporación NO se importa del LakeHouse: permanece como cálculo del app
-            # (lámina editable × área espejo calculada por nivel).
+            # La evaporación no se inicializa desde LakeHouse; la controla la fuente activa
+            # seleccionada en el bloque de evaporación (Manual o Aquarius).
             mapeo = {
                 "n_pnx_lkh": (info.get("n_pnx"), 0.0, 40.0, 1),
                 "n_npx_lkh": (info.get("n_npx"), 0.0, 20.0, 1),
@@ -1588,6 +1692,7 @@ st.session_state.setdefault("v_fondo_lkh", 0)
 st.session_state.setdefault("v_gatun_lkh", 0)
 st.session_state.setdefault("evap_gat_mm_lkh", 4.0)
 st.session_state.setdefault("evap_alh_mm_lkh", st.session_state.get("evap_gat_mm_lkh", 4.0))
+st.session_state.setdefault("fuente_evap", "Manual")
 
 # ═══ NIVELES OPERATIVOS — fuente única para todo el app ═══════════════════════
 st.sidebar.markdown("### 📍 Niveles Operativos")
@@ -1827,24 +1932,76 @@ dem_escl_efectivo       = max(n_npx * vn_efectivo + n_pnx * vp_efectivo - ahorro
 dem_escl_sidebar_ahorro = max(n_npx * vn_sidebar_ahorro + n_pnx * vp_sidebar_ahorro - ahorro_turnaround_npx_sidebar, 0.0)
 
 st.sidebar.markdown("### ☀️ Evaporación")
-evap_gat_mm = st.sidebar.number_input(
-    "Lámina Gatún (mm/día)",
-    min_value=0.0, max_value=15.0, step=0.1, key="evap_gat_mm_lkh",
-    help="Lámina diaria utilizada para calcular el volumen evaporado de Gatún."
+fuente_evap = st.sidebar.radio(
+    "Fuente de evaporación",
+    ["Manual", "Aquarius · lámina (mm/día)", "Aquarius · caudal/volumen"],
+    key="fuente_evap",
+    help=(
+        "Manual: ingresa la lámina por embalse. "
+        "Aquarius · lámina: usa CZL para Gatún y PMG para Alhajuela. "
+        "Aquarius · caudal/volumen: usa directamente las series V Evap 0.85 en hm³/día."
+    ),
 )
 
-evap_alh_mm = st.sidebar.number_input(
-    "Lámina Alhajuela (mm/día)",
+# Los campos manuales permanecen visibles y guardados; en modo Aquarius quedan bloqueados.
+_evap_manual_bloqueado = fuente_evap != "Manual"
+evap_gat_mm_manual = st.sidebar.number_input(
+    "Lámina manual Gatún (mm/día)",
+    min_value=0.0, max_value=15.0, step=0.1, key="evap_gat_mm_lkh",
+    disabled=_evap_manual_bloqueado,
+    help="Se usa únicamente cuando la fuente seleccionada es Manual."
+)
+evap_alh_mm_manual = st.sidebar.number_input(
+    "Lámina manual Alhajuela (mm/día)",
     min_value=0.0, max_value=15.0, step=0.1, key="evap_alh_mm_lkh",
-    help=(
-        "Por defecto inicia con el mismo valor de Gatún, "
-        "pero puede modificarse manualmente sin afectar la lámina de Gatún."
-    )
+    disabled=_evap_manual_bloqueado,
+    help="Se usa únicamente cuando la fuente seleccionada es Manual."
 )
-st.sidebar.caption(
-    "Alhajuela queda inicializada con la misma lámina de Gatún, "
-    "pero ambos campos son editables de forma independiente."
-)
+if _evap_manual_bloqueado:
+    st.sidebar.caption("Los valores manuales quedan guardados como respaldo, pero no alimentan el balance mientras Aquarius esté activo.")
+
+_evap_aq_gat = None
+_evap_aq_alh = None
+_evap_modo_efectivo = fuente_evap
+_evap_gat_hm3_directo = None
+_evap_alh_hm3_directo = None
+
+if fuente_evap == "Aquarius · lámina (mm/día)":
+    _evap_aq_gat = _cargar_serie_evap_aquarius(EVAP_AQUARIUS_FILES["mm_gat"])
+    _evap_aq_alh = _cargar_serie_evap_aquarius(EVAP_AQUARIUS_FILES["mm_alh"])
+    if _evap_aq_gat.get("ok") and _evap_aq_alh.get("ok"):
+        evap_gat_mm = float(_evap_aq_gat["valor"])
+        evap_alh_mm = float(_evap_aq_alh["valor"])
+    else:
+        _evap_modo_efectivo = "Manual · respaldo"
+        evap_gat_mm = evap_gat_mm_manual
+        evap_alh_mm = evap_alh_mm_manual
+        _faltantes = [x for x in (_evap_aq_gat, _evap_aq_alh) if not x.get("ok")]
+        st.sidebar.warning(
+            "No fue posible usar las dos láminas de Aquarius; se aplicaron los valores manuales guardados. "
+            + " | ".join(f"{x.get('archivo')}: {x.get('error')}" for x in _faltantes)
+        )
+elif fuente_evap == "Aquarius · caudal/volumen":
+    _evap_aq_gat = _cargar_serie_evap_aquarius(EVAP_AQUARIUS_FILES["hm3_gat"])
+    _evap_aq_alh = _cargar_serie_evap_aquarius(EVAP_AQUARIUS_FILES["hm3_alh"])
+    if _evap_aq_gat.get("ok") and _evap_aq_alh.get("ok"):
+        _evap_gat_hm3_directo = float(_evap_aq_gat["valor"])
+        _evap_alh_hm3_directo = float(_evap_aq_alh["valor"])
+        # Se completan después de calcular las áreas, como láminas equivalentes.
+        evap_gat_mm = 0.0
+        evap_alh_mm = 0.0
+    else:
+        _evap_modo_efectivo = "Manual · respaldo"
+        evap_gat_mm = evap_gat_mm_manual
+        evap_alh_mm = evap_alh_mm_manual
+        _faltantes = [x for x in (_evap_aq_gat, _evap_aq_alh) if not x.get("ok")]
+        st.sidebar.warning(
+            "No fue posible usar los dos volúmenes de Aquarius; se aplicaron los valores manuales guardados. "
+            + " | ".join(f"{x.get('archivo')}: {x.get('error')}" for x in _faltantes)
+        )
+else:
+    evap_gat_mm = evap_gat_mm_manual
+    evap_alh_mm = evap_alh_mm_manual
 
 st.sidebar.markdown("**Área espejo de embalse**")
 # ── Selector de curva hipsométrica Gatún ─────────────────────────────────────
@@ -1861,7 +2018,7 @@ area_modo_gat = st.sidebar.radio("Área Gatún", ["Calcular desde nivel (ft)", "
 if area_modo_gat == "Manual":
     area_gat = st.sidebar.number_input("Área espejo Gatún (km²)", 0.0, 500.0, 425.0, 1.0)
     nivel_gat_ft = None
-    st.sidebar.caption(f"💧 Evap estimada: **{evap_gat_mm * area_gat * 1e-3:.4f} hm³/d**")
+    st.sidebar.caption("Área manual utilizada por la fuente activa de evaporación.")
 else:
     nivel_gat_ft = nivel_gat_op  # sincronizado con Niveles Operativos
     area_gat = area_desde_nivel_gat(nivel_gat_ft, daily=_use_daily_gat)
@@ -1883,13 +2040,61 @@ area_modo_alh = st.sidebar.radio("Área Alhajuela", ["Calcular desde nivel (ft)"
 if area_modo_alh == "Manual":
     area_alh = st.sidebar.number_input("Área espejo Alhajuela (km²)", 0.0, 100.0, 49.0, 1.0)
     nivel_alh_ft = None
-    st.sidebar.caption(f"💧 Evap estimada: **{evap_alh_mm * area_alh * 1e-3:.4f} hm³/d**")
+    st.sidebar.caption("Área manual utilizada por la fuente activa de evaporación.")
 else:
     nivel_alh_ft = nivel_alh_op  # sincronizado con Niveles Operativos
     area_alh = area_desde_nivel_alh(nivel_alh_ft, daily=_use_daily_alh)
     st.sidebar.caption(f"📐 Área calculada: **{area_alh:.4f} km²** @ {nivel_alh_ft:.2f} ft  ({'Daily' if _use_daily_alh else 'Estándar'})")
     if (not _use_daily_alh) and not (_NV_ALH[0] <= nivel_alh_ft <= _NV_ALH[-1]):
         st.sidebar.warning("Nivel Alhajuela fuera del rango de curva estándar; use Daily para evitar extrapolación/clamp.")
+
+# Fuente única de evaporación aplicada a TODO el dashboard.
+if _evap_modo_efectivo == "Aquarius · caudal/volumen":
+    evap_gat = max(float(_evap_gat_hm3_directo or 0.0), 0.0)
+    evap_alh = max(float(_evap_alh_hm3_directo or 0.0), 0.0)
+    # Lámina equivalente para las vistas de área espejo y para documentar el valor directo.
+    evap_gat_mm = evap_gat / (area_gat * 1e-3) if area_gat > 0 else 0.0
+    evap_alh_mm = evap_alh / (area_alh * 1e-3) if area_alh > 0 else 0.0
+elif _evap_modo_efectivo == "Aquarius · lámina (mm/día)":
+    evap_gat = max(float(evap_gat_mm), 0.0) * area_gat * 1e-3
+    evap_alh = max(float(evap_alh_mm), 0.0) * area_alh * 1e-3
+else:
+    evap_gat = max(float(evap_gat_mm), 0.0) * area_gat * 1e-3
+    evap_alh = max(float(evap_alh_mm), 0.0) * area_alh * 1e-3
+
+evap_tot = evap_gat + evap_alh
+
+if _evap_modo_efectivo == "Aquarius · lámina (mm/día)":
+    evap_fuente_label = "Aquarius · lámina diaria"
+    evap_fuente_corta = "Aquarius mm"
+    evap_detalle_gat = f"CZL · {_evap_aq_gat.get('fecha', 'N/D')}"
+    evap_detalle_alh = f"PMG · {_evap_aq_alh.get('fecha', 'N/D')}"
+elif _evap_modo_efectivo == "Aquarius · caudal/volumen":
+    evap_fuente_label = "Aquarius · volumen V Evap 0.85"
+    evap_fuente_corta = "Aquarius volumen"
+    evap_detalle_gat = f"GAT · {_evap_aq_gat.get('fecha', 'N/D')}"
+    evap_detalle_alh = f"MAD · {_evap_aq_alh.get('fecha', 'N/D')}"
+elif _evap_modo_efectivo == "Manual · respaldo":
+    evap_fuente_label = "Manual · respaldo por archivo Aquarius no disponible"
+    evap_fuente_corta = "Manual respaldo"
+    evap_detalle_gat = "Lámina manual guardada"
+    evap_detalle_alh = "Lámina manual guardada"
+else:
+    evap_fuente_label = "Manual · lámina por embalse"
+    evap_fuente_corta = "Manual"
+    evap_detalle_gat = "Lámina manual"
+    evap_detalle_alh = "Lámina manual"
+
+st.sidebar.markdown("**Resultado aplicado al balance**")
+st.sidebar.caption(
+    f"**Gatún:** {evap_gat:.4f} hm³/d · {evap_gat/CFS2HM3:.1f} cfs · "
+    f"{evap_gat_mm:.2f} mm/día ({evap_detalle_gat})"
+)
+st.sidebar.caption(
+    f"**Alhajuela:** {evap_alh:.4f} hm³/d · {evap_alh/CFS2HM3:.1f} cfs · "
+    f"{evap_alh_mm:.2f} mm/día ({evap_detalle_alh})"
+)
+st.sidebar.caption(f"Fuente activa: **{evap_fuente_label}**")
 
 st.sidebar.markdown("---")
 unidad  = st.sidebar.radio("Unidad visual", ["hm³/día", "cfs", "m³/s"], horizontal=True)
@@ -1934,9 +2139,7 @@ alh_vf    = v_fondo*CFS2HM3; alh_vt = v_tambor*CFS2HM3; alh_vl = v_libre*CFS2HM3
 alh_vert  = alh_vf+alh_vt+alh_vl
 gat_ver   = v_gatun*CFS2HM3
 dem_flush = ZZ_FLUSH_M3S*(flush_cc+flush_ac)*3600/1e6
-evap_gat  = evap_gat_mm*area_gat*1e-3
-evap_alh  = evap_alh_mm*area_alh*1e-3
-evap_tot  = evap_gat+evap_alh
+# La evaporación ya fue resuelta una sola vez según la fuente seleccionada en el sidebar.
 
 alh_total = gen_alh+alh_pot+alh_fug+alh_vert+evap_alh
 gat_total = gen_gat+gat_pot+gat_fug+gat_ver+dem_escl+dem_flush+evap_gat
@@ -2050,7 +2253,7 @@ _detalle_principal_lkh = {
     "alh_pot":  _buscar_detalle_lkh("Alhajuela ", uso="Potabilización"),
     "alh_fug":  _buscar_detalle_lkh("Alhajuela ", uso="Fugas"),
     "alh_ver":  _buscar_detalle_lkh("Alhajuela ", prefijo_uso="Vertido"),
-    # La evaporación del LakeHouse se ignora deliberadamente: siempre usa el cálculo del app.
+    # La evaporación usa la fuente activa seleccionada en el sidebar.
     "gat_pnx":  _buscar_detalle_lkh("Gatún", uso="Esclusajes PNX"),
     "gat_npx":  _buscar_detalle_lkh("Gatún", uso="Esclusajes NPX"),
     "gat_gen":  _buscar_detalle_lkh("Gatún", uso="Generación Gatún"),
@@ -2062,7 +2265,7 @@ _detalle_principal_lkh = {
 
 
 def _total_promedio_lkh(componentes, evaporacion_app):
-    """Suma el promedio LakeHouse por embalse y agrega la evaporación calculada por el app."""
+    """Suma el promedio LakeHouse por embalse y agrega la evaporación de la fuente activa."""
     _total = 0.0
     for _valor_lkh, _valor_app in componentes:
         if _valor_lkh is not None and pd.notna(_valor_lkh):
@@ -2115,7 +2318,7 @@ _detalle_principal_app_alh = [
         "app": alh_total,
         "lkh": _alh_total_lkh,
         "solo_app": False,
-        "fuente_lkh": f"LakeHouse + evap. app · {dias_kpi_superiores} días",
+        "fuente_lkh": f"LakeHouse + evap. {evap_fuente_corta} · {dias_kpi_superiores} días",
     },
     {
         "etiqueta": "Generación Madden",
@@ -2128,7 +2331,7 @@ _detalle_principal_app_alh = [
     {"etiqueta": "Potabilización", "app": alh_pot, "lkh": _detalle_principal_lkh["alh_pot"], "solo_app": False},
     {"etiqueta": "Fugas", "app": alh_fug, "lkh": _detalle_principal_lkh["alh_fug"], "solo_app": False},
     {"etiqueta": "Vertido Madden", "app": alh_vert, "lkh": _detalle_principal_lkh["alh_ver"], "solo_app": False},
-    {"etiqueta": "Evaporación calculada", "app": evap_alh, "lkh": None, "solo_app": True},
+    {"etiqueta": "Evaporación", "app": evap_alh, "lkh": None, "solo_app": True, "fuente_app": evap_fuente_label},
 ]
 
 _detalle_principal_app_gat = [
@@ -2137,7 +2340,7 @@ _detalle_principal_app_gat = [
         "app": gat_total,
         "lkh": _gat_total_lkh,
         "solo_app": False,
-        "fuente_lkh": f"LakeHouse + evap. app · {dias_kpi_superiores} días",
+        "fuente_lkh": f"LakeHouse + evap. {evap_fuente_corta} · {dias_kpi_superiores} días",
     },
     {
         "etiqueta": "Generación Gatún",
@@ -2151,14 +2354,14 @@ _detalle_principal_app_gat = [
     {"etiqueta": "Fugas", "app": gat_fug, "lkh": _detalle_principal_lkh["gat_fug"], "solo_app": False},
     {"etiqueta": "Vertido Gatún", "app": gat_ver, "lkh": _detalle_principal_lkh["gat_ver"], "solo_app": False},
     {"etiqueta": "ZZ-Flush", "app": dem_flush, "lkh": _detalle_principal_lkh["gat_flush"], "solo_app": False},
-    {"etiqueta": "Evaporación calculada", "app": evap_gat, "lkh": None, "solo_app": True},
+    {"etiqueta": "Evaporación", "app": evap_gat, "lkh": None, "solo_app": True, "fuente_app": evap_fuente_label},
 ]
 
 
-def _seleccionar_flujo_principal(valor_app, valor_lkh, solo_app=False, fuente_lkh=None):
+def _seleccionar_flujo_principal(valor_app, valor_lkh, solo_app=False, fuente_lkh=None, fuente_app=None):
     _app_ok = valor_app is not None and pd.notna(valor_app)
     if solo_app:
-        return (float(valor_app) if _app_ok else None), "App calculado", None, "app"
+        return (float(valor_app) if _app_ok else None), (fuente_app or "App calculado"), None, "app"
     _lkh_ok = valor_lkh is not None and pd.notna(valor_lkh)
     _etiqueta_lkh = fuente_lkh or f"LakeHouse · {dias_kpi_superiores} días"
 
@@ -2183,12 +2386,14 @@ def _tarjeta_flujo_principal(
     nota_app=None,
     nota_lkh=None,
     fuente_lkh=None,
+    fuente_app=None,
 ):
     _hm3, _fuente, _comparacion, _origen = _seleccionar_flujo_principal(
         valor_app,
         valor_lkh,
         solo_app=solo_app,
         fuente_lkh=fuente_lkh,
+        fuente_app=fuente_app,
     )
     if _hm3 is None or pd.isna(_hm3):
         _valor_txt = "N/D"
@@ -2213,6 +2418,7 @@ def _tarjeta_flujo_principal(
             <div class="flow-label">{etiqueta}</div>
             <div class="flow-value">{_valor_txt}</div>
             <div class="flow-conv">{_conversion_txt}</div>
+            <div class="flow-source">{_fuente}</div>
             {_nota_html}
             {_comparacion_html}
         </div>
@@ -2234,6 +2440,7 @@ for _i, _item in enumerate(_detalle_principal_app_alh):
             nota_app=_item.get("nota_app"),
             nota_lkh=_item.get("nota_lkh"),
             fuente_lkh=_item.get("fuente_lkh"),
+            fuente_app=_item.get("fuente_app"),
         )
 
 st.markdown("##### 🌊 Gatún")
@@ -2404,7 +2611,7 @@ if _info_balance_lkh:
         f"promedio **{_info_balance_lkh.get('n_dias', dias_kpi_superiores)} días** · "
         f"último dato **{_fecha_kpi_lkh}**. "
         "Los vertidos Madden y Gatún se inicializan desde `madspill` y `gatspill`; "
-        "la evaporación mostrada y usada en cada embalse se calcula siempre dentro del app."
+        f"la evaporación mostrada y usada en cada embalse proviene de **{evap_fuente_label}**."
     )
 else:
     st.caption("LakeHouse no disponible; el visor mantiene los valores calculados por el app.")
@@ -2491,8 +2698,9 @@ with tabs[0]:
         delta_color="off"
     )
     st.caption(
-        "La evaporación se calcula con la lámina diaria ingresada y el área espejo estimada por nivel operativo. "
-        "Alhajuela inicia con la misma lámina de Gatún, pero puede editarse manualmente."
+        f"Fuente activa: **{evap_fuente_label}**. "
+        "Cuando la fuente entrega lámina, el volumen se calcula con el área espejo activa; "
+        "cuando entrega volumen V Evap 0.85, ese hm³/día entra directamente al balance y la lámina mostrada es equivalente."
     )
 
     st.markdown("---")
@@ -2904,8 +3112,10 @@ with tabs[5]:
 with tabs[6]:
     st.subheader("📐 Área Espejo · Evaporación por Nivel")
     st.caption(
-        "Los niveles se ajustan desde **📍 Niveles Operativos** en el sidebar. "
-        "Fórmula: Vol evaporado (hm³/d) = Lámina (mm/d) × Área (km²) × 10⁻³")
+        f"Fuente activa: **{evap_fuente_label}**. Los niveles se ajustan desde **📍 Niveles Operativos**. "
+        "Para fuentes en mm: Vol (hm³/d) = Lámina (mm/d) × Área (km²) × 10⁻³. "
+        "En modo Aquarius volumen, las láminas mostradas son equivalentes al volumen directo seleccionado."
+    )
 
     # ── Métricas principales ──────────────────────────────────────────────────
     _nv_g   = nivel_gat_op
@@ -3219,8 +3429,14 @@ with tabs[8]:
                 {"Parámetro":"Vertido Gatún","Valor":v_gatun,"Unidad":"cfs"},
                 {"Parámetro":"ZZ-Flush Cocolí","Valor":flush_cc,"Unidad":"hrs"},
                 {"Parámetro":"ZZ-Flush A.Clara","Valor":flush_ac,"Unidad":"hrs"},
+                {"Parámetro":"Fuente evaporación","Valor":evap_fuente_label,"Unidad":""},
+                {"Parámetro":"Detalle evaporación Gatún","Valor":evap_detalle_gat,"Unidad":""},
+                {"Parámetro":"Detalle evaporación Alhajuela","Valor":evap_detalle_alh,"Unidad":""},
                 {"Parámetro":"Evap lámina Gatún","Valor":evap_gat_mm,"Unidad":"mm/día"},
                 {"Parámetro":"Evap lámina Alhajuela","Valor":evap_alh_mm,"Unidad":"mm/día"},
+                {"Parámetro":"Evap volumen Gatún aplicado","Valor":evap_gat,"Unidad":"hm³/día"},
+                {"Parámetro":"Evap volumen Alhajuela aplicado","Valor":evap_alh,"Unidad":"hm³/día"},
+                {"Parámetro":"Evap total aplicado","Valor":evap_tot,"Unidad":"hm³/día"},
                 {"Parámetro":"Área espejo Gatún","Valor":round(area_gat,2),"Unidad":"km²"},
                 {"Parámetro":"Área espejo Alhajuela","Valor":round(area_alh,2),"Unidad":"km²"},
                 {"Parámetro":"Modo área Gatún","Valor":area_modo_gat,"Unidad":""},
@@ -3257,7 +3473,7 @@ with tabs[8]:
                     "Nivel Gatún (ft)": round(_en,2),
                     "Área Daily (km²)": round(_ea,4),
                     "Área Std (km²)":   round(area_desde_nivel_gat(float(_en),daily=False),4),
-                    f"Evap {evap_gat_mm}mm (hm³/d)": round(evap_gat_mm*_ea*1e-3, 5),
+                    f"Evap {evap_gat_mm:.3f} mm eq. (hm³/d)": round(evap_gat_mm*_ea*1e-3, 5),
                 })
             pd.DataFrame(_exp_ae_rows_g).to_excel(
                 writer, sheet_name="Área Espejo Gatún", index=False)
@@ -3271,7 +3487,7 @@ with tabs[8]:
                     "Nivel Alhajuela (ft)": round(_en,2),
                     "Área Daily (km²)":     round(_ea,4),
                     "Área Std (km²)":       round(area_desde_nivel_alh(float(_en),daily=False),4),
-                    f"Evap {evap_alh_mm}mm (hm³/d)": round(evap_alh_mm*_ea*1e-3, 5),
+                    f"Evap {evap_alh_mm:.3f} mm eq. (hm³/d)": round(evap_alh_mm*_ea*1e-3, 5),
                 })
             pd.DataFrame(_exp_ae_rows_a).to_excel(
                 writer, sheet_name="Área Espejo Alhajuela", index=False)
@@ -3639,9 +3855,7 @@ with tabs[9]:
             _escl_hm3 = _mean_col("total_escl_hm3")
         _pot_prom = _promedio_componentes(dv, [("mun_m_hm3", "mun_m", True), ("mun_g_hm3", "mun_g", True)])
         _fug_prom = _promedio_componentes(dv, [("leak_m_hm3", "leak_m", True), ("leak_g_hm3", "leak_g", True)])
-        # La evaporación NO se toma de los campos de volumen del LakeHouse porque pueden venir
-        # vacíos, en cero o desajustados. Se muestra el cálculo activo del app:
-        # lámina mm/día × área del embalse × 0.001.
+        # La evaporación mostrada corresponde a la fuente activa seleccionada en el sidebar.
         _evap_prom = _flow_prom_from_hm3(evap_tot)
         _gen_mwh = 0.0
         _gen_count = 0
@@ -3662,14 +3876,14 @@ with tabs[9]:
         with cD:
             _lkh_card("⚡ Generación", _fmt_lkh(_gen_mw, "MW", 1), "MWh/d ÷ 24 · promedio horario")
         with cE:
-            _lkh_card("☀️ Evaporación", _fmt_lkh(_evap_prom['hm3'] if _evap_prom else None, "hm³/d", 2), f"{_fmt_lkh(_evap_prom['cfs'] if _evap_prom else None, 'cfs', 0)} · App calculado")
+            _lkh_card("☀️ Evaporación", _fmt_lkh(_evap_prom['hm3'] if _evap_prom else None, "hm³/d", 2), f"{_fmt_lkh(_evap_prom['cfs'] if _evap_prom else None, 'cfs', 0)} · {evap_fuente_corta}")
         st.caption(
             f"Esclusajes, potabilización, fugas y generación se calculan con los últimos {dias_sel} registros/días seleccionados del LakeHouse. "
-            "La evaporación se toma del cálculo activo del app por embalse, no de los campos de evaporación del LakeHouse."
+            f"La evaporación usa la fuente activa **{evap_fuente_label}** y se aplica por embalse."
         )
 
-        # --- Salidas de agua por embalse desde LakeHouse + evaporación calculada por el app ---
-        st.markdown("#### 🏔️🌊 Salidas de agua por embalse — LakeHouse + evaporación calculada")
+        # --- Salidas de agua por embalse desde LakeHouse + evaporación de la fuente activa ---
+        st.markdown("#### 🏔️🌊 Salidas de agua por embalse — LakeHouse + evaporación activa")
 
         def _agregar_salida_embalse(rows, embalse, salida, componentes):
             prom = _promedio_componentes(dv, componentes)
@@ -3694,7 +3908,7 @@ with tabs[9]:
                 "Prom hm³/d": prom["hm3"],
                 "Prom cfs": prom["cfs"],
                 "Prom m³/s": prom["m3s"],
-                "Fuente": "App calculado",
+                "Fuente": evap_fuente_label,
             })
 
         salidas_embalse_rows = []
@@ -3735,19 +3949,19 @@ with tabs[9]:
                 _lkh_card(
                     "🏔️ Total Alhajuela",
                     _fmt_lkh(_tot_alh["Prom hm³/d"].iloc[0] if not _tot_alh.empty else None, "hm³/d", 2),
-                    f"{_fmt_lkh(_tot_alh['Prom cfs'].iloc[0] if not _tot_alh.empty else None, 'cfs', 0)} · LakeHouse + evap. app",
+                    f"{_fmt_lkh(_tot_alh['Prom cfs'].iloc[0] if not _tot_alh.empty else None, 'cfs', 0)} · LakeHouse + evap. activa",
                 )
             with e2:
                 _lkh_card(
                     "🌊 Total Gatún",
                     _fmt_lkh(_tot_gat["Prom hm³/d"].iloc[0] if not _tot_gat.empty else None, "hm³/d", 2),
-                    f"{_fmt_lkh(_tot_gat['Prom cfs'].iloc[0] if not _tot_gat.empty else None, 'cfs', 0)} · LakeHouse + evap. app",
+                    f"{_fmt_lkh(_tot_gat['Prom cfs'].iloc[0] if not _tot_gat.empty else None, 'cfs', 0)} · LakeHouse + evap. activa",
                 )
             with e3:
                 _lkh_card(
                     "💧 Total sistema",
                     _fmt_lkh(tot_sistema["Prom hm³/d"], "hm³/d", 2),
-                    f"{_fmt_lkh(tot_sistema['Prom cfs'], 'cfs', 0)} · suma LakeHouse + evap. app",
+                    f"{_fmt_lkh(tot_sistema['Prom cfs'], 'cfs', 0)} · suma LakeHouse + evap. activa",
                 )
 
             st.dataframe(df_sal_emb, use_container_width=True, hide_index=True)
@@ -3770,7 +3984,7 @@ with tabs[9]:
                 margin=dict(t=70, b=90),
             )
             st.plotly_chart(fig_sal_emb, use_container_width=True)
-            st.caption("La tabla separa las salidas por embalse. La evaporación no usa el volumen del LakeHouse; se muestra como **App calculado** a partir de la lámina y área activa del embalse.")
+            st.caption(f"La tabla separa las salidas por embalse. La evaporación corresponde a **{evap_fuente_label}**.")
         else:
             st.info("No se encontraron columnas suficientes en el LakeHouse para separar las salidas por embalse.")
 
@@ -3898,13 +4112,13 @@ with tabs[9]:
         _add_sal_row("Vertido Gatún", [(None, "vert_g")], "LakeHouse")
         _add_sal_row("Vertido Madden", [("vert_m_hm3", None)], "LakeHouse cfs")
 
-        # Evaporación: se calcula desde el app, no desde LakeHouse.
+        # Evaporación: usa la fuente activa seleccionada en el sidebar.
         for _label, _hm3_app in [("Evaporación Gatún", evap_gat), ("Evaporación Alhajuela", evap_alh)]:
             _prom_app = _flow_prom_from_hm3(_hm3_app)
             if _prom_app is not None:
                 sal_rows.append({
                     "Parámetro": _label,
-                    "Fuente": "App calculado",
+                    "Fuente": evap_fuente_label,
                     "Prom hm³/d": _prom_app["hm3"],
                     "Prom cfs": _prom_app["cfs"],
                     "Prom m³/s": _prom_app["m3s"],
@@ -3912,7 +4126,7 @@ with tabs[9]:
 
         if sal_rows:
             st.dataframe(pd.DataFrame(sal_rows), use_container_width=True, hide_index=True)
-            st.caption("Potabilización y fugas priorizan MCF/MPC y usan *_hm3 solo como respaldo. La evaporación se calcula con el app. El vertido Madden `madspill` se interpreta como MPC/MCF por día.")
+            st.caption(f"Potabilización y fugas priorizan MCF/MPC y usan *_hm3 solo como respaldo. La evaporación usa **{evap_fuente_label}**. El vertido Madden `madspill` se interpreta como MPC/MCF por día.")
 
         # --- Generación ---
         st.markdown("#### ⚡ Generación hidroeléctrica")
@@ -4102,7 +4316,7 @@ with tabs[10]:
         <div class="lkh-card">
             <div class="label">Evaporación Gatún</div>
             <div class="value">{evap_gat:.3f}</div>
-            <div class="sub">hm³/d · {evap_gat_mm:.2f} mm/día.</div>
+            <div class="sub">hm³/d · {evap_gat_mm:.2f} mm/día · {evap_fuente_corta}.</div>
         </div>
         """, unsafe_allow_html=True)
     with c5:
@@ -4110,7 +4324,7 @@ with tabs[10]:
         <div class="lkh-card">
             <div class="label">Evaporación Alhajuela</div>
             <div class="value">{evap_alh:.3f}</div>
-            <div class="sub">hm³/d · {evap_alh_mm:.2f} mm/día.</div>
+            <div class="sub">hm³/d · {evap_alh_mm:.2f} mm/día · {evap_fuente_corta}.</div>
         </div>
         """, unsafe_allow_html=True)
     with c6:
@@ -4143,7 +4357,7 @@ with tabs[10]:
         {"Elemento": "Tránsitos", "Criterio": "PNX y NPX se promedian entre complejos para evitar duplicar el tránsito; el total se muestra con 3 cifras significativas."},
         {"Elemento": "Potabilización y fugas", "Criterio": "Se priorizan columnas MCF/MPC del LakeHouse; *_hm3 se usa como respaldo."},
         {"Elemento": "Vertidos", "Criterio": "`madspill` y `gatspill` del LakeHouse se convierten de MPC/MCF por día a cfs y cargan los controles editables de Madden y Gatún."},
-        {"Elemento": "Evaporación", "Criterio": "No se toma del LakeHouse. Se calcula como lámina mm/día × área km² × 0.001."},
+        {"Elemento": "Evaporación", "Criterio": "Se selecciona Manual, Aquarius lámina (CZL/PMG) o Aquarius volumen V Evap 0.85 (GAT/MAD). La fuente activa alimenta todo el balance."},
         {"Elemento": "Unidad visual", "Criterio": "Cambiar hm³/día, cfs o m³/s solo cambia la visualización; el cálculo base queda en hm³/día."},
     ])
     st.dataframe(reglas, use_container_width=True, hide_index=True)
@@ -4184,7 +4398,7 @@ with tabs[10]:
         {"Situación": "El total de tránsitos no es el esperado", "Solución": "Revise por separado Panamax (PNX) y NeoPanamax (NPX) en el sidebar. El total es la suma de ambos."},
         {"Situación": "Potable o fugas se ven altos", "Solución": "Revise columnas MCF/MPC (`munic_*`, `leak_*`). La app las prioriza sobre *_hm3."},
         {"Situación": "Vertido fondo Madden no coincide", "Solución": "Verifique `madspill`: debe estar en MPC/MCF por día; la app lo convierte directamente a hm³/día."},
-        {"Situación": "Evaporación no coincide con LakeHouse", "Solución": "La evaporación se calcula dentro del app con lámina y área, no con el volumen del LakeHouse."},
+        {"Situación": "Evaporación no coincide", "Solución": "Revise la fuente activa. Manual usa lámina y área; Aquarius mm usa CZL/PMG; Aquarius volumen usa V Evap 0.85 de GAT/MAD directamente."},
     ])
     st.dataframe(problemas, use_container_width=True, hide_index=True)
 
