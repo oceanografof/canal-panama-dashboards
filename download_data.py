@@ -132,25 +132,43 @@ SENSITIVE_REGEXES = [
 SERIES_CONFIG = [
     {
         "station": "TstCHCP_AT",
-        "dataset": "Discharge.AT_GAT_Diario@TstCHCP_AT",
+        # Aportes diarios GAT en m³/s, según URL Aquarius indicada.
+        # Se mantiene el mismo archivo de salida para no romper el app.
+        "dataset": "Discharge.AT_GAT_Diario(m^3/s)@TstCHCP_AT",
         "calculation": "Instantaneous",
-        "unit_id": 218,
+        "unit_id": 193,
         "interval": "PointsAsRecorded",
         "time_aligned": "True",
+        "date_range": "EntirePeriodOfRecord",
+        "calendar": "CALENDARYEAR",
         "out_name": "Discharge_AT_GAT_Diario.csv",
-        "label": "Caudal AT GAT Diario @ TstCHCP_AT",
-        "kind_keywords": ["Discharge.AT_GAT_Diario", "AT_GAT_Diario"],
+        "label": "Aporte diario GAT en m³/s @ TstCHCP_AT",
+        "kind_keywords": [
+            "Discharge.AT_GAT_Diario(m^3/s)",
+            "Discharge.AT_GAT_Diario",
+            "AT_GAT_Diario",
+            "TstCHCP_AT",
+        ],
     },
     {
         "station": "TstCHCP_AT",
-        "dataset": "Discharge.AT_ALHA_Diario@TstCHCP_AT",
+        # Aportes diarios ALHA en m³/s, según URL Aquarius indicada.
+        # Se mantiene el mismo archivo de salida para no romper el app.
+        "dataset": "Discharge.AT_ALHA_Diario(m^3/s)@TstCHCP_AT",
         "calculation": "Instantaneous",
-        "unit_id": 218,
+        "unit_id": 193,
         "interval": "PointsAsRecorded",
         "time_aligned": "True",
+        "date_range": "EntirePeriodOfRecord",
+        "calendar": "CALENDARYEAR",
         "out_name": "Discharge_AT_ALHA_Diario.csv",
-        "label": "Caudal AT ALHA Diario @ TstCHCP_AT",
-        "kind_keywords": ["Discharge.AT_ALHA_Diario", "AT_ALHA_Diario"],
+        "label": "Aporte diario ALHA en m³/s @ TstCHCP_AT",
+        "kind_keywords": [
+            "Discharge.AT_ALHA_Diario(m^3/s)",
+            "Discharge.AT_ALHA_Diario",
+            "AT_ALHA_Diario",
+            "TstCHCP_AT",
+        ],
     },
     {
         "station": "GAT",
