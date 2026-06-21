@@ -74,6 +74,23 @@ DATA_DIR_NAME = "data"
 CFS_TO_M3S     = 0.028316846592
 CFS_TO_HM3_DAY = CFS_TO_M3S * 86400 / 1_000_000
 
+# Evaporación automática: misma referencia de área usada por defecto en app_demandas.
+# La lámina diaria de cada estación se corrige con el coeficiente 0.85.
+EVAP_COEFFICIENT = 0.85
+EVAP_AREA_GAT_KM2 = 425.0   # Gatún
+EVAP_AREA_ALH_KM2 = 49.0    # Alhajuela / Madden
+EVAP_SERIES_PATTERNS: Dict[str, List[str]] = {
+    "CZL": ["Evapo_Rate_Daily_Tank_CZL*.csv", "*Evapo*CZL*.csv"],
+    "PMG": ["Evapo_Rate_Daily_Tank_PMG*.csv", "*Evapo*PMG*.csv"],
+}
+
+# Ajuste morfológico de AP DSS: usa la forma del hidrograma observado de
+# los últimos días de mayo, pero conserva el volumen/promedio de cada semana
+# operativa DSS. Semana operativa: sábado a viernes.
+AP_HYDROGRAPH_ADJUSTMENT_ENABLED = True
+AP_MAY_HYDROGRAPH_DAYS = 7
+AP_MAY_HYDROGRAPH_MIN_DAYS = 3
+
 PERCENTILE_ORDER = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95]
 EXCEEDANCE_COLORS = {
     95: "#001f5b", 90: "#003f88", 80: "#005f99", 70: "#0077b6",
@@ -295,6 +312,128 @@ def read_first_local(candidates: List[str]) -> Tuple[Optional[bytes], Optional[P
             return data, fp
 
     return None, None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Series de evaporación CZL / PMG
+# ─────────────────────────────────────────────────────────────────────
+def _normalizar_columna(nombre: object) -> str:
+    s = str(nombre).strip().lower()
+    return s.translate(str.maketrans("áéíóúüñ", "aeiouun"))
+
+
+@st.cache_data(show_spinner=False)
+def read_evap_rate_csv(file_bytes: bytes, filename: str = "") -> Tuple[Optional[pd.Timestamp], Optional[float]]:
+    """Lee una serie diaria de evaporación y devuelve su último valor válido en mm/día.
+
+    Formato esperado: fecha_inicio, fecha_fin, valor_raw. También acepta nombres
+    equivalentes de fecha/valor y separadores coma o punto y coma.
+    """
+    if not file_bytes:
+        return None, None
+    try:
+        text_csv = file_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text_csv = file_bytes.decode("latin-1", errors="replace")
+
+    try:
+        sep = ";" if text_csv[:4000].count(";") > text_csv[:4000].count(",") else ","
+        df = pd.read_csv(StringIO(text_csv), sep=sep)
+    except Exception:
+        return None, None
+    if df.empty:
+        return None, None
+
+    cols = list(df.columns)
+    norm = {_normalizar_columna(c): c for c in cols}
+
+    date_col = None
+    for wanted in ("fecha_inicio", "fecha", "timestamp", "date", "time"):
+        for n, original in norm.items():
+            if wanted in n:
+                parsed = pd.to_datetime(df[original], errors="coerce")
+                if parsed.notna().any():
+                    date_col = original
+                    break
+        if date_col is not None:
+            break
+
+    value_col = None
+    for wanted in ("valor_raw", "valor", "value", "evapo", "evap"):
+        for n, original in norm.items():
+            if original == date_col:
+                continue
+            if wanted in n:
+                parsed = pd.to_numeric(
+                    df[original].astype(str).str.replace(",", ".", regex=False).str.strip(),
+                    errors="coerce",
+                )
+                if parsed.notna().any():
+                    value_col = original
+                    break
+        if value_col is not None:
+            break
+
+    if date_col is None or value_col is None:
+        return None, None
+
+    out = pd.DataFrame({
+        "Fecha": pd.to_datetime(df[date_col], errors="coerce"),
+        "mm_dia": pd.to_numeric(
+            df[value_col].astype(str).str.replace(",", ".", regex=False).str.strip(),
+            errors="coerce",
+        ),
+    }).dropna(subset=["Fecha", "mm_dia"])
+    out = out[out["mm_dia"] >= 0].sort_values("Fecha")
+    if out.empty:
+        return None, None
+    last = out.iloc[-1]
+    return pd.to_datetime(last["Fecha"]), float(last["mm_dia"])
+
+
+def latest_evap_series(station: str) -> Dict[str, object]:
+    """Busca la serie local más actualizada y devuelve fecha, mm/día y archivo."""
+    station = station.upper().strip()
+    patterns = EVAP_SERIES_PATTERNS.get(station, [f"*{station}*.csv"])
+    files: Dict[Path, Path] = {}
+    for base in local_search_dirs():
+        for pattern in patterns:
+            for fp in base.glob(pattern):
+                try:
+                    if fp.exists() and fp.is_file() and not fp.name.startswith("."):
+                        files[fp.resolve()] = fp
+                except OSError:
+                    continue
+
+    best: Optional[Dict[str, object]] = None
+    for fp in files.values():
+        try:
+            date_value, mm_day = read_evap_rate_csv(fp.read_bytes(), fp.name)
+        except Exception:
+            continue
+        if date_value is None or mm_day is None:
+            continue
+        item = {"date": date_value, "mm_day": float(mm_day), "file": fp.name}
+        if best is None or pd.to_datetime(item["date"]) > pd.to_datetime(best["date"]):
+            best = item
+    return best or {"date": None, "mm_day": None, "file": None}
+
+
+def evap_mm_to_flows(mm_day: float, area_km2: float, coefficient: float = EVAP_COEFFICIENT) -> Dict[str, float]:
+    """Convierte lámina evaporada a hm³/día y p³/s.
+
+    hm³/día = mm/día × área(km²) × coeficiente × 0.001
+    """
+    try:
+        mm = max(float(mm_day), 0.0)
+        area = max(float(area_km2), 0.0)
+        coef = max(float(coefficient), 0.0)
+    except Exception:
+        mm = area = coef = 0.0
+    hm3_day = mm * area * coef * 0.001
+    cfs = hm3_day / CFS_TO_HM3_DAY if CFS_TO_HM3_DAY > 0 else 0.0
+    return {"mm_day": mm, "area_km2": area, "coefficient": coef,
+            "hm3_day": hm3_day, "cfs": cfs}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -745,6 +884,147 @@ def to_daily(df: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
     return daily.sort_values("Fecha_dia")
 
 
+def _ap_operational_week_start(date_series: pd.Series) -> pd.Series:
+    """Inicio de semana operativa DSS para AP: sábado a viernes."""
+    dt = pd.to_datetime(date_series, errors="coerce").dt.normalize()
+    offset_days = (dt.dt.weekday - 5) % 7  # sábado=0, domingo=1, ..., viernes=6
+    return dt - pd.to_timedelta(offset_days, unit="D")
+
+
+def _ap_operational_week_pos(date_series: pd.Series) -> pd.Series:
+    """Posición dentro de la semana operativa DSS: sábado=0 ... viernes=6."""
+    dt = pd.to_datetime(date_series, errors="coerce").dt.normalize()
+    return ((dt.dt.weekday - 5) % 7).astype("Int64")
+
+
+def _last_may_hydrograph_factors(obs_aportes: Optional[pd.DataFrame]) -> Tuple[Dict[int, float], Dict[str, object]]:
+    """Calcula factores de forma usando el hidrograma observado de fin de mayo.
+
+    Los factores representan la distribución diaria relativa del hidrograma de
+    los últimos días disponibles de mayo. Luego se aplican al AP DSS y se
+    renormalizan por semana para que el promedio/volumen semanal DSS no cambie.
+    """
+    meta: Dict[str, object] = {
+        "ap_may_adjustment": False,
+        "reason": "sin datos observados de aporte",
+    }
+    if not _valid_df(obs_aportes) or "Fecha_dia" not in obs_aportes.columns or "Valor" not in obs_aportes.columns:
+        return {}, meta
+
+    obs = obs_aportes[["Fecha_dia", "Valor"]].copy()
+    obs["Fecha_dia"] = pd.to_datetime(obs["Fecha_dia"], errors="coerce").dt.normalize()
+    obs["Valor"] = pd.to_numeric(obs["Valor"], errors="coerce")
+    obs = obs.dropna(subset=["Fecha_dia", "Valor"])
+    obs = obs[obs["Valor"] > 0].sort_values("Fecha_dia")
+    obs = obs[obs["Fecha_dia"].dt.month == 5]
+    if obs.empty:
+        meta["reason"] = "sin aportes observados en mayo"
+        return {}, meta
+
+    # Usar el último año con datos de mayo, para no mezclar años.
+    latest_year = int(obs["Fecha_dia"].dt.year.max())
+    obs = obs[obs["Fecha_dia"].dt.year == latest_year]
+    obs = obs.groupby("Fecha_dia", as_index=False).agg(Valor=("Valor", "mean"))
+    last_date = obs["Fecha_dia"].max()
+    start_date = last_date - pd.Timedelta(days=AP_MAY_HYDROGRAPH_DAYS - 1)
+    obs = obs[obs["Fecha_dia"] >= start_date].copy()
+
+    if obs["Fecha_dia"].nunique() < AP_MAY_HYDROGRAPH_MIN_DAYS:
+        meta.update({
+            "reason": f"menos de {AP_MAY_HYDROGRAPH_MIN_DAYS} días válidos de mayo",
+            "may_year": latest_year,
+            "may_days": int(obs["Fecha_dia"].nunique()),
+        })
+        return {}, meta
+
+    mean_val = float(obs["Valor"].mean())
+    if not np.isfinite(mean_val) or mean_val <= 0:
+        meta["reason"] = "promedio de aporte observado inválido"
+        return {}, meta
+
+    obs["week_pos"] = _ap_operational_week_pos(obs["Fecha_dia"]).astype(int)
+    factors_s = obs.groupby("week_pos")["Valor"].mean() / mean_val
+    factors = {int(k): float(v) for k, v in factors_s.items() if np.isfinite(v) and v > 0}
+    if not factors:
+        meta["reason"] = "factores de hidrograma inválidos"
+        return {}, meta
+
+    meta.update({
+        "ap_may_adjustment": True,
+        "reason": "ok",
+        "may_year": latest_year,
+        "may_start": pd.to_datetime(obs["Fecha_dia"].min()),
+        "may_end": pd.to_datetime(obs["Fecha_dia"].max()),
+        "may_days": int(obs["Fecha_dia"].nunique()),
+        "factor_min": float(min(factors.values())),
+        "factor_max": float(max(factors.values())),
+    })
+    return factors, meta
+
+
+def apply_may_hydrograph_ap_adjustment(
+    daily: pd.DataFrame,
+    cfg: Dict,
+    obs_aportes: Optional[pd.DataFrame] = None,
+    enabled: bool = AP_HYDROGRAPH_ADJUSTMENT_ENABLED,
+) -> pd.DataFrame:
+    """Ajusta la forma diaria del AP DSS con el hidrograma observado de mayo.
+
+    Importante: no cambia el volumen/promedio semanal del DSS. Para cada columna
+    AP y cada semana operativa sábado-viernes, se redistribuye la forma diaria y
+    luego se reescala para que la suma semanal quede igual que en el DSS original.
+    """
+    if not enabled or daily is None or daily.empty:
+        return daily
+
+    ap_cols = cols_by_prefix(daily, "AP", cfg.get("token", ""))
+    if not ap_cols:
+        return daily
+
+    factors, meta = _last_may_hydrograph_factors(obs_aportes)
+    if not factors:
+        out = daily.copy()
+        out.attrs.update(meta)
+        return out
+
+    out = daily.copy()
+    out["Fecha_dia"] = pd.to_datetime(out["Fecha_dia"], errors="coerce").dt.normalize()
+    week_start = _ap_operational_week_start(out["Fecha_dia"])
+    week_pos = _ap_operational_week_pos(out["Fecha_dia"])
+    factor_series = week_pos.map(factors).astype(float).fillna(1.0)
+
+    for col in ap_cols:
+        raw = pd.to_numeric(out[col], errors="coerce")
+        shaped = raw * factor_series
+        raw_week_sum = raw.groupby(week_start).transform("sum")
+        shaped_week_sum = shaped.groupby(week_start).transform("sum")
+        scale = pd.Series(1.0, index=out.index)
+        valid = shaped_week_sum.replace(0, np.nan).notna() & raw_week_sum.notna()
+        scale.loc[valid] = raw_week_sum.loc[valid] / shaped_week_sum.loc[valid]
+        adjusted = shaped * scale
+        out[col] = adjusted.where(raw.notna(), raw)
+
+    out.attrs.update(meta)
+    return out
+
+
+def _show_ap_may_adjustment_note(df: pd.DataFrame, res_key: str, location: str = "") -> None:
+    """Muestra una nota breve si el AP DSS fue redistribuido con el hidrograma de mayo."""
+    try:
+        meta = getattr(df, "attrs", {}) or {}
+        if not meta.get("ap_may_adjustment"):
+            return
+        start = pd.to_datetime(meta.get("may_start"))
+        end = pd.to_datetime(meta.get("may_end"))
+        st.caption(
+            f"Ajuste AP DSS activo{(' · ' + location) if location else ''}: se usa la forma del hidrograma observado "
+            f"de mayo ({start:%d-%m-%Y} a {end:%d-%m-%Y}) y se conserva la suma semanal DSS "
+            f"por semana operativa sábado-viernes."
+        )
+    except Exception:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Conversión de unidades
 # ─────────────────────────────────────────────────────────────────────
@@ -785,9 +1065,15 @@ def ap_total_dss_cfs(ap_neto_cfs, evap_cfs: float) -> pd.Series:
     """AP total DSS estimado = AP neto DSS + caudal evaporado.
 
     Acepta escalares o Series y retorna una Series numérica en p³/s.
+    Blindaje operativo: la evaporación siempre entra como término positivo,
+    por lo que el AP total DSS nunca se calcula restando evaporación.
     """
-    ap = pd.to_numeric(pd.Series(ap_neto_cfs), errors="coerce")
-    return ap + clean_evap_cfs(evap_cfs)
+    if isinstance(ap_neto_cfs, pd.Series):
+        ap = pd.to_numeric(ap_neto_cfs, errors="coerce").copy()
+    else:
+        ap = pd.to_numeric(pd.Series(ap_neto_cfs), errors="coerce")
+    evap = clean_evap_cfs(evap_cfs)
+    return ap + evap
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1009,16 +1295,78 @@ def sidebar() -> Dict:
     )
 
     st.sidebar.header("🌫️ Caudal evaporado para ajuste AP DSS")
-    evap_gat_cfs = st.sidebar.number_input(
-        "Evaporación GAT (p³/s)",
-        min_value=0.0, value=0.0, step=10.0, format="%.3f",
-        help="Se suma al AP neto DSS de Gatún para estimar AP total DSS."
+    evap_mode = st.sidebar.radio(
+        "Fuente de evaporación",
+        ["Automática · último valor CZL/PMG", "Manual · p³/s"],
+        index=0,
+        key="evap_source_mode",
+        help=(
+            "Automática: usa el último valor válido de Corozal (CZL) para Gatún y "
+            "Pedro Miguel (PMG) para Alhajuela. Manual: permite ingresar el caudal en p³/s."
+        ),
     )
-    evap_alh_cfs = st.sidebar.number_input(
-        "Evaporación ALHA (p³/s)",
-        min_value=0.0, value=0.0, step=10.0, format="%.3f",
-        help="Se suma al AP neto DSS de Alhajuela/Madden para estimar AP total DSS."
-    )
+
+    evap_gat_meta: Dict[str, object] = {"mode": evap_mode}
+    evap_alh_meta: Dict[str, object] = {"mode": evap_mode}
+
+    if evap_mode.startswith("Automática"):
+        gat_series = latest_evap_series("CZL")
+        alh_series = latest_evap_series("PMG")
+
+        if gat_series.get("mm_day") is not None:
+            gat_calc = evap_mm_to_flows(float(gat_series["mm_day"]), EVAP_AREA_GAT_KM2)
+            evap_gat_cfs = float(gat_calc["cfs"])
+            evap_gat_meta.update(gat_series)
+            evap_gat_meta.update(gat_calc)
+            st.sidebar.markdown(
+                f"**Gatún · Corozal (CZL)**  \n"
+                f"{gat_calc['mm_day']:.3f} mm/día · {gat_calc['hm3_day']:.4f} hm³/día · "
+                f"**{gat_calc['cfs']:.3f} p³/s**"
+            )
+            st.sidebar.caption(
+                f"Fecha: {pd.to_datetime(gat_series['date']):%d-%m-%Y} · "
+                f"Área: {EVAP_AREA_GAT_KM2:.1f} km² · Archivo: {gat_series['file']}"
+            )
+        else:
+            evap_gat_cfs = 0.0
+            st.sidebar.warning("No se encontró una serie válida de evaporación CZL para Gatún.")
+
+        if alh_series.get("mm_day") is not None:
+            alh_calc = evap_mm_to_flows(float(alh_series["mm_day"]), EVAP_AREA_ALH_KM2)
+            evap_alh_cfs = float(alh_calc["cfs"])
+            evap_alh_meta.update(alh_series)
+            evap_alh_meta.update(alh_calc)
+            st.sidebar.markdown(
+                f"**Alhajuela · Pedro Miguel (PMG)**  \n"
+                f"{alh_calc['mm_day']:.3f} mm/día · {alh_calc['hm3_day']:.4f} hm³/día · "
+                f"**{alh_calc['cfs']:.3f} p³/s**"
+            )
+            st.sidebar.caption(
+                f"Fecha: {pd.to_datetime(alh_series['date']):%d-%m-%Y} · "
+                f"Área: {EVAP_AREA_ALH_KM2:.1f} km² · Archivo: {alh_series['file']}"
+            )
+        else:
+            evap_alh_cfs = 0.0
+            st.sidebar.warning("No se encontró una serie válida de evaporación PMG para Alhajuela.")
+
+        st.sidebar.caption(
+            "Fórmula automática: hm³/día = mm/día × área (km²) × 0.85 × 0.001. "
+            "Luego se convierte a p³/s."
+        )
+    else:
+        evap_gat_cfs = st.sidebar.number_input(
+            "Evaporación GAT (p³/s)",
+            min_value=0.0, value=0.0, step=10.0, format="%.3f",
+            help="Se suma al AP neto DSS de Gatún para estimar AP total DSS."
+        )
+        evap_alh_cfs = st.sidebar.number_input(
+            "Evaporación ALHA (p³/s)",
+            min_value=0.0, value=0.0, step=10.0, format="%.3f",
+            help="Se suma al AP neto DSS de Alhajuela/Madden para estimar AP total DSS."
+        )
+        evap_gat_meta.update({"cfs": float(evap_gat_cfs), "source": "Manual"})
+        evap_alh_meta.update({"cfs": float(evap_alh_cfs), "source": "Manual"})
+
     st.sidebar.caption("AP total DSS estimado = AP neto DSS + caudal evaporado.")
 
     st.sidebar.header("📖 Glosario")
@@ -1048,6 +1396,9 @@ def sidebar() -> Dict:
         "pct_ref": int(pct_ref_gat),
         "evap_gat_cfs": float(evap_gat_cfs),
         "evap_alh_cfs": float(evap_alh_cfs),
+        "evap_mode": evap_mode,
+        "evap_gat_meta": evap_gat_meta,
+        "evap_alh_meta": evap_alh_meta,
     }
 
 
@@ -1296,6 +1647,7 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
         return
 
     daily = to_daily(dss_raw, cfg)
+    daily = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_aportes)
     if daily.empty:
         st.warning("No se pudo construir el diario DSS.")
         return
@@ -1311,6 +1663,7 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
                        f"{last.iloc[-1]['Fecha_dia']:%d-%m-%Y} · {last.iloc[-1]['Valor']:,.3f} ft")
 
     show_aporte_reservoir_metrics(filtered, cfg, flow_unit, pct_ref, obs_aportes, evap_cfs)
+    _show_ap_may_adjustment_note(filtered, res_key, "pestaña del embalse")
     st.markdown("---")
 
     token = cfg["token"]
@@ -1464,8 +1817,19 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
     # --- Tabla diaria ---
     st.markdown("### 📋 Tabla diaria DSS")
     with st.expander("Ver tabla", expanded=False):
-        st.dataframe(filtered, use_container_width=True, height=420)
-        csv = filtered.to_csv(index=False).encode("utf-8-sig")
+        table_df = filtered.copy()
+        if ap_cols:
+            ap_pct_map_table = ordered_percentile_map_by_value(table_df, ap_cols)
+            for c in ap_cols:
+                if c not in table_df.columns:
+                    continue
+                pct = ap_pct_map_table.get(c, exceedance_pct(c))
+                total_cfs = ap_total_dss_cfs(table_df[c], evap_cfs)
+                table_df[f"AP total DSS P{pct} (p³/s)"] = total_cfs
+                table_df[f"AP total DSS P{pct} ({unit_label(flow_unit)})"] = convert_flow(total_cfs, flow_unit)
+            table_df["Evaporación sumada AP DSS (p³/s)"] = clean_evap_cfs(evap_cfs)
+        st.dataframe(table_df, use_container_width=True, height=420)
+        csv = table_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(f"⬇️ Descargar CSV — {cfg['name']}",
                            csv, f"{res_key}_dss_diario.csv", "text/csv", key=f"{res_key}_dl")
 
@@ -1494,7 +1858,11 @@ def _semaforo(diff_abs: float, warn: float, alert: float) -> str:
 
 
 def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: int,
-               obs_gat: Optional[pd.DataFrame], obs_alh: Optional[pd.DataFrame]) -> None:
+               obs_gat: Optional[pd.DataFrame], obs_alh: Optional[pd.DataFrame],
+               obs_gat_aporte: Optional[pd.DataFrame] = None,
+               obs_alh_aporte: Optional[pd.DataFrame] = None,
+               evap_gat_cfs: float = 0.0,
+               evap_alh_cfs: float = 0.0) -> None:
     st.subheader("🧭 Manejo de embalses — apoyo a la decisión")
     st.caption(
         f"{PROJ_NOTE} · Gatún y Alhajuela/Madden se evalúan por separado. "
@@ -1520,12 +1888,17 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
 
     rows = []
     ts_map = {}
-    for res_key, obs_df in [("gatun", obs_gat), ("alhajuela", obs_alh)]:
+    for res_key, obs_df, obs_ap_df in [
+        ("gatun", obs_gat, obs_gat_aporte),
+        ("alhajuela", obs_alh, obs_alh_aporte),
+    ]:
         cfg = RESERVOIR_CONFIG[res_key]
         pct_ref = int(pct_ref_gat if res_key == "gatun" else pct_ref_alh)
+        evap_cfs = clean_evap_cfs(evap_gat_cfs if res_key == "gatun" else evap_alh_cfs)
         try:
             raw    = load_dss_sheet(dss_bytes, cfg["sheet"])
             daily  = to_daily(raw, cfg)
+            daily  = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_ap_df)
         except Exception as exc:
             st.warning(f"{cfg['name']}: error DSS — {exc}")
             continue
@@ -1568,7 +1941,7 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
         row_dss = exact.iloc[0] if not exact.empty else base.loc[(base["Fecha_dia"] - ref_date).abs().idxmin()]
 
         np_v  = float(row_dss.get(np_col, np.nan))  if np_col  else np.nan
-        ap_v  = convert_flow(pd.Series([float(row_dss.get(ap_col, np.nan))]), flow_unit).iloc[0] if ap_col else np.nan
+        ap_v  = convert_flow(ap_total_dss_cfs([row_dss.get(ap_col, np.nan)], evap_cfs), flow_unit).iloc[0] if ap_col else np.nan
         v_v   = convert_flow(pd.Series([float(row_dss.get(v_col, np.nan))]), flow_unit).iloc[0]  if v_col  else np.nan
         hp_v  = float(row_dss.get(hp_col, np.nan))  if hp_col  else np.nan
 
@@ -1585,7 +1958,7 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
         future = base[base["Fecha_dia"] >= today_dt].head(horizon)
         if future.empty:
             future = base.tail(horizon)
-        ap_prom = convert_flow(future[ap_col], flow_unit).mean() if ap_col and ap_col in future else np.nan
+        ap_prom = convert_flow(ap_total_dss_cfs(future[ap_col], evap_cfs), flow_unit).mean() if ap_col and ap_col in future else np.nan
         v_prom  = convert_flow(future[v_col], flow_unit).mean()  if v_col and v_col in future else np.nan
         hp_prom = future[hp_col].mean() if hp_col and hp_col in future else np.nan
         np_start = float(future[np_col].iloc[0])  if np_col and np_col in future and not future.empty else np.nan
@@ -1601,14 +1974,14 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
             "Fecha obs.":                f"{obs_date:%d-%m-%Y}" if obs_date else "—",
             "Percentil referencia":      f"P{pct_ref}",
             "Nivel DSS usado (ft)":      _fmt(np_v),
-            f"Aporte DSS usado ({unit_label(flow_unit)})": _fmt(ap_v, 2),
+            f"AP total DSS usado ({unit_label(flow_unit)})": _fmt(ap_v, 2),
             f"Vertido DSS usado ({unit_label(flow_unit)})": _fmt(v_v, 2),
             "Hidrogeneración DSS usada (MW)": _fmt(hp_v, 2),
-            "Series DSS usadas":         f"NP P{np_pct if np_pct is not None else '—'} · AP P{ap_pct if ap_pct is not None else '—'} · V P{v_pct if v_pct is not None else '—'} · HP P{hp_pct if hp_pct is not None else '—'}",
+            "Series DSS usadas":         f"NP P{np_pct if np_pct is not None else '—'} · AP total P{ap_pct if ap_pct is not None else '—'} (+{evap_cfs:,.1f} p³/s evap.) · V P{v_pct if v_pct is not None else '—'} · HP P{hp_pct if hp_pct is not None else '—'}",
             "Percentil nivel cercano":   closest["label"] if closest else "—",
             "Umbral embalse (ft)":       _fmt(threshold_ft, 3),
             "Δ Obs-NP (ft)":             _fmt(diff_np, 3),
-            f"AP prom. {horizon}d ({unit_label(flow_unit)})": _fmt(ap_prom, 2),
+            f"AP total prom. {horizon}d ({unit_label(flow_unit)})": _fmt(ap_prom, 2),
             f"V prom. {horizon}d ({unit_label(flow_unit)})":  _fmt(v_prom, 2),
             f"HP prom. {horizon}d (MW)": _fmt(hp_prom, 2),
             f"NP inicio horiz. (ft)":    _fmt(np_start, 3),
@@ -1616,6 +1989,7 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
             f"Δ NP horiz. (ft)":         _fmt(np_end - np_start, 3) if pd.notna(np_start) and pd.notna(np_end) else "—",
         })
         ts_map[cfg["name"]] = (daily, obs_df, cfg)
+        _show_ap_may_adjustment_note(daily, res_key, "manejo/decisión")
 
     if rows:
         st.markdown("#### Estado ejecutivo")
@@ -1839,6 +2213,7 @@ def tab_aporte_obs_embalse(
     try:
         raw = load_dss_sheet(dss_bytes, cfg["sheet"])
         daily = to_daily(raw, cfg)
+        daily = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_df)
     except Exception as exc:
         st.error(f"Error cargando DSS {embalse}: {exc}")
         return
@@ -1859,6 +2234,7 @@ def tab_aporte_obs_embalse(
         f"Caudal evaporado aplicado desde la barra lateral: **{clean_evap_cfs(evap_cfs):,.3f} p³/s**. "
         f"Fórmula: **AP total DSS estimado = AP neto DSS + caudal evaporado**."
     )
+    _show_ap_may_adjustment_note(daily, res_key, "aportes observados")
 
     # Período recomendado: si hay observado, enfocar la gráfica alrededor del observado.
     date_parts = [daily["Fecha_dia"]]
@@ -2239,6 +2615,8 @@ def tab_comparativo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_
 
     gat_d = to_daily(gat_raw, RESERVOIR_CONFIG["gatun"])
     alh_d = to_daily(alh_raw, RESERVOIR_CONFIG["alhajuela"])
+    gat_d = apply_may_hydrograph_ap_adjustment(gat_d, RESERVOIR_CONFIG["gatun"], obs_gat_aporte)
+    alh_d = apply_may_hydrograph_ap_adjustment(alh_d, RESERVOIR_CONFIG["alhajuela"], obs_alh_aporte)
     if gat_d.empty or alh_d.empty:
         st.warning("No hay datos DSS suficientes para el comparativo.")
         return
@@ -2273,6 +2651,8 @@ def tab_comparativo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_
         gat_cols = [c for c in gat_cols_all if exceedance_pct(c) in pcts]
         alh_cols = [c for c in alh_cols_all if exceedance_pct(c) in pcts]
         st.caption("En AP se corrige la etiqueta como probabilidad de excedencia: menor AP → P95; mayor AP → P5. En el visor Plotly se ordena P5 arriba y P95 abajo.")
+        _show_ap_may_adjustment_note(gat_plot, "gatun", "comparativo Gatún")
+        _show_ap_may_adjustment_note(alh_plot, "alhajuela", "comparativo Alhajuela")
     else:
         st.caption("El visor Plotly se ordena de húmedo a seco: P5 arriba y P95 abajo.")
         gat_cols = [c for c in raw_gat_cols if exceedance_pct(c) in pcts]
@@ -2378,6 +2758,8 @@ def tab_aporte_instantaneo(
         alh_raw = load_dss_sheet(dss_bytes, RESERVOIR_CONFIG["alhajuela"]["sheet"])
         gat_d = to_daily(gat_raw, RESERVOIR_CONFIG["gatun"])
         alh_d = to_daily(alh_raw, RESERVOIR_CONFIG["alhajuela"])
+        gat_d = apply_may_hydrograph_ap_adjustment(gat_d, RESERVOIR_CONFIG["gatun"], obs_gat_aporte)
+        alh_d = apply_may_hydrograph_ap_adjustment(alh_d, RESERVOIR_CONFIG["alhajuela"], obs_alh_aporte)
     except Exception as exc:
         st.error(f"Error DSS: {exc}")
         return
@@ -2413,6 +2795,8 @@ def tab_aporte_instantaneo(
         evap_g = e1.number_input("Evap. GAT (p³/s)", min_value=0.0, value=float(clean_evap_cfs(evap_gat_cfs)), step=10.0, format="%.3f", key="apinst_evap_g")
         evap_a = e2.number_input("Evap. ALHA (p³/s)", min_value=0.0, value=float(clean_evap_cfs(evap_alh_cfs)), step=10.0, format="%.3f", key="apinst_evap_a")
         st.info("Fórmula: **AP total DSS estimado = AP neto DSS + evaporación**.")
+        _show_ap_may_adjustment_note(gat_d, "gatun", "aporte instantáneo Gatún")
+        _show_ap_may_adjustment_note(alh_d, "alhajuela", "aporte instantáneo Alhajuela")
 
     def _last_aquarius(odf: Optional[pd.DataFrame]) -> Optional[Tuple[pd.Timestamp, float, str]]:
         if not _valid_df(odf):
@@ -2590,6 +2974,8 @@ def tab_exportar_percentil(
     pct_ref_alh: int,
     evap_gat_cfs: float = 0.0,
     evap_alh_cfs: float = 0.0,
+    obs_gat_aporte: Optional[pd.DataFrame] = None,
+    obs_alh_aporte: Optional[pd.DataFrame] = None,
 ) -> None:
     """Pestaña para exportar el percentil elegido por embalse."""
     st.subheader("⬇️ Exportar percentil DSS")
@@ -2607,10 +2993,12 @@ def tab_exportar_percentil(
         key="exp_pct",
     )
     evap = evap_gat_cfs if res_key == "gatun" else evap_alh_cfs
+    obs_ap_df = obs_gat_aporte if res_key == "gatun" else obs_alh_aporte
 
     try:
         raw = load_dss_sheet(dss_bytes, cfg["sheet"])
         daily = to_daily(raw, cfg)
+        daily = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_ap_df)
     except Exception as exc:
         st.error(f"Error cargando DSS: {exc}")
         return
@@ -2618,6 +3006,7 @@ def tab_exportar_percentil(
         st.warning("No se pudo construir el diario DSS para exportación.")
         return
 
+    _show_ap_may_adjustment_note(daily, res_key, "exportación")
     table = build_percentile_export_table(daily, cfg, int(pct), flow_unit, evap)
     if table.empty:
         st.warning("No hay datos para exportar.")
@@ -2999,11 +3388,15 @@ Importante: las tarjetas que dicen **percentil cercano** pueden mostrar un perce
 
 #### 3. Evaporación GAT y Evaporación ALHA
 
-Los campos de evaporación se ingresan en `p³/s` y se aplican por embalse mediante la relación:
+La evaporación puede definirse de dos maneras: **automática**, usando el último valor válido de Corozal (CZL) para Gatún y Pedro Miguel (PMG) para Alhajuela; o **manual**, ingresando el caudal en `p³/s`.
+
+En modo automático se usa: `hm³/día = mm/día × área (km²) × 0.85 × 0.001`, con áreas de referencia de 425 km² para Gatún y 49 km² para Alhajuela. Luego el volumen diario se convierte a `p³/s`.
 
 `AP total DSS estimado = AP neto DSS + caudal evaporado`
 
-Este ajuste permite comparar mejor el AP DSS con el aporte observado. La app está blindada para **sumar** la evaporación al AP neto DSS y no restarla. Si no se desea aplicar ajuste, dejar el valor en `0.0`.
+La app está blindada para **sumar** la evaporación al AP neto DSS y no restarla.
+
+Adicionalmente, cuando existen aportes observados de mayo, la app utiliza la forma del hidrograma de los últimos días válidos de mayo para redistribuir los AP diarios del DSS dentro de cada semana operativa. Este ajuste **no cambia la suma ni el promedio semanal DSS**; solo modifica la forma diaria para que el comportamiento del hidrograma sea más consistente.
 
 ---
 
@@ -3167,7 +3560,7 @@ Secuencia recomendada:
 2. Presionar **Recargar archivos** si se actualizaron datos.
 3. Seleccionar la unidad de caudal/flujo.
 4. Seleccionar el percentil de referencia de Gatún y de Alhajuela/Madden.
-5. Ingresar evaporación por embalse si aplica.
+5. Seleccionar evaporación automática CZL/PMG o ingresar el caudal manual por embalse.
 6. Revisar **Manejo / Decisión**.
 7. Validar cada embalse en **GATÚN DSS** y **ALHAJUELA DSS**.
 8. Revisar **Aporte GAT obs** y **Aporte ALHA obs** para identificar el percentil hidrológico actual.
@@ -3245,7 +3638,7 @@ def main() -> None:
     with tabs[1]:
         _run_tab("ALHAJUELA DSS", tab_reservoir, "alhajuela", dss_bytes, flow_unit, pct_ref_alh, obs_alh_nivel, obs_alh_aporte, evap_alh_cfs)
     with tabs[2]:
-        _run_tab("Manejo / Decisión", tab_manejo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_nivel, obs_alh_nivel)
+        _run_tab("Manejo / Decisión", tab_manejo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_nivel, obs_alh_nivel, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
     with tabs[3]:
         _run_tab("Aporte GAT obs", tab_aporte_obs_embalse, "gatun", dss_bytes, flow_unit, pct_ref_gat, obs_gat_aporte, evap_gat_cfs)
     with tabs[4]:
@@ -3257,7 +3650,7 @@ def main() -> None:
     with tabs[7]:
         _run_tab("Aporte instantáneo", tab_aporte_instantaneo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
     with tabs[8]:
-        _run_tab("Exportar", tab_exportar_percentil, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, evap_gat_cfs, evap_alh_cfs)
+        _run_tab("Exportar", tab_exportar_percentil, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, evap_gat_cfs, evap_alh_cfs, obs_gat_aporte, obs_alh_aporte)
     with tabs[9]:
         _run_tab("Instructivo", tab_instructivo)
 
