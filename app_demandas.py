@@ -4,7 +4,7 @@ Creado para HIMH por JFRodriguez
 pip install streamlit pandas numpy plotly openpyxl pillow pyxlsb
 streamlit run app_demandas.py
 """
-import streamlit as st, pandas as pd, numpy as np, datetime, io, base64, os, tempfile
+import streamlit as st, pandas as pd, numpy as np, datetime, io, base64, os, tempfile, glob
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -1052,18 +1052,76 @@ def _cargar_serie_evap_aquarius(nombre: str) -> dict:
 
 # ── Aportes observados desde Aquarius (Discharge AT) ─────────────────────────
 APORTES_OBSERVADOS_FILES = {
-    "Gatún": ["Discharge_AT_GAT_Diario.csv", "Discharge_AT_GAT_Diario(3).csv"],
-    "Alhajuela": ["Discharge_AT_ALHA_Diario.csv", "Discharge_AT_ALHA_Diario(3).csv"],
+    # Se acepta el nombre base y cualquier copia numerada, por ejemplo:
+    # Discharge_AT_GAT_Diario(6).csv. Si hay varias copias, se usa la más reciente.
+    "Gatún": ["Discharge_AT_GAT_Diario.csv", "Discharge_AT_GAT_Diario*.csv"],
+    "Alhajuela": ["Discharge_AT_ALHA_Diario.csv", "Discharge_AT_ALHA_Diario*.csv"],
 }
 
 
+def _dirs_busqueda_data():
+    """Directorios donde el app busca datos locales, sin duplicados."""
+    base_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    candidatos = [
+        os.path.join(base_dir, "data"),
+        os.path.join(os.getcwd(), "data"),
+        base_dir,
+        os.getcwd(),
+    ]
+    dirs, vistos = [], set()
+    for folder in candidatos:
+        folder_abs = os.path.abspath(folder)
+        if folder_abs in vistos:
+            continue
+        vistos.add(folder_abs)
+        if os.path.isdir(folder_abs):
+            dirs.append(folder_abs)
+    return dirs
+
+
 def _buscar_archivo_data_multi(nombres):
-    """Busca el primer archivo existente a partir de una lista de nombres posibles."""
-    for nombre in nombres:
-        path = _buscar_archivo_data(nombre)
-        if path:
-            return path
-    return None
+    """Busca CSV locales y, si hay copias numeradas, usa el archivo más reciente."""
+    encontrados = []
+    for folder in _dirs_busqueda_data():
+        for nombre in nombres:
+            patron = os.path.join(folder, nombre)
+            if any(ch in nombre for ch in "*?[]"):
+                candidatos = glob.glob(patron)
+            else:
+                candidatos = [patron]
+            for path in candidatos:
+                try:
+                    if os.path.isfile(path) and not os.path.basename(path).startswith("."):
+                        encontrados.append(os.path.abspath(path))
+                except Exception:
+                    continue
+    if not encontrados:
+        return None
+    encontrados = sorted(set(encontrados), key=lambda p: os.path.getmtime(p), reverse=True)
+    return encontrados[0]
+
+
+def _hoy_panama_normalizado() -> pd.Timestamp:
+    """Fecha actual operativa en Panamá, igual que en el app DSS."""
+    try:
+        return pd.Timestamp.now(tz="America/Panama").tz_localize(None).normalize()
+    except Exception:
+        return pd.Timestamp.today().normalize()
+
+
+def _ajustar_fecha_aporte_observado(df: pd.DataFrame, date_col: str = "fecha") -> pd.DataFrame:
+    """Evita que un aporte diario observado aparezca en una fecha futura.
+
+    Copia el criterio del app DSS: la fecha del aporte se normaliza a día
+    operativo y cualquier sello posterior a hoy Panamá se coloca en hoy.
+    """
+    if df is None or df.empty or date_col not in df.columns:
+        return df
+    out = df.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce").dt.normalize()
+    hoy = _hoy_panama_normalizado()
+    out.loc[out[date_col] > hoy, date_col] = hoy
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -1124,6 +1182,17 @@ def _leer_aportes_observados_csv(path: str, mtime_ns: int) -> pd.DataFrame:
     out = out.loc[out["fecha"].notna()].sort_values("fecha")
     if out.empty:
         return pd.DataFrame(columns=["fecha", "cfs", "hm3_d", "m3s"])
+
+    # Igual que en DSS: no se permite que un aporte observado quede fechado
+    # después de hoy Panamá. Si Aquarius trae 22/06 siendo hoy 21/06, se fija
+    # en 21/06 y se consolida ese día para que el visor no salte al futuro.
+    out = _ajustar_fecha_aporte_observado(out, "fecha")
+    out = (
+        out.groupby("fecha", as_index=False)
+           .agg(cfs=("cfs", "mean"))
+           .sort_values("fecha")
+    )
+
     out["hm3_d"] = out["cfs"].astype(float) * CFS2HM3
     out["m3s"] = out["cfs"].astype(float) * CFS2M3S
     return out[["fecha", "cfs", "hm3_d", "m3s"]].reset_index(drop=True)
