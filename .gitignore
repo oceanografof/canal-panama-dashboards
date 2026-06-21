@@ -15,3 +15,8 @@ dss_views.txt
 BulkExport*.csv
 BulkExport-*.csv
 desktop.ini
+**/desktop.ini
+Thumbs.db
+**/Thumbs.db
+.DS_Store
+**/.DS_Store

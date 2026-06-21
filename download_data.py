@@ -62,7 +62,18 @@ ALLOWED_ROOT_FILES = {
     "actualizar.bat",
     "requirements.txt",
     ".gitignore",
+    # Activo visual usado por el dashboard. Se permite de forma explícita
+    # para que un cambio legítimo del logo no bloquee la actualización segura.
+    "LOGO HIMH.jpg",
 }
+
+# Activos visuales permitidos únicamente si están en la raíz del repositorio,
+# no tienen nombres sensibles y no exceden MAX_AUTO_ASSET_BYTES.
+# Esto cubre logos/íconos usados por Streamlit sin abrir permisos generales.
+ALLOWED_ROOT_ASSET_PATTERNS = (
+    "*.png", "*.jpg", "*.jpeg", "*.webp", "*.svg",
+)
+MAX_AUTO_ASSET_BYTES = 8 * 1024 * 1024
 
 # Apps Streamlit del repositorio que pueden subirse automáticamente.
 # Esto evita que cada nueva app tipo app_temperatura.py, app_AyS.py,
@@ -100,6 +111,13 @@ LOCAL_ONLY_GIT_PATTERNS = (
     ".app_state/*",
     "BulkExport*.csv",
     "BulkExport-*.csv",
+    # Archivos de sistema creados por Windows/macOS/OneDrive; no son datos operativos.
+    "desktop.ini",
+    "**/desktop.ini",
+    "Thumbs.db",
+    "**/Thumbs.db",
+    ".DS_Store",
+    "**/.DS_Store",
 )
 
 SENSITIVE_REGEXES = [
@@ -378,11 +396,36 @@ def is_allowed_root_app_file(path: str) -> bool:
     return any(fnmatch.fnmatch(name, pat) for pat in ALLOWED_ROOT_APP_PATTERNS)
 
 
+def is_allowed_root_asset_file(path: str) -> bool:
+    """Permite logos/activos visuales pequeños en la raíz del repo.
+
+    Evita que un logo modificado bloquee el flujo, pero conserva blindaje:
+    - no permite subcarpetas,
+    - no permite nombres sensibles,
+    - no permite archivos mayores al límite,
+    - no autoriza eliminaciones accidentales de activos.
+    """
+    p = path.replace("\\", "/")
+    name = Path(p).name
+    if "/" in p:
+        return False
+    if is_path_blocked(p):
+        return False
+    if not any(fnmatch.fnmatch(name.lower(), pat.lower()) for pat in ALLOWED_ROOT_ASSET_PATTERNS):
+        return False
+
+    asset_path = REPO_DIR / p
+    try:
+        return asset_path.is_file() and asset_path.stat().st_size <= MAX_AUTO_ASSET_BYTES
+    except OSError:
+        return False
+
+
 def is_allowed_to_commit(path: str) -> bool:
     p = path.replace("\\", "/")
     if is_path_blocked(p):
         return False
-    if "/" not in p and (p in ALLOWED_ROOT_FILES or is_allowed_root_app_file(p)):
+    if "/" not in p and (p in ALLOWED_ROOT_FILES or is_allowed_root_app_file(p) or is_allowed_root_asset_file(p)):
         return True
     if p.startswith("data/") and Path(p).name in EXPECTED_DATA_FILES:
         return True
@@ -520,6 +563,7 @@ def ensure_gitignore(repo_dir: Path) -> None:
         # Estado local del dashboard y BulkExport crudos no normalizados.
         ".app_state/", "dss_views.txt", ".dss_views.txt",
         "BulkExport*.csv", "BulkExport-*.csv",
+        "desktop.ini", "**/desktop.ini", "Thumbs.db", "**/Thumbs.db", ".DS_Store", "**/.DS_Store",
     ):
         if rule not in stripped:
             lines.append(rule)
@@ -527,6 +571,25 @@ def ensure_gitignore(repo_dir: Path) -> None:
     if changed:
         atomic_write_text(gitignore, "\n".join(lines).rstrip() + "\n")
         print("  ✅ .gitignore reforzado para temporales, credenciales y estado local")
+
+
+def unquote_git_path(path: str) -> str:
+    """Normaliza rutas de `git status --short` cuando Git las imprime entre comillas.
+
+    Ejemplo real: Git puede devolver ` M "LOGO HIMH.jpg"`. Si no se quitan
+    esas comillas, el archivo se interpreta como no autorizado aunque esté en
+    ALLOWED_ROOT_FILES.
+    """
+    cleaned = path.rstrip()
+    if len(cleaned) >= 2 and cleaned[0] == '"' and cleaned[-1] == '"':
+        try:
+            import ast
+            value = ast.literal_eval(cleaned)
+            if isinstance(value, str):
+                return value
+        except Exception:
+            return cleaned[1:-1]
+    return cleaned
 
 
 def parse_status(status: str) -> list[GitStatusEntry]:
@@ -540,6 +603,7 @@ def parse_status(status: str) -> list[GitStatusEntry]:
         path = line[3:].rstrip()
         if " -> " in path:
             path = path.split(" -> ", 1)[1].rstrip()
+        path = unquote_git_path(path)
         entries.append(GitStatusEntry(xy=xy, path=path.replace("\\", "/")))
     return entries
 

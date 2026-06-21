@@ -52,6 +52,16 @@ VIEW_FILE   = "dss_views.txt"
 VIEW_STATE_DIR = ".app_state"
 RADAR_URL   = "https://radar-meteorologico.delcanal.com/es.gif"
 
+# Logos institucionales. Coloque estos archivos junto al app o en ./data.
+LOGO_HIMH_CANDIDATES = [
+    "logo_himh.jpg", "logo_himh.png", "logo_himh.jpeg",
+    "LOGO_HIMH.jpg", "LOGO_HIMH.png", "himh_logo.jpg", "himh_logo.png",
+]
+LOGO_CANAL_CANDIDATES = [
+    "logo_canal_panama.jpg", "logo_canal_panama.png", "logo_canal_panama.jpeg",
+    "CP_RGB_p_Ver.jpg", "CP_RGB_p_Ver.png", "canal_panama_logo.jpg", "canal_panama_logo.png",
+]
+
 # Series Aquarius que la app puede intentar cargar automáticamente.
 # La carga remota es opcional desde la barra lateral; si no hay acceso a la red
 # o Aquarius solicita autenticación, la app continúa usando los CSV locales/subidos.
@@ -74,11 +84,29 @@ DATA_DIR_NAME = "data"
 CFS_TO_M3S     = 0.028316846592
 CFS_TO_HM3_DAY = CFS_TO_M3S * 86400 / 1_000_000
 
-# Evaporación automática: misma referencia de área usada por defecto en app_demandas.
+# Evaporación automática:
 # La lámina diaria de cada estación se corrige con el coeficiente 0.85.
+# El área del espejo se calcula con el último nivel observado del embalse.
 EVAP_COEFFICIENT = 0.85
+
+# Áreas de respaldo si no hay nivel observado disponible.
 EVAP_AREA_GAT_KM2 = 425.0   # Gatún
 EVAP_AREA_ALH_KM2 = 49.0    # Alhajuela / Madden
+
+# Curva nivel-área editable. Se interpola por nivel observado (ft PLD).
+# Si existe una curva oficial más detallada, solo reemplace estos puntos.
+EVAP_LEVEL_AREA_TABLES: Dict[str, List[Tuple[float, float]]] = {
+    "gatun": [
+        (78.0, 392.0), (80.0, 402.0), (82.0, 413.0),
+        (85.0, 425.0), (87.0, 435.0), (89.0, 445.0),
+    ],
+    "alhajuela": [
+        (190.0, 18.0), (200.0, 25.0), (210.0, 32.0),
+        (220.0, 39.0), (230.0, 45.0), (240.0, 49.0),
+        (250.0, 53.0), (260.0, 57.0),
+    ],
+}
+
 EVAP_SERIES_PATTERNS: Dict[str, List[str]] = {
     "CZL": ["Evapo_Rate_Daily_Tank_CZL*.csv", "*Evapo*CZL*.csv"],
     "PMG": ["Evapo_Rate_Daily_Tank_PMG*.csv", "*Evapo*PMG*.csv"],
@@ -262,6 +290,59 @@ def find_local(candidates: List[str]) -> Optional[Path]:
     return None
 
 
+def find_local_logo(candidates: List[str]) -> Optional[Path]:
+    """Busca logos primero junto al app y luego en ./data."""
+    bases: List[Path] = []
+    for base in [app_base_dir(), app_base_dir() / DATA_DIR_NAME, Path.cwd().resolve(), Path.cwd().resolve() / DATA_DIR_NAME]:
+        try:
+            rb = base.resolve()
+        except Exception:
+            rb = base
+        if rb not in bases and rb.exists() and rb.is_dir():
+            bases.append(rb)
+
+    for base in bases:
+        for name in candidates:
+            fp = base / name
+            if fp.exists() and fp.is_file():
+                return fp
+    return None
+
+
+def show_brand_header(view_count: int) -> None:
+    """Encabezado institucional con logos proporcionados por el usuario.
+
+    Se usan anchos fijos para evitar que el logo HIMH crezca demasiado y
+    desplace el logo del Canal de Panamá.
+    """
+    logo_himh = find_local_logo(LOGO_HIMH_CANDIDATES)
+    logo_canal = find_local_logo(LOGO_CANAL_CANDIDATES)
+
+    left, center, right = st.columns([0.72, 2.55, 0.90])
+    with left:
+        if logo_himh is not None:
+            st.image(str(logo_himh), width=92)
+    with center:
+        st.markdown(
+            f"""
+            <div style="text-align:center;padding-top:.15rem;padding-bottom:.2rem">
+                <div class="main-title" style="font-size:1.75rem;line-height:1.12">💧 {APP_TITLE}</div>
+                <div class="sub-title" style="margin-bottom:.35rem">{PROJ_NOTE} · ACP HIMH</div>
+                <div style="color:#003E69;font-weight:800">
+                    ACP-HIMH
+                    <span class='badge' style='margin-left:10px'>👁️ {view_count:,}</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with right:
+        if logo_canal is not None:
+            st.image(str(logo_canal), width=145)
+
+    st.markdown("<div style='margin-bottom:.45rem'></div>", unsafe_allow_html=True)
+
+
 @st.cache_data(show_spinner=False)
 def _read_bytes_cached(path_str: str, mtime_ns: int, size: int) -> bytes:
     return Path(path_str).read_bytes()
@@ -434,6 +515,98 @@ def evap_mm_to_flows(mm_day: float, area_km2: float, coefficient: float = EVAP_C
     cfs = hm3_day / CFS_TO_HM3_DAY if CFS_TO_HM3_DAY > 0 else 0.0
     return {"mm_day": mm, "area_km2": area, "coefficient": coef,
             "hm3_day": hm3_day, "cfs": cfs}
+
+
+def fallback_evap_area_km2(res_key: str) -> float:
+    """Área de respaldo cuando no hay nivel observado."""
+    return EVAP_AREA_GAT_KM2 if str(res_key).lower().startswith("gat") else EVAP_AREA_ALH_KM2
+
+
+def evap_area_from_observed_level(res_key: str, level_ft: Optional[float]) -> Tuple[float, str]:
+    """Calcula el área del espejo por interpolación usando el nivel observado.
+
+    Retorna (area_km2, estado). Si no hay nivel válido, usa el área de respaldo.
+    """
+    key = "gatun" if str(res_key).lower().startswith("gat") else "alhajuela"
+    fallback = fallback_evap_area_km2(key)
+    try:
+        level = float(level_ft)
+    except Exception:
+        return fallback, "respaldo_sin_nivel"
+
+    table = EVAP_LEVEL_AREA_TABLES.get(key, [])
+    if not table:
+        return fallback, "respaldo_sin_curva"
+
+    pts = sorted((float(lv), float(ar)) for lv, ar in table)
+    levels = np.array([x[0] for x in pts], dtype=float)
+    areas = np.array([x[1] for x in pts], dtype=float)
+
+    if not np.isfinite(level):
+        return fallback, "respaldo_nivel_invalido"
+
+    if level <= levels.min():
+        return float(areas[0]), "nivel_bajo_clamp"
+    if level >= levels.max():
+        return float(areas[-1]), "nivel_alto_clamp"
+    return float(np.interp(level, levels, areas)), "interpolado_nivel_obs"
+
+
+def latest_observed_level_from_df(obs_df: Optional[pd.DataFrame]) -> Dict[str, object]:
+    """Extrae el último nivel observado válido de un DataFrame diario."""
+    if obs_df is None or not isinstance(obs_df, pd.DataFrame) or obs_df.empty:
+        return {"date": None, "level_ft": None, "source": None}
+    if "Fecha_dia" not in obs_df.columns or "Valor" not in obs_df.columns:
+        return {"date": None, "level_ft": None, "source": None}
+
+    df = obs_df.copy()
+    df["Fecha_dia"] = pd.to_datetime(df["Fecha_dia"], errors="coerce").dt.normalize()
+    df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce")
+    df = df.dropna(subset=["Fecha_dia", "Valor"]).sort_values("Fecha_dia")
+    if df.empty:
+        return {"date": None, "level_ft": None, "source": None}
+
+    today = today_panama()
+    past = df[df["Fecha_dia"] <= today]
+    last = past.iloc[-1] if not past.empty else df.iloc[-1]
+    return {
+        "date": pd.to_datetime(last["Fecha_dia"]),
+        "level_ft": float(last["Valor"]),
+        "source": last.get("Fuente", None),
+    }
+
+
+def latest_local_observed_level_for_evap(res_key: str) -> Dict[str, object]:
+    """Busca el último nivel observado local para calcular área de evaporación.
+
+    Esta búsqueda no crea widgets; usa los CSV locales de data/ o de la carpeta
+    del app para que el panel lateral pueda calcular el área antes de que el
+    usuario abra las pestañas.
+    """
+    target = "Gatún" if str(res_key).lower().startswith("gat") else "Alhajuela"
+    best: Dict[str, object] = {"date": None, "level_ft": None, "source": None}
+    try:
+        for fp in discover_local_bulk_csvs()[:40]:
+            try:
+                daily, embalse, variable, serie = read_bulk_csv(fp.read_bytes(), fp.name)
+            except Exception:
+                continue
+            if variable != "nivel" or daily is None or daily.empty:
+                continue
+            if target == "Gatún" and "Gat" not in str(embalse):
+                continue
+            if target == "Alhajuela" and not any(x in str(embalse) for x in ["Alhajuela", "Madden"]):
+                continue
+
+            item = latest_observed_level_from_df(daily)
+            if item.get("level_ft") is None:
+                continue
+            if best.get("date") is None or pd.to_datetime(item["date"]) > pd.to_datetime(best["date"]):
+                item["source"] = fp.name
+                best = item
+    except Exception:
+        pass
+    return best
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -966,7 +1139,7 @@ def apply_may_hydrograph_ap_adjustment(
     daily: pd.DataFrame,
     cfg: Dict,
     obs_aportes: Optional[pd.DataFrame] = None,
-    enabled: bool = AP_HYDROGRAPH_ADJUSTMENT_ENABLED,
+    enabled: Optional[bool] = None,
 ) -> pd.DataFrame:
     """Ajusta la forma diaria del AP DSS con el hidrograma observado de mayo.
 
@@ -974,8 +1147,21 @@ def apply_may_hydrograph_ap_adjustment(
     AP y cada semana operativa sábado-viernes, se redistribuye la forma diaria y
     luego se reescala para que la suma semanal quede igual que en el DSS original.
     """
+    if enabled is None:
+        enabled = bool(st.session_state.get("ap_hydrograph_enabled", AP_HYDROGRAPH_ADJUSTMENT_ENABLED))
+
     if not enabled or daily is None or daily.empty:
-        return daily
+        out = daily.copy() if isinstance(daily, pd.DataFrame) else daily
+        try:
+            if isinstance(out, pd.DataFrame):
+                out.attrs.update({
+                    "ap_may_adjustment": False,
+                    "ap_distribution_mode": "semanal_dss",
+                    "reason": "modo semanal DSS seleccionado",
+                })
+        except Exception:
+            pass
+        return out
 
     ap_cols = cols_by_prefix(daily, "AP", cfg.get("token", ""))
     if not ap_cols:
@@ -1294,6 +1480,25 @@ def sidebar() -> Dict:
         help="Percentil DSS de referencia para las pestañas y métricas de Alhajuela/Madden.",
     )
 
+    st.sidebar.header("🌊 Distribución de aportes DSS")
+    ap_distribution_mode = st.sidebar.radio(
+        "Forma diaria de los aportes DSS",
+        ["Simular último hidrograma de mayo", "Ver aporte semanal DSS"],
+        index=0,
+        key="ap_distribution_mode",
+        help=(
+            "Simular último hidrograma de mayo redistribuye la forma diaria del AP, "
+            "pero conserva el volumen/promedio semanal DSS. Ver aporte semanal DSS deja "
+            "el AP como viene del DSS."
+        ),
+    )
+    ap_hydrograph_enabled = ap_distribution_mode.startswith("Simular")
+    st.session_state["ap_hydrograph_enabled"] = bool(ap_hydrograph_enabled)
+    if ap_hydrograph_enabled:
+        st.sidebar.caption("Modo activo: AP DSS redistribuido con el último hidrograma válido de mayo, conservando la suma semanal.")
+    else:
+        st.sidebar.caption("Modo activo: AP semanal DSS original, sin redistribución diaria.")
+
     st.sidebar.header("🌫️ Caudal evaporado para ajuste AP DSS")
     evap_mode = st.sidebar.radio(
         "Fuente de evaporación",
@@ -1314,37 +1519,57 @@ def sidebar() -> Dict:
         alh_series = latest_evap_series("PMG")
 
         if gat_series.get("mm_day") is not None:
-            gat_calc = evap_mm_to_flows(float(gat_series["mm_day"]), EVAP_AREA_GAT_KM2)
+            gat_level = latest_local_observed_level_for_evap("gatun")
+            gat_area, gat_area_status = evap_area_from_observed_level("gatun", gat_level.get("level_ft"))
+            gat_calc = evap_mm_to_flows(float(gat_series["mm_day"]), gat_area)
             evap_gat_cfs = float(gat_calc["cfs"])
             evap_gat_meta.update(gat_series)
             evap_gat_meta.update(gat_calc)
+            evap_gat_meta.update({"level_info": gat_level, "area_status": gat_area_status})
             st.sidebar.markdown(
                 f"**Gatún · Corozal (CZL)**  \n"
                 f"{gat_calc['mm_day']:.3f} mm/día · {gat_calc['hm3_day']:.4f} hm³/día · "
                 f"**{gat_calc['cfs']:.3f} p³/s**"
             )
-            st.sidebar.caption(
-                f"Fecha: {pd.to_datetime(gat_series['date']):%d-%m-%Y} · "
-                f"Área: {EVAP_AREA_GAT_KM2:.1f} km² · Archivo: {gat_series['file']}"
-            )
+            if gat_level.get("level_ft") is not None:
+                st.sidebar.caption(
+                    f"Evap: {pd.to_datetime(gat_series['date']):%d-%m-%Y} · "
+                    f"Nivel obs: {gat_level['level_ft']:.2f} ft · Área por nivel: {gat_area:.1f} km² · "
+                    f"Archivo nivel: {gat_level.get('source') or '—'}"
+                )
+            else:
+                st.sidebar.caption(
+                    f"Evap: {pd.to_datetime(gat_series['date']):%d-%m-%Y} · "
+                    f"Sin nivel observado local; usa área respaldo: {gat_area:.1f} km² · Archivo: {gat_series['file']}"
+                )
         else:
             evap_gat_cfs = 0.0
             st.sidebar.warning("No se encontró una serie válida de evaporación CZL para Gatún.")
 
         if alh_series.get("mm_day") is not None:
-            alh_calc = evap_mm_to_flows(float(alh_series["mm_day"]), EVAP_AREA_ALH_KM2)
+            alh_level = latest_local_observed_level_for_evap("alhajuela")
+            alh_area, alh_area_status = evap_area_from_observed_level("alhajuela", alh_level.get("level_ft"))
+            alh_calc = evap_mm_to_flows(float(alh_series["mm_day"]), alh_area)
             evap_alh_cfs = float(alh_calc["cfs"])
             evap_alh_meta.update(alh_series)
             evap_alh_meta.update(alh_calc)
+            evap_alh_meta.update({"level_info": alh_level, "area_status": alh_area_status})
             st.sidebar.markdown(
                 f"**Alhajuela · Pedro Miguel (PMG)**  \n"
                 f"{alh_calc['mm_day']:.3f} mm/día · {alh_calc['hm3_day']:.4f} hm³/día · "
                 f"**{alh_calc['cfs']:.3f} p³/s**"
             )
-            st.sidebar.caption(
-                f"Fecha: {pd.to_datetime(alh_series['date']):%d-%m-%Y} · "
-                f"Área: {EVAP_AREA_ALH_KM2:.1f} km² · Archivo: {alh_series['file']}"
-            )
+            if alh_level.get("level_ft") is not None:
+                st.sidebar.caption(
+                    f"Evap: {pd.to_datetime(alh_series['date']):%d-%m-%Y} · "
+                    f"Nivel obs: {alh_level['level_ft']:.2f} ft · Área por nivel: {alh_area:.1f} km² · "
+                    f"Archivo nivel: {alh_level.get('source') or '—'}"
+                )
+            else:
+                st.sidebar.caption(
+                    f"Evap: {pd.to_datetime(alh_series['date']):%d-%m-%Y} · "
+                    f"Sin nivel observado local; usa área respaldo: {alh_area:.1f} km² · Archivo: {alh_series['file']}"
+                )
         else:
             evap_alh_cfs = 0.0
             st.sidebar.warning("No se encontró una serie válida de evaporación PMG para Alhajuela.")
@@ -1399,6 +1624,8 @@ def sidebar() -> Dict:
         "evap_mode": evap_mode,
         "evap_gat_meta": evap_gat_meta,
         "evap_alh_meta": evap_alh_meta,
+        "ap_distribution_mode": ap_distribution_mode,
+        "ap_hydrograph_enabled": bool(ap_hydrograph_enabled),
     }
 
 
@@ -3560,12 +3787,13 @@ Secuencia recomendada:
 2. Presionar **Recargar archivos** si se actualizaron datos.
 3. Seleccionar la unidad de caudal/flujo.
 4. Seleccionar el percentil de referencia de Gatún y de Alhajuela/Madden.
-5. Seleccionar evaporación automática CZL/PMG o ingresar el caudal manual por embalse.
-6. Revisar **Manejo / Decisión**.
-7. Validar cada embalse en **GATÚN DSS** y **ALHAJUELA DSS**.
-8. Revisar **Aporte GAT obs** y **Aporte ALHA obs** para identificar el percentil hidrológico actual.
-9. Usar **Aporte instantáneo** si se requiere comparar un aporte manual o monitorear el radar.
-10. Usar **Exportar** para generar una tabla del percentil operativo evaluado.
+5. Seleccionar la distribución de aportes DSS: **Simular último hidrograma de mayo** o **Ver aporte semanal DSS**.
+6. Seleccionar evaporación automática CZL/PMG o ingresar el caudal manual por embalse. En modo automático, el área se calcula con el último nivel observado local disponible.
+7. Revisar **Manejo / Decisión**.
+8. Validar cada embalse en **GATÚN DSS** y **ALHAJUELA DSS**.
+9. Revisar **Aporte GAT obs** y **Aporte ALHA obs** para identificar el percentil hidrológico actual.
+10. Usar **Aporte instantáneo** si se requiere comparar un aporte manual o monitorear el radar.
+11. Usar **Exportar** para generar una tabla del percentil operativo evaluado.
 
 La lectura final debe considerar siempre la consistencia entre nivel observado, aporte observado, percentil DSS, vertidos, esclusajes e hidrogeneración.
 """)
@@ -3588,14 +3816,7 @@ def main() -> None:
     inject_css()
     view_count = get_view_count()
 
-    st.markdown(f"<div class='main-title'>💧 {APP_TITLE}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='sub-title'>{PROJ_NOTE} · ACP HIMH</div>", unsafe_allow_html=True)
-    st.markdown(
-        f"<div style='color:#003E69;font-weight:700;margin-bottom:.7rem'>"
-        f"ACP-HIMH"
-        f"<span class='badge' style='margin-left:10px'>👁️ {view_count:,}</span></div>",
-        unsafe_allow_html=True,
-    )
+    show_brand_header(view_count)
 
     cfg = sidebar()
     dss_bytes = cfg["dss_bytes"]
