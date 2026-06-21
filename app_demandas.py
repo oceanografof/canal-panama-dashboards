@@ -1092,14 +1092,32 @@ def _leer_aportes_observados_csv(path: str, mtime_ns: int) -> pd.DataFrame:
     if col_valor is None:
         return pd.DataFrame(columns=["fecha", "cfs", "hm3_d", "m3s"])
 
-    col_fecha = next(
-        (columnas_l[k] for k in ("fecha_fin", "fecha_inicio", "timestamp", "date", "fecha") if k in columnas_l),
+    # Para series diarias de Aquarius, fecha_fin suele ser el cierre del intervalo
+    # a las 00:00 del día siguiente. Por eso, para el visor operativo se usa
+    # fecha_inicio como fecha del día observado. Esto evita mostrar 22/06 cuando
+    # el aporte corresponde al día operativo 21/06.
+    col_fecha_inicio = columnas_l.get("fecha_inicio")
+    col_fecha_fin = columnas_l.get("fecha_fin")
+    col_fecha = col_fecha_inicio or col_fecha_fin or next(
+        (columnas_l[k] for k in ("timestamp", "date", "fecha") if k in columnas_l),
         None,
     )
     out = df.copy()
     out["cfs"] = pd.to_numeric(out[col_valor], errors="coerce")
     if col_fecha is not None:
-        out["fecha"] = pd.to_datetime(out[col_fecha], errors="coerce")
+        fechas = pd.to_datetime(out[col_fecha], errors="coerce")
+        if col_fecha_inicio is None and col_fecha_fin is not None and col_fecha == col_fecha_fin:
+            try:
+                mask_cierre_medianoche = (
+                    fechas.notna()
+                    & fechas.dt.hour.eq(0)
+                    & fechas.dt.minute.eq(0)
+                    & fechas.dt.second.eq(0)
+                )
+                fechas = fechas.mask(mask_cierre_medianoche, fechas - pd.Timedelta(days=1))
+            except Exception:
+                pass
+        out["fecha"] = fechas
     else:
         out["fecha"] = pd.NaT
     out = out.loc[out["cfs"].notna() & np.isfinite(out["cfs"]) & (out["cfs"] >= 0)].copy()
