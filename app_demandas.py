@@ -1110,17 +1110,19 @@ def _hoy_panama_normalizado() -> pd.Timestamp:
 
 
 def _ajustar_fecha_aporte_observado(df: pd.DataFrame, date_col: str = "fecha") -> pd.DataFrame:
-    """Evita que un aporte diario observado aparezca en una fecha futura.
+    """Normaliza la fecha operativa y elimina registros posteriores a hoy Panamá.
 
-    Copia el criterio del app DSS: la fecha del aporte se normaliza a día
-    operativo y cualquier sello posterior a hoy Panamá se coloca en hoy.
+    En `Discharge_AT_*_Diario`, Aquarius entrega el dato diario con sello
+    00:00 del día siguiente. Por ejemplo, la fila 22/06 00:00 corresponde
+    operativamente al aporte observado del 21/06. La conversión de fecha se
+    hace al leer la serie; aquí solo se filtra por la fecha operativa final.
     """
     if df is None or df.empty or date_col not in df.columns:
         return df
     out = df.copy()
     out[date_col] = pd.to_datetime(out[date_col], errors="coerce").dt.normalize()
     hoy = _hoy_panama_normalizado()
-    out.loc[out[date_col] > hoy, date_col] = hoy
+    out = out.loc[out[date_col].notna() & (out[date_col] <= hoy)].copy()
     return out
 
 
@@ -1128,13 +1130,15 @@ def _ajustar_fecha_aporte_observado(df: pd.DataFrame, date_col: str = "fecha") -
 def _leer_aportes_observados_csv(path: str, mtime_ns: int) -> pd.DataFrame:
     """Lee una serie de aportes observados diarios y normaliza unidades.
 
-    La serie Discharge_AT_*_Diario se interpreta en p³/s (cfs). Se entregan
-    columnas en p³/s, hm³/día y m³/s para usarla en visores y gráficas.
+    La serie `Discharge_AT_*_Diario` de Aquarius viene en m³/s. El app conserva
+    ese valor como unidad fuente y calcula sus equivalentes en hm³/día y p³/s
+    para visores, gráficas y tablas.
     """
     del mtime_ns
     df = pd.read_csv(path)
+    cols_out = ["fecha", "cfs", "hm3_d", "m3s"]
     if df.empty:
-        return pd.DataFrame(columns=["fecha", "cfs", "hm3_d", "m3s"])
+        return pd.DataFrame(columns=cols_out)
 
     columnas_l = {str(c).strip().lower(): c for c in df.columns}
     col_valor = next(
@@ -1148,53 +1152,55 @@ def _leer_aportes_observados_csv(path: str, mtime_ns: int) -> pd.DataFrame:
                 col_valor = c
                 break
     if col_valor is None:
-        return pd.DataFrame(columns=["fecha", "cfs", "hm3_d", "m3s"])
+        return pd.DataFrame(columns=cols_out)
 
-    # Para series diarias de Aquarius, fecha_fin suele ser el cierre del intervalo
-    # a las 00:00 del día siguiente. Por eso, para el visor operativo se usa
-    # fecha_inicio como fecha del día observado. Esto evita mostrar 22/06 cuando
-    # el aporte corresponde al día operativo 21/06.
+    # En las series diarias `Discharge_AT_*_Diario`, Aquarius etiqueta el
+    # cierre del intervalo a las 00:00 del día siguiente. Por eso se usa
+    # preferentemente `fecha_fin` y, cuando el sello está exactamente a
+    # medianoche, se resta un día: 22/06 00:00 => aporte operativo 21/06.
     col_fecha_inicio = columnas_l.get("fecha_inicio")
     col_fecha_fin = columnas_l.get("fecha_fin")
-    col_fecha = col_fecha_inicio or col_fecha_fin or next(
+    col_fecha = col_fecha_fin or col_fecha_inicio or next(
         (columnas_l[k] for k in ("timestamp", "date", "fecha") if k in columnas_l),
         None,
     )
     out = df.copy()
-    out["cfs"] = pd.to_numeric(out[col_valor], errors="coerce")
+    out["m3s"] = pd.to_numeric(out[col_valor], errors="coerce")
     if col_fecha is not None:
         fechas = pd.to_datetime(out[col_fecha], errors="coerce")
-        if col_fecha_inicio is None and col_fecha_fin is not None and col_fecha == col_fecha_fin:
-            try:
-                mask_cierre_medianoche = (
-                    fechas.notna()
-                    & fechas.dt.hour.eq(0)
-                    & fechas.dt.minute.eq(0)
-                    & fechas.dt.second.eq(0)
-                )
-                fechas = fechas.mask(mask_cierre_medianoche, fechas - pd.Timedelta(days=1))
-            except Exception:
-                pass
+        try:
+            mask_cierre_medianoche = (
+                fechas.notna()
+                & fechas.dt.hour.eq(0)
+                & fechas.dt.minute.eq(0)
+                & fechas.dt.second.eq(0)
+            )
+            fechas = fechas.mask(mask_cierre_medianoche, fechas - pd.Timedelta(days=1))
+        except Exception:
+            pass
         out["fecha"] = fechas
     else:
         out["fecha"] = pd.NaT
-    out = out.loc[out["cfs"].notna() & np.isfinite(out["cfs"]) & (out["cfs"] >= 0)].copy()
+
+    out = out.loc[out["m3s"].notna() & np.isfinite(out["m3s"]) & (out["m3s"] >= 0)].copy()
     out = out.loc[out["fecha"].notna()].sort_values("fecha")
     if out.empty:
-        return pd.DataFrame(columns=["fecha", "cfs", "hm3_d", "m3s"])
+        return pd.DataFrame(columns=cols_out)
 
-    # Igual que en DSS: no se permite que un aporte observado quede fechado
-    # después de hoy Panamá. Si Aquarius trae 22/06 siendo hoy 21/06, se fija
-    # en 21/06 y se consolida ese día para que el visor no salte al futuro.
+    # Luego del ajuste, 22/06 00:00 queda como fecha operativa 21/06.
+    # Se filtran fechas futuras reales y, si hay duplicados del mismo día,
+    # se conserva el último valor cargado para ese día operativo.
     out = _ajustar_fecha_aporte_observado(out, "fecha")
+    if out.empty:
+        return pd.DataFrame(columns=cols_out)
     out = (
         out.groupby("fecha", as_index=False)
-           .agg(cfs=("cfs", "mean"))
+           .agg(m3s=("m3s", "last"))
            .sort_values("fecha")
     )
 
-    out["hm3_d"] = out["cfs"].astype(float) * CFS2HM3
-    out["m3s"] = out["cfs"].astype(float) * CFS2M3S
+    out["hm3_d"] = out["m3s"].astype(float) / HM3D2M3S
+    out["cfs"] = out["m3s"].astype(float) * M3S2CFS
     return out[["fecha", "cfs", "hm3_d", "m3s"]].reset_index(drop=True)
 
 
@@ -2747,9 +2753,9 @@ def _tarjeta_aporte_observado(embalse, resumen, archivo):
         <div class="lkh-card">
             <div class="label">📈 Aporte observado {embalse}</div>
             <div class="value">{resumen['ultimo_hm3']:.2f} hm³/d</div>
-            <div class="sub">{resumen['ultimo_cfs']:,.0f} p³/s · {resumen['ultimo_m3s']:.2f} m³/s · último {fecha_txt}</div>
-            <div class="sub">Prom. {resumen['n']}d: {resumen['prom_hm3']:.2f} hm³/d · {resumen['prom_cfs']:,.0f} p³/s · {resumen['prom_m3s']:.2f} m³/s</div>
-            <div class="sub">Prom. {resumen['n30']}d: {resumen['prom30_hm3']:.2f} hm³/d · {resumen['prom30_cfs']:,.0f} p³/s · {resumen['prom30_m3s']:.2f} m³/s</div>
+            <div class="sub">{resumen['ultimo_m3s']:.2f} m³/s · {resumen['ultimo_cfs']:,.0f} p³/s · último {fecha_txt}</div>
+            <div class="sub">Prom. {resumen['n']}d: {resumen['prom_hm3']:.2f} hm³/d · {resumen['prom_m3s']:.2f} m³/s · {resumen['prom_cfs']:,.0f} p³/s</div>
+            <div class="sub">Prom. {resumen['n30']}d: {resumen['prom30_hm3']:.2f} hm³/d · {resumen['prom30_m3s']:.2f} m³/s · {resumen['prom30_cfs']:,.0f} p³/s</div>
             <div class="sub">{archivo}</div>
         </div>
         ''',
@@ -2785,9 +2791,9 @@ if mostrar_aportes_observados:
                 <div class="lkh-card">
                     <div class="label">📈 Aporte observado total</div>
                     <div class="value">{_total_ult_hm3:.2f} hm³/d</div>
-                    <div class="sub">{_total_ult_cfs:,.0f} p³/s · {_total_ult_m3s:.2f} m³/s · Gatún + Alhajuela</div>
-                    <div class="sub">Prom. {dias_kpi_superiores}d: {_total_p7_hm3:.2f} hm³/d · {_total_p7_cfs:,.0f} p³/s · {_total_p7_m3s:.2f} m³/s</div>
-                    <div class="sub">Prom. 30d: {_total_p30_hm3:.2f} hm³/d · {_total_p30_cfs:,.0f} p³/s · {_total_p30_m3s:.2f} m³/s</div>
+                    <div class="sub">{_total_ult_m3s:.2f} m³/s · {_total_ult_cfs:,.0f} p³/s · Gatún + Alhajuela</div>
+                    <div class="sub">Prom. {dias_kpi_superiores}d: {_total_p7_hm3:.2f} hm³/d · {_total_p7_m3s:.2f} m³/s · {_total_p7_cfs:,.0f} p³/s</div>
+                    <div class="sub">Prom. 30d: {_total_p30_hm3:.2f} hm³/d · {_total_p30_m3s:.2f} m³/s · {_total_p30_cfs:,.0f} p³/s</div>
                     <div class="sub">Use la pestaña 📈 Aportes observados para la gráfica completa.</div>
                 </div>
                 ''',
@@ -4852,7 +4858,7 @@ with tabs[10]:
         {"Elemento": "EED", "Criterio": "Se muestra como equivalente diario de consumo. Es una referencia visual; no cambia el balance base."},
         {"Elemento": "Área espejo", "Criterio": "Por defecto usa curva hipsométrica Daily y área calculada desde nivel para Gatún y Alhajuela. Manual queda como respaldo."},
         {"Elemento": "Evaporación", "Criterio": "Por defecto usa Aquarius lámina (CZL/PMG) con área Daily calculada desde nivel: hm³/d = mm/d × área(km²) × 0.001 × 0.85. Aquarius volumen usa V Evap 0.85 directo."},
-        {"Elemento": "Aportes observados", "Criterio": "El visor compacto se activa con Ver aportes obs.; la pestaña 📈 Aportes observados muestra series, último dato y promedios en hm³/d, p³/s y m³/s."},
+        {"Elemento": "Aportes observados", "Criterio": "El visor compacto se activa con Ver aportes obs.; la pestaña 📈 Aportes observados muestra series, último dato y promedios en hm³/d, m³/s y p³/s."},
         {"Elemento": "Conversor de volumen", "Criterio": "Permite hm³, MPC y Mgal. Mgal corresponde a millones de galones US."},
         {"Elemento": "Unidad visual", "Criterio": "Cambiar hm³/día, cfs o m³/s solo cambia la visualización; el cálculo base queda en hm³/día."},
     ])
@@ -4910,7 +4916,7 @@ with tabs[11]:
     st.subheader("📈 Aportes observados — demandas")
     st.caption(
         "Carga automática desde `Discharge_AT_GAT_Diario.csv` y `Discharge_AT_ALHA_Diario.csv` "
-        "ubicados en la carpeta `data` o junto al app. El visor presenta hm³/d con conversión a p³/s y m³/s."
+        "ubicados en la carpeta `data` o junto al app. Los valores originales se leen en m³/s; el visor presenta hm³/d con conversión a m³/s y p³/s."
     )
 
     _aportes_tab = _cargar_aportes_observados()
@@ -4927,7 +4933,7 @@ with tabs[11]:
             st.metric(
                 "Gatún último",
                 f"{_sum_gat['ultimo_hm3']:.2f} hm³/d",
-                delta=f"{_sum_gat['ultimo_cfs']:,.0f} p³/s · {_sum_gat['ultimo_m3s']:.2f} m³/s · prom {_sum_gat['n']}d {_sum_gat['prom_hm3']:.2f} hm³/d",
+                delta=f"{_sum_gat['ultimo_m3s']:.2f} m³/s · {_sum_gat['ultimo_cfs']:,.0f} p³/s · prom {_sum_gat['n']}d {_sum_gat['prom_hm3']:.2f} hm³/d",
                 delta_color="off",
             )
         else:
@@ -4937,7 +4943,7 @@ with tabs[11]:
             st.metric(
                 "Alhajuela último",
                 f"{_sum_alh['ultimo_hm3']:.2f} hm³/d",
-                delta=f"{_sum_alh['ultimo_cfs']:,.0f} p³/s · {_sum_alh['ultimo_m3s']:.2f} m³/s · prom {_sum_alh['n']}d {_sum_alh['prom_hm3']:.2f} hm³/d",
+                delta=f"{_sum_alh['ultimo_m3s']:.2f} m³/s · {_sum_alh['ultimo_cfs']:,.0f} p³/s · prom {_sum_alh['n']}d {_sum_alh['prom_hm3']:.2f} hm³/d",
                 delta_color="off",
             )
         else:
@@ -4951,7 +4957,7 @@ with tabs[11]:
             st.metric(
                 "Total observado último",
                 f"{_total_hm3_u:.2f} hm³/d",
-                delta=f"{_total_cfs_u:,.0f} p³/s · {_total_m3s_u:.2f} m³/s · prom {_sum_gat['n']}d {_total_prom_hm3:.2f} hm³/d",
+                delta=f"{_total_m3s_u:.2f} m³/s · {_total_cfs_u:,.0f} p³/s · prom {_sum_gat['n']}d {_total_prom_hm3:.2f} hm³/d",
                 delta_color="off",
             )
         else:
@@ -4995,7 +5001,7 @@ with tabs[11]:
                 fig_ap.add_trace(go.Scatter(
                     x=_de["fecha"], y=_de["hm3_d"], mode="lines+markers", name=_emb,
                     customdata=np.stack([_de["cfs"], _de["m3s"]], axis=-1),
-                    hovertemplate="%{x|%d/%m/%Y}<br>%{y:.2f} hm³/d<br>%{customdata[0]:,.0f} p³/s<br>%{customdata[1]:.2f} m³/s<extra>" + _emb + "</extra>",
+                    hovertemplate="%{x|%d/%m/%Y}<br>%{y:.2f} hm³/d<br>%{customdata[1]:.2f} m³/s<br>%{customdata[0]:,.0f} p³/s<extra>" + _emb + "</extra>",
                 ))
 
         if not _gat_df.empty and not _alh_df.empty:
@@ -5011,7 +5017,7 @@ with tabs[11]:
                 x=_mt["fecha"], y=_mt["Total hm³/d"], mode="lines", name="Total",
                 line=dict(dash="dash"),
                 customdata=np.stack([_mt["Total p³/s"], _mt["Total m³/s"]], axis=-1),
-                hovertemplate="%{x|%d/%m/%Y}<br>%{y:.2f} hm³/d<br>%{customdata[0]:,.0f} p³/s<br>%{customdata[1]:.2f} m³/s<extra>Total</extra>",
+                hovertemplate="%{x|%d/%m/%Y}<br>%{y:.2f} hm³/d<br>%{customdata[1]:.2f} m³/s<br>%{customdata[0]:,.0f} p³/s<extra>Total</extra>",
             ))
 
         fig_ap.update_layout(

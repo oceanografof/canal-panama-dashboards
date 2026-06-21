@@ -82,6 +82,7 @@ DSS_NAMES = [
 DATA_DIR_NAME = "data"
 
 CFS_TO_M3S     = 0.028316846592
+M3S_TO_CFS     = 1 / CFS_TO_M3S
 CFS_TO_HM3_DAY = CFS_TO_M3S * 86400 / 1_000_000
 
 # Evaporación automática:
@@ -157,17 +158,56 @@ def today_panama() -> pd.Timestamp:
 
 
 def clamp_observed_future_dates(df: pd.DataFrame, date_col: str = "Fecha_dia") -> pd.DataFrame:
-    """Corrige observaciones que por zona horaria/sello de tiempo caigan en un día futuro.
+    """Normaliza observaciones y elimina registros posteriores al día operativo actual.
 
-    Los aportes y niveles observados no deben aparecer después del día actual operativo.
-    Si un BulkExport trae un sello futuro por conversión/horario, se coloca en el día actual.
+    Para las series diarias de aporte `Discharge_AT_*_Diario`, la corrección
+    principal de fecha se hace en `read_bulk_csv`: el sello 00:00 del día
+    siguiente se asigna al día operativo anterior. Aquí solo se bloquean
+    fechas futuras reales para que no aparezcan en gráficas ni métricas.
     """
     if df is None or df.empty or date_col not in df.columns:
         return df
     out = df.copy()
     out[date_col] = pd.to_datetime(out[date_col], errors="coerce").dt.normalize()
     today = today_panama()
-    out.loc[out[date_col] > today, date_col] = today
+    out = out.loc[out[date_col].notna() & (out[date_col] <= today)].copy()
+    return out
+
+
+def _is_daily_discharge_at_m3s(filename: str = "", header_text: str = "", columns: Optional[List[object]] = None) -> bool:
+    """Identifica las series Aquarius `Discharge_AT_*_Diario` que vienen en m³/s.
+
+    Estas series llegan normalizadas como `fecha_inicio, fecha_fin, valor_raw`
+    y el valor **no** está en p³/s. Se convierte internamente a p³/s para
+    compararlo con AP DSS, que se mantiene en p³/s.
+    """
+    joined = " ".join([str(filename or ""), str(header_text or ""), " ".join(map(str, columns or []))])
+    joined = joined.upper()
+    compact = re.sub(r"[^A-Z0-9]+", "_", joined)
+    return any(token in compact for token in (
+        "DISCHARGE_AT_GAT_DIARIO",
+        "DISCHARGE_AT_ALHA_DIARIO",
+        "DISCHARGE_AT_MAD_DIARIO",
+    ))
+
+
+def _shift_daily_midnight_to_operational_day(fechas: pd.Series) -> pd.Series:
+    """Convierte el sello 00:00 del día siguiente al día operativo anterior.
+
+    Ejemplo operativo: `22/06/2026 00:00` corresponde al aporte diario del
+    `21/06/2026`. Esta regla se aplica solo a `Discharge_AT_*_Diario`.
+    """
+    out = pd.to_datetime(fechas, errors="coerce")
+    try:
+        mask_midnight = (
+            out.notna()
+            & out.dt.hour.eq(0)
+            & out.dt.minute.eq(0)
+            & out.dt.second.eq(0)
+        )
+        out = out.mask(mask_midnight, out - pd.Timedelta(days=1))
+    except Exception:
+        pass
     return out
 
 
@@ -707,6 +747,10 @@ def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, 
 
     Retorna: (df_diario, embalse, variable, serie_name)
     df_diario tiene columnas: Fecha_dia, Valor, Fuente
+
+    Nota operativa: para `Discharge_AT_*_Diario`, `valor_raw` se lee como
+    m³/s, se convierte a p³/s en `Valor` y el sello 00:00 se asigna al día
+    operativo anterior.
     variable: 'nivel' | 'aporte'
     """
     empty = pd.DataFrame(columns=["Fecha_dia", "Valor", "Fuente"])
@@ -766,10 +810,18 @@ def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, 
 
     cols = list(df.columns)
     norm = {_norm_col(c): c for c in cols}
+    is_daily_discharge_m3s = variable == "aporte" and _is_daily_discharge_at_m3s(filename, meta_text, cols)
 
-    preferred_time_names = [
-        "fecha_inicio", "timestamp", "sello de tiempo", "sello", "fecha", "date", "time"
-    ]
+    if is_daily_discharge_m3s:
+        # En `Discharge_AT_*_Diario`, el cierre del intervalo llega como
+        # fecha_fin 00:00 del día siguiente. Por eso se prefiere fecha_fin.
+        preferred_time_names = [
+            "fecha_fin", "fecha_inicio", "timestamp", "sello de tiempo", "sello", "fecha", "date", "time"
+        ]
+    else:
+        preferred_time_names = [
+            "fecha_inicio", "timestamp", "sello de tiempo", "sello", "fecha", "date", "time"
+        ]
     time_col = None
     for key in preferred_time_names:
         for n, original in norm.items():
@@ -824,6 +876,13 @@ def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, 
     out["Fecha"] = pd.to_datetime(df[time_col], errors="coerce")
     raw_val = df[value_col].astype(str).str.replace(",", ".", regex=False).str.strip()
     out["Valor"] = pd.to_numeric(raw_val, errors="coerce")
+
+    if is_daily_discharge_m3s:
+        # `valor_raw` viene en m³/s; internamente se conserva `Valor` en p³/s
+        # para compararlo con AP DSS. Además, 22/06 00:00 => operativo 21/06.
+        out["Fecha"] = _shift_daily_midnight_to_operational_day(out["Fecha"])
+        out["Valor"] = out["Valor"] * M3S_TO_CFS
+
     out = out.dropna(subset=["Fecha", "Valor"]).sort_values("Fecha")
     out["Fuente"] = filename or serie
 
@@ -831,8 +890,9 @@ def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, 
         return empty, embalse, variable, serie
 
     # Agregar a diario.
-    # - Nivel subdiario: último valor diario, más representativo del estado operativo.
-    # - Aporte diario/subdiario: promedio diario.
+    # - Nivel: último valor diario, más representativo del estado operativo.
+    # - Aporte: último valor del día operativo. En `Discharge_AT_*_Diario`,
+    #   el valor ya representa el cierre diario en m³/s convertido a p³/s.
     out["Fecha_dia"] = out["Fecha"].dt.floor("D")
     out = clamp_observed_future_dates(out, "Fecha_dia")
 
@@ -843,7 +903,7 @@ def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, 
         )
     else:
         daily = out.groupby("Fecha_dia", as_index=False).agg(
-            Valor=("Valor", "mean"),
+            Valor=("Valor", "last"),
             Fuente=("Fuente", "last"),
         )
 
@@ -2436,6 +2496,7 @@ def tab_aporte_obs_embalse(
     )
     st.caption(SIMULATION_NOTE)
     st.caption("Las etiquetas AP se corrigen por excedencia: P95 es el aporte más seco y P5 el más húmedo; el visor muestra P5 arriba y P95 abajo.")
+    st.caption("Para `Discharge_AT_*_Diario`, el CSV se lee en m³/s, se convierte a p³/s internamente y el sello 00:00 se asigna al día operativo anterior.")
 
     try:
         raw = load_dss_sheet(dss_bytes, cfg["sheet"])
@@ -3392,14 +3453,15 @@ def load_observed_data() -> Tuple[
         out = out.dropna(subset=["Fecha_dia", "Valor"]).sort_values(["Fecha_dia", "_source_order"])
 
         # Niveles: conservar el último valor disponible del día/fuente prioritaria.
-        # Aportes: promedio diario si hay más de una muestra válida del mismo día.
+        # Aportes: conservar el último valor del día operativo. Esto evita promediar
+        # el 21/06 con el sello 22/06 00:00 cuando ese último corresponde al 21/06.
         if variable == "nivel":
             out = out.groupby("Fecha_dia", as_index=False).agg(
                 Valor=("Valor", "last"), Fuente=("Fuente", "last")
             )
         else:
             out = out.groupby("Fecha_dia", as_index=False).agg(
-                Valor=("Valor", "mean"), Fuente=("Fuente", "last")
+                Valor=("Valor", "last"), Fuente=("Fuente", "last")
             )
         return out
 
