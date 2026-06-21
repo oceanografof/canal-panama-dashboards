@@ -1484,7 +1484,7 @@ def sidebar() -> Dict:
     ap_distribution_mode = st.sidebar.radio(
         "Forma diaria de los aportes DSS",
         ["Simular último hidrograma de mayo", "Ver aporte semanal DSS"],
-        index=0,
+        index=1,
         key="ap_distribution_mode",
         help=(
             "Simular último hidrograma de mayo redistribuye la forma diaria del AP, "
