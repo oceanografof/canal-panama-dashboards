@@ -1930,7 +1930,7 @@ def _validar_opcion_session(key: str, opciones: list[str], default: str) -> None
     except Exception:
         st.session_state[key] = default
 
-_validar_opcion_session("fuente_evap", ["Manual", "Aquarius · lámina (mm/día)", "Aquarius · caudal/volumen"], "Aquarius · lámina (mm/día)")
+_validar_opcion_session("fuente_evap", ["Manual", "Aquarius · lámina (mm/día)", "Aquarius · caudal/volumen", "LakeHouse · promedio"], "Aquarius · lámina (mm/día)")
 _validar_opcion_session("curva_gat", ["Estándar", "Daily"], "Daily")
 _validar_opcion_session("curva_alh", ["Estándar", "Daily"], "Daily")
 _validar_opcion_session("amg", ["Calcular desde nivel (ft)", "Manual"], "Calcular desde nivel (ft)")
@@ -2206,7 +2206,7 @@ evap_alh_mm_manual = st.sidebar.number_input(
     help="Se usa únicamente cuando la fuente seleccionada es Manual."
 )
 if _evap_manual_bloqueado:
-    st.sidebar.caption("Los valores manuales quedan guardados como respaldo, pero no alimentan el balance mientras Aquarius esté activo.")
+    st.sidebar.caption("Los valores manuales quedan guardados como respaldo, pero no alimentan el balance mientras la fuente automática seleccionada esté activa.")
 
 _evap_aq_gat = None
 _evap_aq_alh = None

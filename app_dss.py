@@ -2314,7 +2314,8 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
     st.subheader("🧭 Manejo de embalses — apoyo a la decisión")
     st.caption(
         f"{PROJ_NOTE} · Gatún y Alhajuela/Madden se evalúan por separado. "
-        f"Referencia: Gatún P{pct_ref_gat} · Alhajuela/Madden P{pct_ref_alh}."
+        f"Selector inicial: Gatún P{pct_ref_gat} · Alhajuela/Madden P{pct_ref_alh}. "
+        "Cuando hay observado, la referencia usada es la probabilidad de excedencia más cercana."
     )
 
     c1, c2, c3 = st.columns(3)
@@ -2359,17 +2360,9 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
         v_cols  = cols_by_prefix(daily, "V",  token)
         hp_cols = cols_by_prefix(daily, "HP", token)
 
-        # Elegir columnas con respaldo: si el percentil seleccionado no existe
-        # en alguna variable, se usa el percentil disponible más cercano para
-        # evitar valores None en la tabla de Manejo/Decisión.
-        np_col, np_pct = pick_percentile_column(np_cols, pct_ref)
-        v_col,  v_pct  = pick_percentile_column(v_cols,  pct_ref)
-        hp_col, hp_pct = pick_percentile_column(hp_cols, pct_ref)
-
-        # AP usa etiqueta corregida como probabilidad de excedencia por magnitud:
-        # menor AP → P95; mayor AP → P5.
-        ap_pct_map = ordered_percentile_map_by_value(daily, ap_cols)
-        ap_col, ap_pct = pick_percentile_column(ap_cols, pct_ref, pct_map=ap_pct_map)
+        # Las columnas DSS se seleccionan más abajo, usando como referencia la
+        # probabilidad de excedencia más cercana al dato observado disponible.
+        # Si no hay observado, se conserva el percentil seleccionado en la barra lateral.
 
         # Último observado
         obs_val, obs_date = None, None
@@ -2387,6 +2380,40 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
         base = daily.sort_values("Fecha_dia")
         exact = base[base["Fecha_dia"] == ref_date]
         row_dss = exact.iloc[0] if not exact.empty else base.loc[(base["Fecha_dia"] - ref_date).abs().idxmin()]
+
+        # Referencia por cercanía para nivel: usa la curva NP más cercana al nivel observado.
+        # Referencia por cercanía para AP/HP: usa la curva AP más cercana al aporte observado
+        # total. Si no existe aporte observado, AP/HP heredan la referencia cercana del nivel.
+        level_ref_pct = int(str(closest["label"]).replace("P", "")) if closest else int(pct_ref)
+        closest_ap = None
+        if _valid_df(obs_ap_df):
+            obs_ap_valid = clamp_observed_future_dates(obs_ap_df, "Fecha_dia")
+            obs_ap_valid = obs_ap_valid[obs_ap_valid["Valor"].notna()].copy()
+            obs_ap_valid["Fecha_dia"] = pd.to_datetime(obs_ap_valid["Fecha_dia"], errors="coerce").dt.normalize()
+            obs_ap_valid = obs_ap_valid[obs_ap_valid["Fecha_dia"].notna()].sort_values("Fecha_dia")
+            obs_ap_past = obs_ap_valid[obs_ap_valid["Fecha_dia"] <= today_panama()]
+            if not obs_ap_past.empty:
+                last_ap = obs_ap_past.iloc[-1]
+            elif not obs_ap_valid.empty:
+                last_ap = obs_ap_valid.iloc[-1]
+            else:
+                last_ap = None
+            if last_ap is not None:
+                closest_ap = _nearest_ap_percentile(
+                    daily, cfg, pd.to_datetime(last_ap["Fecha_dia"]), float(last_ap["Valor"]),
+                    dss_add_cfs=evap_cfs,
+                )
+
+        ap_ref_pct_eff = int(closest_ap["percentile"]) if closest_ap else int(level_ref_pct)
+
+        np_col, np_pct = pick_percentile_column(np_cols, level_ref_pct)
+        v_col,  v_pct  = pick_percentile_column(v_cols,  level_ref_pct)
+        hp_col, hp_pct = pick_percentile_column(hp_cols, ap_ref_pct_eff)
+
+        # AP usa etiqueta corregida como probabilidad de excedencia por magnitud:
+        # menor AP → P95; mayor AP → P5.
+        ap_pct_map = ordered_percentile_map_by_value(daily, ap_cols, ref_row=row_dss)
+        ap_col, ap_pct = pick_percentile_column(ap_cols, ap_ref_pct_eff, pct_map=ap_pct_map)
 
         np_v  = float(row_dss.get(np_col, np.nan))  if np_col  else np.nan
         ap_v  = convert_flow(ap_total_dss_cfs([row_dss.get(ap_col, np.nan)], evap_cfs), flow_unit).iloc[0] if ap_col else np.nan
@@ -2420,13 +2447,14 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
             "Estado":                    semaforo,
             "Obs. LKH (ft)":             _fmt(obs_val),
             "Fecha obs.":                f"{obs_date:%d-%m-%Y}" if obs_date else "—",
-            "Percentil referencia":      f"P{pct_ref}",
+            "Percentil referencia":      f"NP P{level_ref_pct} · AP/HP P{ap_ref_pct_eff}",
             "Nivel DSS usado (ft)":      _fmt(np_v),
             f"AP total DSS usado ({unit_label(flow_unit)})": _fmt(ap_v, 2),
             f"Vertido DSS usado ({unit_label(flow_unit)})": _fmt(v_v, 2),
             "Hidrogeneración DSS usada (MW)": _fmt(hp_v, 2),
             "Series DSS usadas":         f"NP P{np_pct if np_pct is not None else '—'} · AP total P{ap_pct if ap_pct is not None else '—'} (+{evap_cfs:,.1f} p³/s evap.) · V P{v_pct if v_pct is not None else '—'} · HP P{hp_pct if hp_pct is not None else '—'}",
             "Percentil nivel cercano":   closest["label"] if closest else "—",
+            "Percentil AP cercano":      closest_ap["label"] if closest_ap else "—",
             "Umbral embalse (ft)":       _fmt(threshold_ft, 3),
             "Δ Obs-NP (ft)":             _fmt(diff_np, 3),
             f"AP total prom. {horizon}d ({unit_label(flow_unit)})": _fmt(ap_prom, 2),
@@ -2557,9 +2585,10 @@ def _nearest_ap_percentile(
         AP total DSS estimado = AP neto DSS + evaporación (p³/s)
 
     Criterio del indicador: las etiquetas se tratan como probabilidad de
-    excedencia hidrológica. Por eso, si el observado cae entre dos curvas, se
-    asigna la curva inferior del tramo (por ejemplo, entre P95 y P90 se reporta
-    P95). Esto evita que el indicador del último dato se invierta visualmente.
+    excedencia hidrológica y la referencia se escoge por cercanía absoluta.
+    Es decir, si el observado cae entre dos curvas, se toma la curva cuyo
+    valor DSS esté más cerca del observado, sin importar si queda por arriba
+    o por debajo.
     """
     if daily is None or daily.empty or ref_date is None or pd.isna(obs_total_cfs):
         return None
@@ -2600,20 +2629,26 @@ def _nearest_ap_percentile(
     if not candidates:
         return None
 
-    # Orden por caudal: menor caudal debe corresponder a mayor excedencia.
-    candidates = sorted(candidates, key=lambda r: (r["dss_total_cfs"], -r["percentile"]))
+    # Referencia por vecino más cercano: compara contra TODAS las curvas
+    # disponibles y selecciona la menor diferencia absoluta Obs-DSS.
+    # Si una curva está por arriba y otra por debajo, gana la que tenga el
+    # menor |Obs-DSS|; solo en empate se conserva la mayor excedencia como
+    # criterio conservador.
     obs = float(obs_total_cfs)
+    for r in candidates:
+        r["diff_cfs"] = obs - float(r["dss_total_cfs"])
+        r["abs_diff_cfs"] = abs(float(r["diff_cfs"]))
 
-    # Indicador por tramo: último valor <= observado. Si el observado cae por
-    # debajo de todas las curvas, se usa la curva más baja (P95). Si queda por
-    # encima de todas, se usa la más alta (P5).
-    eligible = [r for r in candidates if r["dss_total_cfs"] <= obs]
-    if eligible:
-        selected = eligible[-1]
-    else:
-        selected = candidates[0]
+    selected = min(
+        candidates,
+        key=lambda r: (
+            float(r["abs_diff_cfs"]),
+            -int(r["percentile"]),
+            float(r["dss_total_cfs"]),
+        ),
+    )
 
-    diff = obs - float(selected["dss_total_cfs"])
+    diff = float(selected["diff_cfs"])
     rel = abs(diff) / max(abs(obs), 1e-9) * 100
     estado = "🟢 Muy cercano" if rel <= 10 else ("🟠 Seguimiento" if rel <= 25 else "🔴 Revisar")
     return {
@@ -2624,12 +2659,13 @@ def _nearest_ap_percentile(
         "dss_total_cfs": float(selected["dss_total_cfs"]),
         "dss_cfs": float(selected["dss_total_cfs"]),  # compatibilidad
         "diff_cfs": float(diff),
+        "abs_diff_cfs": float(selected.get("abs_diff_cfs", abs(diff))),
         "rel_pct": float(rel),
         "estado": estado,
         "date": pd.to_datetime(row["Fecha_dia"]),
         "exact_date": exact_date,
         "evap_cfs": evap,
-        "criterio": "tramo_excedencia",
+        "criterio": "vecino_mas_cercano_absoluto",
     }
 
 
@@ -2728,7 +2764,32 @@ def tab_aporte_obs_embalse(
 
     ap_pct_map = ordered_percentile_map_by_value(daily, ap_cols)
     pcts_available = sorted(set(ap_pct_map.values()))
-    default_p = [p for p in [90, 50, 10] if p in pcts_available] or pcts_available[:3]
+
+    # La referencia visual/operativa se toma del AP DSS más cercano al último
+    # aporte observado del período filtrado. No importa si la curva DSS queda
+    # por arriba o por debajo: se usa la menor diferencia absoluta Obs-DSS.
+    nearest_ref_pct = int(pct_ref)
+    latest_nearest_for_ref = None
+    latest_obs_for_ref = None
+    if not obs_f.empty and obs_f["Aporte total observado (p³/s)"].notna().any():
+        valid_obs_ref = obs_f.dropna(subset=["Aporte total observado (p³/s)"]).sort_values("Fecha_dia")
+        if not valid_obs_ref.empty:
+            latest_obs_for_ref = valid_obs_ref.iloc[-1]
+            latest_nearest_for_ref = _nearest_ap_percentile(
+                daily, cfg, pd.to_datetime(latest_obs_for_ref["Fecha_dia"]),
+                float(latest_obs_for_ref["Aporte total observado (p³/s)"]),
+                dss_add_cfs=clean_evap_cfs(evap_cfs),
+            )
+            if latest_nearest_for_ref:
+                nearest_ref_pct = int(latest_nearest_for_ref["percentile"])
+
+    default_p = []
+    for p in [nearest_ref_pct, int(pct_ref), 90, 50, 10]:
+        if p in pcts_available and p not in default_p:
+            default_p.append(p)
+    if not default_p:
+        default_p = pcts_available[:3]
+
     sel_pcts = st.multiselect(
         f"Percentiles AP total DSS estimado — {embalse}",
         pcts_available,
@@ -2736,6 +2797,11 @@ def tab_aporte_obs_embalse(
         format_func=lambda x: f"P{x}",
         key=f"ap_obs_{res_key}",
     )
+    if latest_nearest_for_ref:
+        st.caption(
+            f"Referencia AP por cercanía: **{latest_nearest_for_ref['label']}** "
+            "(menor diferencia absoluta Obs-DSS; puede estar por arriba o por debajo del observado)."
+        )
 
     # Métricas del último observado total.
     if not obs_f.empty and obs_f["Aporte total observado (p³/s)"].notna().any():
@@ -2743,7 +2809,7 @@ def tab_aporte_obs_embalse(
         last = valid_obs.iloc[-1]
         last_total_cfs = float(last["Aporte total observado (p³/s)"])
         last_date = pd.to_datetime(last["Fecha_dia"])
-        nearest = _nearest_ap_percentile(daily, cfg, last_date, last_total_cfs, dss_add_cfs=clean_evap_cfs(evap_cfs))
+        nearest = latest_nearest_for_ref or _nearest_ap_percentile(daily, cfg, last_date, last_total_cfs, dss_add_cfs=clean_evap_cfs(evap_cfs))
 
         unit_lbl = unit_label(flow_unit)
         last_total_unit = convert_flow(pd.Series([last_total_cfs]), flow_unit).iloc[0]
@@ -2794,22 +2860,22 @@ def tab_aporte_obs_embalse(
             mode="lines",
             name=f"AP total DSS est. P{pct}",
             line=dict(
-                width=3.2 if pct == pct_ref else (2.5 if pct == 50 else 1.4),
-                dash="solid" if pct in (pct_ref, 50) else "dot",
+                width=3.2 if pct == nearest_ref_pct else (2.5 if pct in (pct_ref, 50) else 1.4),
+                dash="solid" if pct in (nearest_ref_pct, pct_ref, 50) else "dot",
                 color=EXCEEDANCE_COLORS.get(pct, "#aaa"),
             ),
             hovertemplate=f"Fecha: %{{x|%d-%m-%Y}}<br>AP total DSS: %{{y:,.2f}} {unit_label(flow_unit)}<extra></extra>",
         ))
 
     if show_dss_neto:
-        ref_col = next((c for c, p in ap_pct_map.items() if p == pct_ref), None)
+        ref_col = next((c for c, p in ap_pct_map.items() if p == nearest_ref_pct), None)
         if ref_col and ref_col in daily_f.columns:
             vals_net = convert_flow(daily_f[ref_col], flow_unit)
             fig.add_trace(go.Scatter(
                 x=daily_f["Fecha_dia"],
                 y=vals_net,
                 mode="lines",
-                name=f"AP neto DSS P{pct_ref}",
+                name=f"AP neto DSS ref. P{nearest_ref_pct}",
                 line=dict(color="#64748b", width=1.8, dash="dash"),
                 opacity=0.7,
             ))
@@ -3836,7 +3902,7 @@ Estos selectores funcionan como referencia operativa para cada embalse. Se usan 
 - **Exportar**;
 - métricas o tablas que requieren un percentil fijo.
 
-Importante: las tarjetas que dicen **percentil cercano** pueden mostrar un percentil diferente al seleccionado porque la app calcula automáticamente el percentil más parecido al dato observado. Es decir, el selector define la referencia operativa, pero el indicador cercano se calcula con el nivel o aporte observado.
+Importante: las tarjetas que dicen **percentil cercano** pueden mostrar un percentil diferente al seleccionado porque la app calcula automáticamente el percentil más parecido al dato observado. La referencia operativa para AP se toma por **diferencia absoluta mínima Obs-DSS**, sin importar si la curva DSS queda por arriba o por debajo del observado.
 
 #### 3. Evaporación GAT y Evaporación ALHA
 
