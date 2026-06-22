@@ -55,6 +55,7 @@ MAX_ZIP_UNCOMPRESSED_BYTES = 220 * 1024 * 1024
 # Archivos raíz que pueden subirse automáticamente.
 ALLOWED_ROOT_FILES = {
     "LakeHouse_Data.xlsx",
+    "SimulacionDSS_2026.xlsx",
     "app_dss.py",
     "app_demandas.py",
     "app_temperatura.py",
@@ -74,6 +75,15 @@ ALLOWED_ROOT_ASSET_PATTERNS = (
     "*.png", "*.jpg", "*.jpeg", "*.webp", "*.svg",
 )
 MAX_AUTO_ASSET_BYTES = 8 * 1024 * 1024
+
+# Libros Excel operativos permitidos en la raíz del repositorio.
+# Se permite .xlsx en raíz para que archivos como SimulacionDSS_2026.xlsx
+# no bloqueen la actualización segura. No se permiten subcarpetas, nombres
+# sensibles ni archivos temporales de Excel (~$...).
+ALLOWED_ROOT_WORKBOOK_PATTERNS = (
+    "*.xlsx",
+)
+MAX_AUTO_WORKBOOK_BYTES = 80 * 1024 * 1024
 
 # Apps Streamlit del repositorio que pueden subirse automáticamente.
 # Esto evita que cada nueva app tipo app_temperatura.py, app_AyS.py,
@@ -454,11 +464,41 @@ def is_allowed_root_asset_file(path: str) -> bool:
         return False
 
 
+def is_allowed_root_workbook_file(path: str) -> bool:
+    """Permite libros Excel operativos en la raíz del repositorio.
+
+    Esto evita que SimulacionDSS_2026.xlsx u otro .xlsx operativo de la raíz
+    bloquee el flujo seguro, sin autorizar subcarpetas, archivos temporales
+    de Excel ni nombres que parezcan credenciales/secretos.
+    """
+    p = path.replace("\\", "/")
+    name = Path(p).name
+    if "/" in p:
+        return False
+    if name.startswith("~$"):
+        return False
+    if is_path_blocked(p):
+        return False
+    if not any(fnmatch.fnmatch(name.lower(), pat.lower()) for pat in ALLOWED_ROOT_WORKBOOK_PATTERNS):
+        return False
+
+    workbook_path = REPO_DIR / p
+    try:
+        return workbook_path.is_file() and workbook_path.stat().st_size <= MAX_AUTO_WORKBOOK_BYTES
+    except OSError:
+        return False
+
+
 def is_allowed_to_commit(path: str) -> bool:
     p = path.replace("\\", "/")
     if is_path_blocked(p):
         return False
-    if "/" not in p and (p in ALLOWED_ROOT_FILES or is_allowed_root_app_file(p) or is_allowed_root_asset_file(p)):
+    if "/" not in p and (
+        p in ALLOWED_ROOT_FILES
+        or is_allowed_root_app_file(p)
+        or is_allowed_root_asset_file(p)
+        or is_allowed_root_workbook_file(p)
+    ):
         return True
     if p.startswith("data/") and Path(p).name in EXPECTED_DATA_FILES:
         return True

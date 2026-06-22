@@ -2180,13 +2180,14 @@ dem_escl_sidebar_ahorro = max(n_npx * vn_sidebar_ahorro + n_pnx * vp_sidebar_aho
 st.sidebar.markdown("### ☀️ Evaporación")
 fuente_evap = st.sidebar.radio(
     "Fuente de evaporación",
-    ["Manual", "Aquarius · lámina (mm/día)", "Aquarius · caudal/volumen"],
+    ["Manual", "Aquarius · lámina (mm/día)", "Aquarius · caudal/volumen", "LakeHouse · promedio"],
     index=1,
     key="fuente_evap",
     help=(
         "Manual: ingresa la lámina por embalse. "
         "Aquarius · lámina: usa CZL para Gatún y PMG para Alhajuela y aplica hm³/d = mm/d × área(km²) × 0.001 × 0.85. "
-        "Aquarius · caudal/volumen: usa directamente las series V Evap 0.85 en hm³/día."
+        "Aquarius · caudal/volumen: usa directamente las series V Evap 0.85 en hm³/día. "
+        "LakeHouse · promedio: toma el promedio de evaporación del LakeHouse para el período seleccionado (1, 5, 7, 10 o 30 días)."
     ),
 )
 
@@ -2212,6 +2213,8 @@ _evap_aq_alh = None
 _evap_modo_efectivo = fuente_evap
 _evap_gat_hm3_directo = None
 _evap_alh_hm3_directo = None
+_evap_lkh_info = _info_defaults_lkh if isinstance(globals().get("_info_defaults_lkh"), dict) else {}
+_evap_lkh_n_dias = _dias_lkh_seguros(_dias_defaults_lkh)
 
 if fuente_evap == "Aquarius · lámina (mm/día)":
     _evap_aq_gat = _cargar_serie_evap_aquarius(EVAP_AQUARIUS_FILES["mm_gat"])
@@ -2245,6 +2248,41 @@ elif fuente_evap == "Aquarius · caudal/volumen":
         st.sidebar.warning(
             "No fue posible usar los dos volúmenes de Aquarius; se aplicaron los valores manuales guardados. "
             + " | ".join(f"{x.get('archivo')}: {x.get('error')}" for x in _faltantes)
+        )
+elif fuente_evap == "LakeHouse · promedio":
+    def _evap_lkh_num(key):
+        try:
+            val = _evap_lkh_info.get(key)
+            if val is None or pd.isna(val):
+                return None
+            val = float(val)
+            return val if np.isfinite(val) and val >= 0 else None
+        except Exception:
+            return None
+
+    _lkh_gat_hm3 = _evap_lkh_num("evap_gat_hm3_lkh")
+    _lkh_alh_hm3 = _evap_lkh_num("evap_alh_hm3_lkh")
+    _lkh_gat_mm = _evap_lkh_num("evap_gat_mm")
+    _lkh_alh_mm = _evap_lkh_num("evap_alh_mm")
+
+    if _lkh_gat_hm3 is not None and _lkh_alh_hm3 is not None:
+        _evap_modo_efectivo = "LakeHouse · volumen promedio"
+        _evap_gat_hm3_directo = _lkh_gat_hm3
+        _evap_alh_hm3_directo = _lkh_alh_hm3
+        # Se completan después de calcular las áreas, como láminas equivalentes.
+        evap_gat_mm = 0.0
+        evap_alh_mm = 0.0
+    elif _lkh_gat_mm is not None and _lkh_alh_mm is not None:
+        _evap_modo_efectivo = "LakeHouse · lámina promedio"
+        evap_gat_mm = _lkh_gat_mm
+        evap_alh_mm = _lkh_alh_mm
+    else:
+        _evap_modo_efectivo = "Manual · respaldo"
+        evap_gat_mm = evap_gat_mm_manual
+        evap_alh_mm = evap_alh_mm_manual
+        st.sidebar.warning(
+            "No fue posible obtener evaporación promedio del LakeHouse para ambos embalses; "
+            "se aplicaron los valores manuales guardados."
         )
 else:
     evap_gat_mm = evap_gat_mm_manual
@@ -2303,13 +2341,13 @@ else:
 # Por lámina, el cálculo operativo queda:
 # hm³/día = mm/día × área(km²) × 0.001 × 0.85
 # La opción Aquarius volumen ya viene como V Evap 0.85 y no se multiplica nuevamente.
-if _evap_modo_efectivo == "Aquarius · caudal/volumen":
+if _evap_modo_efectivo in ("Aquarius · caudal/volumen", "LakeHouse · volumen promedio"):
     evap_gat = max(float(_evap_gat_hm3_directo or 0.0), 0.0)
     evap_alh = max(float(_evap_alh_hm3_directo or 0.0), 0.0)
     # Lámina equivalente para documentar el valor directo ya corregido por 0.85.
     evap_gat_mm = evap_gat / (area_gat * 1e-3 * EVAP_COEF) if area_gat > 0 and EVAP_COEF > 0 else 0.0
     evap_alh_mm = evap_alh / (area_alh * 1e-3 * EVAP_COEF) if area_alh > 0 and EVAP_COEF > 0 else 0.0
-elif _evap_modo_efectivo == "Aquarius · lámina (mm/día)":
+elif _evap_modo_efectivo in ("Aquarius · lámina (mm/día)", "LakeHouse · lámina promedio"):
     evap_gat = max(float(evap_gat_mm), 0.0) * area_gat * 1e-3 * EVAP_COEF
     evap_alh = max(float(evap_alh_mm), 0.0) * area_alh * 1e-3 * EVAP_COEF
 else:
@@ -2328,6 +2366,16 @@ elif _evap_modo_efectivo == "Aquarius · caudal/volumen":
     evap_fuente_corta = "Aquarius volumen"
     evap_detalle_gat = f"GAT · {_evap_aq_gat.get('fecha', 'N/D')}"
     evap_detalle_alh = f"MAD · {_evap_aq_alh.get('fecha', 'N/D')}"
+elif _evap_modo_efectivo == "LakeHouse · volumen promedio":
+    evap_fuente_label = f"LakeHouse · promedio de volumen ({_evap_lkh_n_dias} días)"
+    evap_fuente_corta = "LakeHouse promedio"
+    evap_detalle_gat = f"vol_evap_gat_hm3 · últimos {_evap_lkh_n_dias} días"
+    evap_detalle_alh = f"vol_evap_ala_hm3 · últimos {_evap_lkh_n_dias} días"
+elif _evap_modo_efectivo == "LakeHouse · lámina promedio":
+    evap_fuente_label = f"LakeHouse · promedio de lámina ({_evap_lkh_n_dias} días) × área × 0.85"
+    evap_fuente_corta = "LakeHouse mm"
+    evap_detalle_gat = f"evap_gatun_mm · últimos {_evap_lkh_n_dias} días"
+    evap_detalle_alh = f"evap_alaj_mm · últimos {_evap_lkh_n_dias} días"
 elif _evap_modo_efectivo == "Manual · respaldo":
     evap_fuente_label = "Manual · respaldo por archivo Aquarius no disponible"
     evap_fuente_corta = "Manual respaldo"
