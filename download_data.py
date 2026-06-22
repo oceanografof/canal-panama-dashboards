@@ -375,6 +375,11 @@ EXPECTED_DATA_FILES = {m["out_name"] for m in ALL_SERIES_CONFIG}
 
 BASE_SERIES_OUT_NAMES = {m["out_name"] for m in BASE_SERIES_CONFIG}
 
+# Caché en memoria del respaldo combinado de las 4 series auxiliares
+# (temperatura/viento). Así, si varias fallan por 0 KB individual, el script
+# descarga el BulkExport combinado una sola vez y reutiliza esos CSV.
+BASE_BULK_PAYLOAD_CACHE: dict[str, str] | None = None
+
 # Series que pueden conservar el CSV local anterior si Aquarius responde vacío.
 # Se limita a las 4 series auxiliares de temperatura/viento y al nivel Radar MAD,
 # que fueron las que devolvieron 0 KB en la corrida reportada. Aportes, mareas,
@@ -876,6 +881,10 @@ def download_bytes(url: str) -> bytes:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/csv,application/zip,*/*",
+        # Evita que Aquarius/servidor intermedio devuelva una respuesta vacía/cacheada
+        # cuando el mismo BulkExport se ejecuta varias veces en la mañana.
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
     req = urllib.request.Request(url, headers=headers)
     chunks, total, t0 = [], 0, time.time()
@@ -909,6 +918,9 @@ def decode_bytes(raw: bytes) -> str:
 
 
 def extract_csv_payloads(raw_bytes: bytes, fallback_name: str) -> dict[str, str]:
+    if not raw_bytes or not raw_bytes.strip():
+        raise RuntimeError("Aquarius respondió 0 KB o contenido vacío.")
+
     results: dict[str, str] = {}
     if raw_bytes[:2] == b"PK":
         print("  Formato: ZIP ✅")
@@ -1213,6 +1225,52 @@ def keep_existing_series(series: dict, output_dir: Path, reason: str) -> Path:
     return path
 
 
+def build_base_bulk_url() -> str:
+    """Construye el BulkExport combinado para las 4 series auxiliares.
+
+    Este URL se conserva porque históricamente Aquarius entrega esas series
+    juntas cuando algunas consultas individuales devuelven HTTP 200 con 0 KB.
+    Se agrega un parámetro dinámico para evitar respuestas cacheadas.
+    """
+    separator = "&" if "?" in BASE_BULK_URL else "?"
+    return BASE_BULK_URL + f"{separator}_={int(time.time() * 1000)}"
+
+
+def download_base_bulk_payloads() -> dict[str, str]:
+    """Descarga una sola vez el BulkExport combinado de temperatura/viento."""
+    global BASE_BULK_PAYLOAD_CACHE
+    if BASE_BULK_PAYLOAD_CACHE is not None:
+        return BASE_BULK_PAYLOAD_CACHE
+
+    print("  ↪ Reintentando con respaldo combinado BulkExport/P90D para temperatura-viento...")
+    raw = download_bytes(build_base_bulk_url())
+    payloads = extract_csv_payloads(raw, "Base_Temp_Viento_P90D.csv")
+    if not payloads:
+        raise RuntimeError("El respaldo combinado no devolvió archivos CSV.")
+    BASE_BULK_PAYLOAD_CACHE = payloads
+    return payloads
+
+
+def try_base_bulk_fallback_for_series(series: dict, output_dir: Path, errors: list[str]) -> Path | None:
+    """Intenta rescatar una serie auxiliar desde el BulkExport combinado.
+
+    Se usa únicamente para LAN_WT_AVG_AMA, Telemetria_TEMP_AMA, WS_AVG_LMB
+    y LAN_WS_AVG_FLC. Si tampoco hay filas válidas, se devuelve None para que
+    el flujo conserve el CSV local anterior según la política segura.
+    """
+    if series.get("out_name") not in BASE_SERIES_OUT_NAMES:
+        return None
+
+    try:
+        payloads = download_base_bulk_payloads()
+        return save_single_series(series, payloads, output_dir, merge_with_existing=True)
+    except Exception as e:
+        msg = sanitize_text(str(e))
+        errors.append("respaldo combinado BulkExport/P90D: " + msg)
+        print(f"  ⚠️ Respaldo combinado sin datos válidos para {series['label']}: {msg}")
+        return None
+
+
 def alternate_requests_for_series(series: dict) -> list[dict]:
     """Devuelve consultas alternas seguras cuando Aquarius responde vacío."""
     alternates: list[dict] = []
@@ -1259,12 +1317,21 @@ def download_and_save_series(series: dict, output_dir: Path) -> Path:
         try:
             raw = download_bytes(build_series_url(request_series))
             payloads = extract_csv_payloads(raw, series["out_name"])
-            return save_single_series(series, payloads, output_dir)
+            merge_recent = (
+                attempt_idx > 1
+                and series.get("out_name") in BASE_SERIES_OUT_NAMES
+                and request_series.get("period") == "P90D"
+            )
+            return save_single_series(series, payloads, output_dir, merge_with_existing=merge_recent)
         except Exception as e:
             msg = sanitize_text(str(e))
             errors.append(msg)
             if attempt_idx < len(attempts):
                 print(f"  ⚠️ Intento {attempt_idx} sin datos válidos: {msg}")
+
+    fallback_path = try_base_bulk_fallback_for_series(series, output_dir, errors)
+    if fallback_path is not None:
+        return fallback_path
 
     reason = errors[-1] if errors else "Aquarius no entregó datos válidos"
     if len(errors) > 1:
@@ -1306,7 +1373,37 @@ def choose_best_payload_for_series(series: dict, csv_map: dict[str, str]) -> tup
     return filename, norm
 
 
-def save_single_series(series: dict, csv_map: dict[str, str], output_dir: Path) -> Path:
+def merge_normalized_with_existing(path: Path, new_norm: str) -> str:
+    """Combina un CSV normalizado reciente con el histórico local.
+
+    Se usa para respaldos P90D de temperatura/viento: actualiza los datos
+    recientes sin recortar años de historial ya válidos en disco.
+    """
+    if not path.exists():
+        return new_norm
+
+    ok, _detail = is_valid_normalized_csv(path)
+    if not ok:
+        return new_norm
+
+    try:
+        old_df = pd.read_csv(path, dtype={"fecha_inicio": str, "fecha_fin": str, "valor_raw": str})
+        new_df = pd.read_csv(io.StringIO(new_norm), dtype={"fecha_inicio": str, "fecha_fin": str, "valor_raw": str})
+        required_cols = ["fecha_inicio", "fecha_fin", "valor_raw"]
+        old_df = old_df[required_cols].copy()
+        new_df = new_df[required_cols].copy()
+        merged = pd.concat([old_df, new_df], ignore_index=True)
+        merged["_dt"] = pd.to_datetime(merged["fecha_inicio"], errors="coerce")
+        merged = merged[merged["_dt"].notna()]
+        merged = merged.drop_duplicates(subset=["fecha_inicio"], keep="last")
+        merged = merged.sort_values("_dt")
+        return merged[required_cols].to_csv(index=False, lineterminator="\n").strip()
+    except Exception as e:
+        print(f"  ⚠️ No se pudo fusionar con histórico local de {path.name}; se usará solo la descarga nueva: {sanitize_text(str(e))}")
+        return new_norm
+
+
+def save_single_series(series: dict, csv_map: dict[str, str], output_dir: Path, *, merge_with_existing: bool = False) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     if output_dir.resolve().parent != REPO_DIR.resolve():
         raise RuntimeError("La carpeta data debe estar directamente dentro del repositorio.")
@@ -1320,9 +1417,13 @@ def save_single_series(series: dict, csv_map: dict[str, str], output_dir: Path) 
     if path.resolve().parent != output_dir.resolve():
         raise RuntimeError(f"Ruta de salida insegura: {path}")
 
+    if merge_with_existing:
+        norm = merge_normalized_with_existing(path, norm)
+
     atomic_write_text(path, norm + "\n")
     records = norm.count("\n")
-    print(f"  ✅ {series['label']}: {records} registros → {out_name}")
+    suffix = " (fusionado con histórico local)" if merge_with_existing else ""
+    print(f"  ✅ {series['label']}: {records} registros → {out_name}{suffix}")
     print(f"     Fuente Aquarius: {source_name}")
     return path
 
