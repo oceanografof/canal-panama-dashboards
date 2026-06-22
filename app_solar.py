@@ -204,12 +204,34 @@ def frac_to_hms(frac):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 def dur_to_hms(minutes):
-    """Minutos decimales → H:MM:SS (precisión de segundos)."""
+    """Minutos decimales → H:MM:SS (se conserva para cálculos detallados)."""
     if not minutes: return ""
     total_sec = round(float(minutes) * 60)
     h, rem = divmod(total_sec, 3600)
     m, s   = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}"
+
+
+def dur_to_hm_clock(minutes):
+    """Minutos decimales → H:MM para visores/relojes.
+    Evita horas decimales tipo 12.64 h; los minutos siempre quedan en 00–59.
+    """
+    if minutes is None:
+        return ""
+    try:
+        if math.isnan(float(minutes)):
+            return ""
+    except Exception:
+        return ""
+    total_min = int(round(float(minutes)))
+    h, m = divmod(total_min, 60)
+    return f"{h}:{m:02d}"
+
+
+def dur_to_hm_label(minutes):
+    """Minutos decimales → etiqueta compacta 'H:MM h' para tarjetas."""
+    hm = dur_to_hm_clock(minutes)
+    return f"{hm} h" if hm else ""
 
 
 # Mapa de nombres español (clave interna → etiqueta)
@@ -820,7 +842,7 @@ if mode == "📅 Diario":
     kpi_data = [
         ("🌅 Amanecer",        frac_to_hm(sr_frac),   PALETTE["sunrise"]),
         ("🌇 Atardecer",       frac_to_hm(ss_frac),   PALETTE["sunrise"]),
-        ("⏱ Horas de Sol",     f"{dur_min/60:.2f} h", PALETTE["duration"]),
+        ("⏱ Horas de Sol",     dur_to_hm_label(dur_min), PALETTE["duration"]),
         ("🕛 Mediodía Solar",   frac_to_hm(noon_frac), PALETTE["noon"]),        
         ("🔆 Elevación Máx.",  f"{max_el:.1f}°",       PALETTE["elevation"]),
         ("🌐 Declinación",     f"{decl_deg:.3f}°",     PALETTE["declin"]),
@@ -946,42 +968,42 @@ else:
     idx_max_el  = df_y["solar_elevation_corr"].idxmax()
 
     # ── KPI anuales: valor principal + sub-valor + etiqueta ─────────
-    # Duraciones con precisión de segundos
-    _dur_max_hms   = dur_to_hms(df_y.loc[idx_max_dur, "sunlight_duration"])
-    _dur_min_hms   = dur_to_hms(df_y.loc[idx_min_dur, "sunlight_duration"])
-    _night_max_hms = dur_to_hms(1440 - df_y.loc[idx_min_dur, "sunlight_duration"])
-    _night_min_hms = dur_to_hms(1440 - df_y.loc[idx_max_dur, "sunlight_duration"])
-    _sr_max = frac_to_hms(df_y.loc[idx_max_dur, "sunrise"])
-    _ss_max = frac_to_hms(df_y.loc[idx_max_dur, "sunset"])
-    _sr_min = frac_to_hms(df_y.loc[idx_min_dur, "sunrise"])
-    _ss_min = frac_to_hms(df_y.loc[idx_min_dur, "sunset"])
+    # Duraciones en formato reloj H:MM, sin horas decimales ni segundos
+    _dur_max_hm    = dur_to_hm_clock(df_y.loc[idx_max_dur, "sunlight_duration"])
+    _dur_min_hm    = dur_to_hm_clock(df_y.loc[idx_min_dur, "sunlight_duration"])
+    _night_max_hm  = dur_to_hm_clock(1440 - df_y.loc[idx_min_dur, "sunlight_duration"])
+    _night_min_hm  = dur_to_hm_clock(1440 - df_y.loc[idx_max_dur, "sunlight_duration"])
+    _sr_max = frac_to_hm(df_y.loc[idx_max_dur, "sunrise"])
+    _ss_max = frac_to_hm(df_y.loc[idx_max_dur, "sunset"])
+    _sr_min = frac_to_hm(df_y.loc[idx_min_dur, "sunrise"])
+    _ss_min = frac_to_hm(df_y.loc[idx_min_dur, "sunset"])
 
     # Fila 1: Día más largo / corto / Noche más larga / corta / Elevación
     _kpi_anual = [
         {
             "lbl"  : "☀️ Día más largo",
-            "main" : _dur_max_hms,
+            "main" : _dur_max_hm,
             "sub"  : df_y.loc[idx_max_dur,"date"].strftime("%d %b"),
             "extra": f"↑ {_sr_max}  ↓ {_ss_max}",
             "color": "#00C9A7",
         },
         {
             "lbl"  : "🌑 Día más corto",
-            "main" : _dur_min_hms,
+            "main" : _dur_min_hm,
             "sub"  : df_y.loc[idx_min_dur,"date"].strftime("%d %b"),
             "extra": f"↑ {_sr_min}  ↓ {_ss_min}",
             "color": "#4A90D9",
         },
         {
             "lbl"  : "🌙 Noche más larga",
-            "main" : _night_max_hms,
+            "main" : _night_max_hm,
             "sub"  : df_y.loc[idx_min_dur,"date"].strftime("%d %b"),
             "extra": "= 24 h − día más corto",
             "color": "#9B59B6",
         },
         {
             "lbl"  : "🌟 Noche más corta",
-            "main" : _night_min_hms,
+            "main" : _night_min_hm,
             "sub"  : df_y.loc[idx_max_dur,"date"].strftime("%d %b"),
             "extra": "= 24 h − día más largo",
             "color": "#F5A623",
@@ -1218,7 +1240,7 @@ Lat: `{lat:.4f}°` · Lon: `{lon:.4f}°` · TZ: `UTC{tz:+d}`
             fig_dur = go.Figure(go.Bar(
                 x=MESES_ABREV, y=medias,
                 marker_color="#1ABC9C",
-                text=[f"{v:.2f} h" for v in medias],
+                text=[f"{dur_to_hm_clock(v*60)} h" for v in medias],
                 textposition="outside"))
             fig_dur.add_hline(y=12, line_dash="dot", line_color="#555",
                               annotation_text="12 h")
