@@ -3732,6 +3732,345 @@ def add_operational_week_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _weekly_ap_obs_vs_dss_table(
+    dss_bytes: bytes,
+    res_key: str,
+    flow_unit: str,
+    obs_aportes: Optional[pd.DataFrame],
+    evap_cfs: float = 0.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Compara el promedio semanal observado de aportes contra AP DSS.
+
+    La semana usada es exactamente la semana operativa del app: sábado-viernes.
+    El AP DSS respeta el modo activo del panel lateral:
+    - "Ver aporte semanal DSS": usa el AP como viene en el DSS.
+    - "Simular último hidrograma de mayo": redistribuye diariamente, pero
+      conserva la suma/promedio semanal DSS.
+    """
+    if dss_bytes is None:
+        return pd.DataFrame(), pd.DataFrame()
+
+    cfg = RESERVOIR_CONFIG[res_key]
+    raw = load_dss_sheet(dss_bytes, cfg["sheet"])
+    daily = to_daily(raw, cfg)
+    daily = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_aportes)
+    if daily is None or daily.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    token = cfg["token"]
+    ap_cols = cols_by_prefix(daily, "AP", token)
+    if not ap_cols:
+        return pd.DataFrame(), pd.DataFrame()
+
+    base = daily.copy()
+    base["Fecha_dia"] = pd.to_datetime(base["Fecha_dia"], errors="coerce").dt.normalize()
+    base = base[base["Fecha_dia"].notna()].sort_values("Fecha_dia")
+    base = add_operational_week_columns(base)
+    base["Año semana"] = pd.to_datetime(base["Inicio semana"], errors="coerce").dt.year
+    group_cols = ["Año semana", "Semana operativa", "Inicio semana", "Fin semana"]
+
+    pct_map = ordered_percentile_map_by_value(base, ap_cols)
+    evap = clean_evap_cfs(evap_cfs)
+
+    dss_total_cols: Dict[str, str] = {}
+    for col in ap_cols:
+        pct = int(pct_map.get(col, exceedance_pct(col)))
+        safe_col = f"AP_total_DSS_P{pct}_{col}"
+        while safe_col in base.columns:
+            safe_col += "_x"
+        base[safe_col] = ap_total_dss_cfs(base[col], evap)
+        dss_total_cols[col] = safe_col
+
+    agg_spec = {safe_col: "mean" for safe_col in dss_total_cols.values()}
+    agg_spec["Fecha_dia"] = "count"
+    weekly_dss = base.groupby(group_cols, as_index=False).agg(agg_spec)
+    weekly_dss = weekly_dss.rename(columns={"Fecha_dia": "Días DSS"})
+
+    # Tabla ancha con todos los percentiles DSS semanales para trazabilidad.
+    wide = weekly_dss[group_cols + ["Días DSS"]].copy()
+    for col, safe_col in dss_total_cols.items():
+        pct = int(pct_map.get(col, exceedance_pct(col)))
+        wide[f"AP DSS semanal P{pct} (p³/s)"] = pd.to_numeric(weekly_dss[safe_col], errors="coerce")
+
+    if obs_aportes is None or not isinstance(obs_aportes, pd.DataFrame) or obs_aportes.empty:
+        return pd.DataFrame(), wide
+
+    obs = clamp_observed_future_dates(obs_aportes, "Fecha_dia")
+    obs = obs.copy()
+    obs["Fecha_dia"] = pd.to_datetime(obs["Fecha_dia"], errors="coerce").dt.normalize()
+    obs["Valor"] = pd.to_numeric(obs["Valor"], errors="coerce")
+    if "Fuente" not in obs.columns:
+        obs["Fuente"] = "Aporte observado"
+    obs = obs.dropna(subset=["Fecha_dia", "Valor"]).sort_values("Fecha_dia")
+    obs = obs[obs["Valor"] > 0].copy()
+    if obs.empty:
+        return pd.DataFrame(), wide
+
+    obs = add_operational_week_columns(obs)
+    obs["Año semana"] = pd.to_datetime(obs["Inicio semana"], errors="coerce").dt.year
+    weekly_obs = obs.groupby(group_cols, as_index=False).agg(
+        Aporte_obs_prom_cfs=("Valor", "mean"),
+        Aporte_obs_min_cfs=("Valor", "min"),
+        Aporte_obs_max_cfs=("Valor", "max"),
+        Dias_obs_validos=("Valor", "count"),
+        Fuente=("Fuente", "last"),
+    )
+
+    merged = weekly_obs.merge(weekly_dss, on=group_cols, how="left")
+    rows: List[Dict[str, object]] = []
+    detail_rows: List[Dict[str, object]] = []
+
+    for _, r in merged.iterrows():
+        obs_cfs = pd.to_numeric(pd.Series([r.get("Aporte_obs_prom_cfs", np.nan)]), errors="coerce").iloc[0]
+        if pd.isna(obs_cfs):
+            continue
+
+        candidates: List[Dict[str, object]] = []
+        for col, safe_col in dss_total_cols.items():
+            dss_cfs = pd.to_numeric(pd.Series([r.get(safe_col, np.nan)]), errors="coerce").iloc[0]
+            if pd.isna(dss_cfs):
+                continue
+            pct = int(pct_map.get(col, exceedance_pct(col)))
+            diff_cfs = float(obs_cfs) - float(dss_cfs)
+            abs_diff_cfs = abs(diff_cfs)
+            rel_pct = abs_diff_cfs / max(abs(float(obs_cfs)), 1e-9) * 100.0
+            item = {
+                "column": col,
+                "percentile": pct,
+                "dss_cfs": float(dss_cfs),
+                "diff_cfs": float(diff_cfs),
+                "abs_diff_cfs": float(abs_diff_cfs),
+                "rel_pct": float(rel_pct),
+            }
+            candidates.append(item)
+            detail_rows.append({
+                "Embalse": cfg["name"],
+                "Semana": int(r["Semana operativa"]),
+                "Inicio semana": pd.to_datetime(r["Inicio semana"]),
+                "Fin semana": pd.to_datetime(r["Fin semana"]),
+                "Percentil AP DSS": f"P{pct}",
+                "Aporte observado semanal prom. (p³/s)": float(obs_cfs),
+                "AP DSS semanal (p³/s)": float(dss_cfs),
+                "Obs-DSS (p³/s)": float(diff_cfs),
+                "Diferencia abs. (%)": float(rel_pct),
+            })
+
+        if not candidates:
+            continue
+
+        nearest = min(
+            candidates,
+            key=lambda x: (
+                float(x["abs_diff_cfs"]),
+                -int(x["percentile"]),
+                float(x["dss_cfs"]),
+            ),
+        )
+
+        obs_unit = convert_flow(pd.Series([float(obs_cfs)]), flow_unit).iloc[0]
+        dss_unit = convert_flow(pd.Series([nearest["dss_cfs"]]), flow_unit).iloc[0]
+        diff_unit = convert_flow(pd.Series([nearest["diff_cfs"]]), flow_unit).iloc[0]
+        obs_min_unit = convert_flow(pd.Series([r.get("Aporte_obs_min_cfs", np.nan)]), flow_unit).iloc[0]
+        obs_max_unit = convert_flow(pd.Series([r.get("Aporte_obs_max_cfs", np.nan)]), flow_unit).iloc[0]
+        estado = (
+            "🟢 Muy cercano" if float(nearest["rel_pct"]) <= 10
+            else ("🟠 Seguimiento" if float(nearest["rel_pct"]) <= 25 else "🔴 Revisar")
+        )
+        rows.append({
+            "Embalse": cfg["name"],
+            "Semana": int(r["Semana operativa"]),
+            "Inicio semana": pd.to_datetime(r["Inicio semana"]).strftime("%d-%m-%Y"),
+            "Fin semana": pd.to_datetime(r["Fin semana"]).strftime("%d-%m-%Y"),
+            "Días obs. válidos": int(r.get("Dias_obs_validos", 0)),
+            f"Aporte observado prom. ({unit_label(flow_unit)})": round(float(obs_unit), 3),
+            f"Obs. mínimo ({unit_label(flow_unit)})": round(float(obs_min_unit), 3) if pd.notna(obs_min_unit) else np.nan,
+            f"Obs. máximo ({unit_label(flow_unit)})": round(float(obs_max_unit), 3) if pd.notna(obs_max_unit) else np.nan,
+            "Percentil AP DSS más cercano": f"P{int(nearest['percentile'])}",
+            f"AP DSS semanal cercano ({unit_label(flow_unit)})": round(float(dss_unit), 3),
+            f"Obs-DSS ({unit_label(flow_unit)})": round(float(diff_unit), 3),
+            "Diferencia abs. (%)": round(float(nearest["rel_pct"]), 2),
+            "Estado": estado,
+            "Días DSS": int(r.get("Días DSS", 0)) if pd.notna(r.get("Días DSS", np.nan)) else 0,
+            "Evap. sumada al DSS (p³/s)": round(evap, 3),
+            "Fuente obs.": r.get("Fuente", "—"),
+            "Modo AP DSS": (
+                "Hidrograma mayo conservando semana"
+                if bool(getattr(daily, "attrs", {}).get("ap_may_adjustment", False))
+                else "Semanal DSS original"
+            ),
+        })
+
+    summary = pd.DataFrame(rows)
+    detail = pd.DataFrame(detail_rows)
+    if not summary.empty:
+        summary = summary.sort_values(["Embalse", "Semana"]).reset_index(drop=True)
+    if not detail.empty:
+        detail = detail.sort_values(["Embalse", "Semana", "Percentil AP DSS"]).reset_index(drop=True)
+        for col in detail.columns:
+            if col not in ("Embalse", "Percentil AP DSS"):
+                if "semana" not in col.lower():
+                    detail[col] = pd.to_numeric(detail[col], errors="ignore")
+    return summary, detail
+
+
+def tab_aportes_obs_semanal(
+    dss_bytes: bytes,
+    flow_unit: str,
+    obs_gat: Optional[pd.DataFrame],
+    obs_alh: Optional[pd.DataFrame],
+    evap_gat_cfs: float = 0.0,
+    evap_alh_cfs: float = 0.0,
+) -> None:
+    """Pestaña semanal: aporte observado promedio vs percentil AP DSS cercano."""
+    st.subheader("📅 Aporte observado semanal vs AP DSS")
+    st.caption(
+        "Promedio semanal observado alineado con la semana operativa sábado-viernes. "
+        "Para cada semana se calcula contra todas las curvas AP DSS y se reporta el percentil más cercano "
+        "por diferencia absoluta, sin importar si el DSS queda por arriba o por debajo del observado."
+    )
+
+    tables: List[pd.DataFrame] = []
+    details: List[pd.DataFrame] = []
+    for res_key, obs_df, evap in [
+        ("gatun", obs_gat, evap_gat_cfs),
+        ("alhajuela", obs_alh, evap_alh_cfs),
+    ]:
+        try:
+            summary, detail = _weekly_ap_obs_vs_dss_table(
+                dss_bytes=dss_bytes,
+                res_key=res_key,
+                flow_unit=flow_unit,
+                obs_aportes=obs_df,
+                evap_cfs=evap,
+            )
+            if not summary.empty:
+                tables.append(summary)
+            if not detail.empty:
+                details.append(detail)
+        except Exception as exc:
+            st.warning(f"{RESERVOIR_CONFIG[res_key]['name']}: no se pudo calcular el resumen semanal — {exc}")
+
+    if not tables:
+        st.warning("No hay aportes observados semanales para comparar. Verifique que estén disponibles los CSV `Discharge_AT_GAT_Diario.csv` y `Discharge_AT_ALHA_Diario.csv` en `data/` o súbalos desde la barra lateral.")
+        return
+
+    table = pd.concat(tables, ignore_index=True).sort_values(["Embalse", "Semana"])
+    detail_table = pd.concat(details, ignore_index=True) if details else pd.DataFrame()
+
+    min_week = int(table["Semana"].min())
+    max_week = int(table["Semana"].max())
+    default_start = max(23, min_week) if max_week >= 23 else min_week
+    c1, c2, c3 = st.columns([0.8, 0.8, 1.1])
+    w1 = c1.number_input("Semana inicial", min_value=min_week, max_value=max_week, value=default_start, step=1, key="apw_s")
+    w2 = c2.number_input("Semana final", min_value=min_week, max_value=max_week, value=max_week, step=1, key="apw_e")
+    embalse_sel = c3.multiselect(
+        "Embalse",
+        sorted(table["Embalse"].dropna().unique().tolist()),
+        default=sorted(table["Embalse"].dropna().unique().tolist()),
+        key="apw_embalse",
+    )
+    if w1 > w2:
+        st.warning("Semana inicial mayor que final. Se muestra todo el período.")
+        w1, w2 = min_week, max_week
+
+    show_tbl = table[
+        (table["Semana"] >= int(w1))
+        & (table["Semana"] <= int(w2))
+        & (table["Embalse"].isin(embalse_sel))
+    ].copy()
+
+    st.markdown("#### Resumen por semana")
+    st.dataframe(show_tbl, use_container_width=True, hide_index=True, height=520)
+
+    if not show_tbl.empty:
+        latest = show_tbl.sort_values(["Embalse", "Semana"]).groupby("Embalse", as_index=False).tail(1)
+        cols = st.columns(len(latest))
+        for idx, (_, r) in enumerate(latest.iterrows()):
+            diff_col = next((c for c in show_tbl.columns if c.startswith("Obs-DSS (")), None)
+            obs_col = next((c for c in show_tbl.columns if c.startswith("Aporte observado prom.")), None)
+            cols[idx].metric(
+                f"{r['Embalse']} · semana {int(r['Semana'])}",
+                str(r["Percentil AP DSS más cercano"]),
+                delta=f"{r[diff_col]:+,.2f} {unit_label(flow_unit)}" if diff_col else None,
+                delta_color="inverse",
+                help=f"Aporte observado prom.: {r[obs_col]:,.2f} {unit_label(flow_unit)} · Diferencia abs.: {r['Diferencia abs. (%)']:.2f}%" if obs_col else None,
+            )
+
+    csv = show_tbl.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "⬇️ Descargar resumen semanal observado vs DSS",
+        csv,
+        "aporte_observado_semanal_vs_dss.csv",
+        "text/csv",
+        key="apw_dl",
+    )
+
+    if PLOTLY_OK and not show_tbl.empty:
+        obs_col = next((c for c in show_tbl.columns if c.startswith("Aporte observado prom.")), None)
+        dss_col = next((c for c in show_tbl.columns if c.startswith("AP DSS semanal cercano")), None)
+        if obs_col and dss_col:
+            plot_rows = []
+            for _, r in show_tbl.iterrows():
+                plot_rows.append({
+                    "Embalse": r["Embalse"],
+                    "Semana": int(r["Semana"]),
+                    "Serie": "Aporte observado semanal",
+                    "Valor": r[obs_col],
+                    "Percentil": "Observado",
+                })
+                plot_rows.append({
+                    "Embalse": r["Embalse"],
+                    "Semana": int(r["Semana"]),
+                    "Serie": "AP DSS semanal más cercano",
+                    "Valor": r[dss_col],
+                    "Percentil": r["Percentil AP DSS más cercano"],
+                })
+            plot_df = pd.DataFrame(plot_rows)
+            fig = px.line(
+                plot_df,
+                x="Semana",
+                y="Valor",
+                color="Serie",
+                line_dash="Embalse",
+                markers=True,
+                hover_data=["Embalse", "Percentil"],
+                title=f"Aporte observado semanal vs AP DSS más cercano ({unit_label(flow_unit)})",
+            )
+            fig.update_layout(height=560, hovermode="x unified")
+            fig.update_yaxes(title=unit_label(flow_unit))
+            st.plotly_chart(fig, use_container_width=True, key="apw_plot")
+
+    if not detail_table.empty:
+        with st.expander("🔎 Detalle: comparación contra todos los percentiles DSS", expanded=False):
+            detail_show = detail_table[
+                (detail_table["Semana"] >= int(w1))
+                & (detail_table["Semana"] <= int(w2))
+                & (detail_table["Embalse"].isin(embalse_sel))
+            ].copy()
+            # Conversión visual adicional en la unidad activa.
+            detail_show[f"Aporte observado semanal prom. ({unit_label(flow_unit)})"] = convert_flow(
+                detail_show["Aporte observado semanal prom. (p³/s)"], flow_unit
+            ).round(3)
+            detail_show[f"AP DSS semanal ({unit_label(flow_unit)})"] = convert_flow(
+                detail_show["AP DSS semanal (p³/s)"], flow_unit
+            ).round(3)
+            detail_show[f"Obs-DSS ({unit_label(flow_unit)})"] = convert_flow(
+                detail_show["Obs-DSS (p³/s)"], flow_unit
+            ).round(3)
+            for c in ["Aporte observado semanal prom. (p³/s)", "AP DSS semanal (p³/s)", "Obs-DSS (p³/s)", "Diferencia abs. (%)"]:
+                if c in detail_show.columns:
+                    detail_show[c] = pd.to_numeric(detail_show[c], errors="coerce").round(3)
+            st.dataframe(detail_show, use_container_width=True, hide_index=True, height=420)
+            st.download_button(
+                "⬇️ Descargar detalle de todos los percentiles",
+                detail_show.to_csv(index=False).encode("utf-8-sig"),
+                "detalle_aporte_observado_semanal_todos_percentiles.csv",
+                "text/csv",
+                key="apw_detail_dl",
+            )
+
+
+
 def tab_hp_semanal(dss_bytes: bytes) -> None:
     st.subheader("⚡ Hidrogeneración DSS")
     st.caption("Promedio semanal de HP del DSS. Semana operativa sábado-viernes.")
@@ -3829,16 +4168,19 @@ Esta versión incorpora mejoras puntuales para la lectura operativa:
 2. **Orden visual húmedo-seco en las gráficas.**  
    Las gráficas y el visor unificado de Plotly se ordenan de **húmedo a seco**: **P5 arriba** y **P95 abajo**. Este criterio aplica a niveles, hidrogeneración, aportes, vertidos y esclusajes cuando las series estén disponibles.
 
-3. **Pestaña Aporte instantáneo.**  
+3. **Pestaña AP semanal observado.**  
+   Se agregó una pestaña independiente para calcular el **promedio semanal observado de aportes** por embalse, usando la misma semana operativa sábado-viernes del app. Para cada semana se compara el promedio observado contra todos los AP DSS y se reporta el **percentil de excedencia más cercano**.
+
+4. **Pestaña Aporte instantáneo.**  
    Se agregó una pestaña para ver el visor meteorológico/radar y comparar:
    - aporte de Aquarius/BulkExport;
    - aporte manual instantáneo ingresado por el usuario;
    - AP total DSS estimado.
 
-4. **Pestaña Exportar.**  
+5. **Pestaña Exportar.**  
    Se agregó una pestaña para exportar el percentil seleccionado por embalse, incluyendo nivel, hidrogeneración, aportes, vertidos y esclusajes cuando existan en el DSS.
 
-5. **Selectores independientes por embalse.**  
+6. **Selectores independientes por embalse.**  
    Gatún y Alhajuela/Madden tienen percentiles de referencia separados. Esto permite evaluar un embalse bajo P95 y el otro bajo P50, por ejemplo, sin mezclar las condiciones.
 
 ---
@@ -4138,6 +4480,7 @@ def main() -> None:
         "🧭 Manejo / Decisión",
         "🌧️ Aporte GAT obs",
         "🌧️ Aporte ALHA obs",
+        "📅 AP semanal obs",
         "🔀 Comparativo",
         "⚡ Hidrogeneración DSS",
         "⚡ Aporte instantáneo",
@@ -4156,14 +4499,16 @@ def main() -> None:
     with tabs[4]:
         _run_tab("Aporte ALHA obs", tab_aporte_obs_embalse, "alhajuela", dss_bytes, flow_unit, pct_ref_alh, obs_alh_aporte, evap_alh_cfs)
     with tabs[5]:
-        _run_tab("Comparativo", tab_comparativo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_nivel, obs_alh_nivel, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
+        _run_tab("AP semanal obs", tab_aportes_obs_semanal, dss_bytes, flow_unit, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
     with tabs[6]:
-        _run_tab("Hidrogeneración DSS", tab_hp_semanal, dss_bytes)
+        _run_tab("Comparativo", tab_comparativo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_nivel, obs_alh_nivel, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
     with tabs[7]:
-        _run_tab("Aporte instantáneo", tab_aporte_instantaneo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
+        _run_tab("Hidrogeneración DSS", tab_hp_semanal, dss_bytes)
     with tabs[8]:
-        _run_tab("Exportar", tab_exportar_percentil, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, evap_gat_cfs, evap_alh_cfs, obs_gat_aporte, obs_alh_aporte)
+        _run_tab("Aporte instantáneo", tab_aporte_instantaneo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
     with tabs[9]:
+        _run_tab("Exportar", tab_exportar_percentil, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, evap_gat_cfs, evap_alh_cfs, obs_gat_aporte, obs_alh_aporte)
+    with tabs[10]:
         _run_tab("Instructivo", tab_instructivo)
 
     st.markdown(
