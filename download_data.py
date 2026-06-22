@@ -189,7 +189,9 @@ SERIES_CONFIG = [
         "interval": "PointsAsRecorded",
         "time_aligned": "True",
         "date_range": "Years1",
-        "calendar": "CALENDARYEAR2",
+        # Enlace operativo indicado por Aquarius para Madden Radar usa CALENDARYEAR.
+        # CALENDARYEAR2 estaba devolviendo 0 KB en algunas corridas.
+        "calendar": "CALENDARYEAR",
         "out_name": "Lake_Res_elevation_Telem_Radar_MAD.csv",
         "label": "Nivel Lake-Res Telem Radar @ MAD",
         "kind_keywords": ["Lake-Res elevation.Telem Radar@MAD", "Telem Radar@MAD", "Radar@MAD"],
@@ -370,6 +372,14 @@ BASE_SERIES_CONFIG = [
 
 ALL_SERIES_CONFIG = SERIES_CONFIG + BASE_SERIES_CONFIG
 EXPECTED_DATA_FILES = {m["out_name"] for m in ALL_SERIES_CONFIG}
+
+BASE_SERIES_OUT_NAMES = {m["out_name"] for m in BASE_SERIES_CONFIG}
+
+# Series que pueden conservar el CSV local anterior si Aquarius responde vacío.
+# Se limita a las 4 series auxiliares de temperatura/viento y al nivel Radar MAD,
+# que fueron las que devolvieron 0 KB en la corrida reportada. Aportes, mareas,
+# evaporación y otros insumos principales siguen bloqueando el push si fallan.
+KEEP_LOCAL_IF_EMPTY_FILES = BASE_SERIES_OUT_NAMES | {"Lake_Res_elevation_Telem_Radar_MAD.csv"}
 
 
 @dataclass
@@ -1164,6 +1174,104 @@ def clean_legacy_data_files(output_dir: Path) -> None:
             print(f"  🧹 Archivo anterior eliminado: {legacy.name}")
 
 
+def is_valid_normalized_csv(path: Path) -> tuple[bool, str]:
+    """Valida que un CSV normalizado existente todavía sea utilizable."""
+    if not path.exists() or not path.is_file():
+        return False, "no existe"
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        return False, f"no se pudo leer ({sanitize_text(str(e))})"
+
+    required = {"fecha_inicio", "fecha_fin", "valor_raw"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        return False, "faltan columnas: " + ", ".join(sorted(missing_cols))
+    if df.empty or df["valor_raw"].notna().sum() < 1:
+        return False, "no tiene registros válidos"
+    return True, "OK"
+
+
+def keep_existing_series(series: dict, output_dir: Path, reason: str) -> Path:
+    """Conserva el CSV local si Aquarius respondió vacío o sin filas válidas."""
+    out_name = Path(series["out_name"]).name
+    path = output_dir / out_name
+
+    if out_name not in KEEP_LOCAL_IF_EMPTY_FILES:
+        raise RuntimeError(reason)
+
+    ok, detail = is_valid_normalized_csv(path)
+    if not ok:
+        raise RuntimeError(
+            f"{reason} Además, no se pudo conservar {out_name} porque {detail}."
+        )
+
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    print(f"  ⚠️ {series['label']}: Aquarius no entregó filas válidas; se conserva CSV local anterior → {out_name}")
+    print(f"     Motivo: {reason}")
+    print(f"     Archivo local válido desde disco, modificado {mtime:%Y-%m-%d %H:%M:%S}")
+    return path
+
+
+def alternate_requests_for_series(series: dict) -> list[dict]:
+    """Devuelve consultas alternas seguras cuando Aquarius responde vacío."""
+    alternates: list[dict] = []
+    out_name = series.get("out_name")
+
+    # Las 4 series de temperatura/viento han respondido 0 KB al pedirse como
+    # Instantaneous / EntirePeriodOfRecord. El BulkExport histórico funcionaba
+    # con ventana corta, Hourly, Aggregate y P90D; se usa como respaldo.
+    if out_name in BASE_SERIES_OUT_NAMES:
+        alt = dict(series)
+        alt.update({
+            "calculation": "Aggregate",
+            "interval": "Hourly",
+            "time_aligned": "False",
+            "date_range": "Custom",
+            "period": "P90D",
+            "calendar": "CALENDARYEAR2",
+            "fallback_label": "respaldo Hourly/Aggregate/P90D",
+        })
+        alternates.append(alt)
+
+    # Respaldo para Madden Radar por si Aquarius vuelve a requerir CALENDARYEAR2
+    # en algún ambiente, aunque el intento principal queda con CALENDARYEAR.
+    if out_name == "Lake_Res_elevation_Telem_Radar_MAD.csv":
+        alt = dict(series)
+        alt.update({
+            "calendar": "CALENDARYEAR2",
+            "fallback_label": "respaldo CALENDARYEAR2",
+        })
+        alternates.append(alt)
+
+    return alternates
+
+
+def download_and_save_series(series: dict, output_dir: Path) -> Path:
+    """Descarga una serie con intentos alternos antes de conservar local."""
+    attempts = [series] + alternate_requests_for_series(series)
+    errors: list[str] = []
+
+    for attempt_idx, request_series in enumerate(attempts, start=1):
+        if attempt_idx > 1:
+            label = request_series.get("fallback_label", f"intento alterno {attempt_idx}")
+            print(f"  ↪ Reintentando con {label}...")
+        try:
+            raw = download_bytes(build_series_url(request_series))
+            payloads = extract_csv_payloads(raw, series["out_name"])
+            return save_single_series(series, payloads, output_dir)
+        except Exception as e:
+            msg = sanitize_text(str(e))
+            errors.append(msg)
+            if attempt_idx < len(attempts):
+                print(f"  ⚠️ Intento {attempt_idx} sin datos válidos: {msg}")
+
+    reason = errors[-1] if errors else "Aquarius no entregó datos válidos"
+    if len(errors) > 1:
+        reason = reason + " | intentos previos: " + " ; ".join(errors[:-1])
+    return keep_existing_series(series, output_dir, reason)
+
+
 def choose_best_payload_for_series(series: dict, csv_map: dict[str, str]) -> tuple[str, str]:
     """Escoge el CSV descargado para una serie individual.
 
@@ -1221,20 +1329,22 @@ def save_single_series(series: dict, csv_map: dict[str, str], output_dir: Path) 
 
 def verify_expected_outputs(saved: list[Path]) -> None:
     saved_names = {p.name for p in saved}
-    expected_names = {m["out_name"] for m in ALL_SERIES_CONFIG}
-    missing = sorted(expected_names - saved_names)
-    if missing:
+    missing_from_run = sorted({m["out_name"] for m in ALL_SERIES_CONFIG} - saved_names)
+    if missing_from_run:
         raise RuntimeError(
-            "No se actualizaron todas las series requeridas. Faltan: " + ", ".join(missing)
+            "No se actualizaron ni se conservaron todas las series requeridas. Faltan: "
+            + ", ".join(missing_from_run)
         )
 
-    print("\n── Verificación de archivos actualizados ──────")
+    print("\n── Verificación de archivos disponibles ──────")
     for meta in ALL_SERIES_CONFIG:
         path = OUTPUT_DIR / meta["out_name"]
-        if not path.exists():
-            raise RuntimeError(f"No existe el archivo esperado: {path.name}")
+        ok, detail = is_valid_normalized_csv(path)
+        if not ok:
+            raise RuntimeError(f"Archivo esperado inválido: {path.name} ({detail})")
         mtime = datetime.fromtimestamp(path.stat().st_mtime)
-        print(f"  ✅ {path.name:<40} modificado {mtime:%Y-%m-%d %H:%M:%S}")
+        marca = "actualizado/conservado" if path.name in saved_names else "existente"
+        print(f"  ✅ {path.name:<40} {marca}; modificado {mtime:%Y-%m-%d %H:%M:%S}")
 
 
 
@@ -1304,25 +1414,29 @@ def main() -> None:
     for idx, series in enumerate(ALL_SERIES_CONFIG, start=1):
         print(f"\n  Serie {idx}/{len(ALL_SERIES_CONFIG)}: {series['label']}")
         try:
-            raw = download_bytes(build_series_url(series))
-            payloads = extract_csv_payloads(raw, series["out_name"])
-            saved_path = save_single_series(series, payloads, OUTPUT_DIR)
+            saved_path = download_and_save_series(series, OUTPUT_DIR)
             saved.append(saved_path)
         except Exception as e:
             msg = sanitize_text(str(e))
             failures.append(f"{series['out_name']}: {msg}")
             print(f"  ❌ No se pudo actualizar {series['label']}: {msg}")
 
-    print(f"\n[2/4] Verificando que todos los CSV requeridos se hayan actualizado en: {OUTPUT_DIR}")
+    print(f"\n[2/4] Verificando que todos los CSV requeridos estén actualizados o conservados en: {OUTPUT_DIR}")
+    verify_ok = True
     try:
         verify_expected_outputs(saved)
     except Exception as e:
+        verify_ok = False
         print(f"\n❌ {sanitize_text(str(e))}")
 
     if failures:
-        print("\n❌ Fallaron una o más series. No se hará commit ni push para evitar subir datos incompletos:")
+        print("\n❌ Fallaron una o más series obligatorias. No se hará commit ni push para evitar subir datos incompletos:")
         for item in failures:
             print(f"    · {item}")
+        sys.exit(1)
+
+    if not verify_ok:
+        print("\n❌ La verificación final no pasó. No se hará commit ni push.")
         sys.exit(1)
 
     if len({p.name for p in saved}) != len(ALL_SERIES_CONFIG):
