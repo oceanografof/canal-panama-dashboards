@@ -120,6 +120,17 @@ AP_HYDROGRAPH_ADJUSTMENT_ENABLED = True
 AP_MAY_HYDROGRAPH_DAYS = 7
 AP_MAY_HYDROGRAPH_MIN_DAYS = 3
 
+# Reparación defensiva para aportes observados Aquarius/BulkExport.
+# En algunas corridas, los CSV de `Discharge_AT_*_Diario` pueden venir con
+# huecos o ceros en la última semana de mayo y junio. La app no debe mostrar
+# esos días como aporte cero si hay valores vecinos válidos; se reconstruyen
+# únicamente para visualización/indicadores usando el valor válido más cercano.
+AP_OBS_GAP_REPAIR_ENABLED = True
+AP_OBS_GAP_REPAIR_START_MONTH = 5
+AP_OBS_GAP_REPAIR_START_DAY = 25
+AP_OBS_GAP_REPAIR_MAX_EXTENSION_DAYS = 5
+AP_OBS_ZERO_IS_MISSING = True
+
 PERCENTILE_ORDER = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95]
 EXCEEDANCE_COLORS = {
     95: "#001f5b", 90: "#003f88", 80: "#005f99", 70: "#0077b6",
@@ -910,6 +921,156 @@ def read_bulk_csv(file_bytes: bytes, filename: str = "") -> Tuple[pd.DataFrame, 
     return daily.sort_values("Fecha_dia"), embalse, variable, serie
 
 
+def _aporte_repair_start_date(dates: pd.Series) -> Optional[pd.Timestamp]:
+    """Inicio del tramo que se blinda para aportes observados: finales de mayo."""
+    valid = pd.to_datetime(dates, errors="coerce").dropna()
+    if valid.empty:
+        return None
+    latest_year = int(valid.max().year)
+    may_start = pd.Timestamp(
+        year=latest_year,
+        month=AP_OBS_GAP_REPAIR_START_MONTH,
+        day=AP_OBS_GAP_REPAIR_START_DAY,
+    )
+    return max(valid.min().normalize(), may_start)
+
+
+def repair_observed_aporte_gaps(
+    df: Optional[pd.DataFrame],
+    reservoir_label: str = "",
+    enabled: bool = AP_OBS_GAP_REPAIR_ENABLED,
+) -> Optional[pd.DataFrame]:
+    """Rellena huecos/ceros de aportes observados desde finales de mayo.
+
+    No modifica niveles ni columnas DSS. Solo aplica a DataFrames de aporte
+    observado con columnas `Fecha_dia`, `Valor`, `Fuente`. La reparación usa el
+    valor válido más cercano dentro de la serie, marca la fuente como relleno y
+    evita que la gráfica/indicadores muestren ceros falsos o días faltantes en
+    la última semana de mayo y junio.
+    """
+    if not enabled or df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    if "Fecha_dia" not in df.columns or "Valor" not in df.columns:
+        return df
+
+    out = df.copy()
+    out["Fecha_dia"] = pd.to_datetime(out["Fecha_dia"], errors="coerce").dt.normalize()
+    out["Valor"] = pd.to_numeric(out["Valor"], errors="coerce")
+    if "Fuente" not in out.columns:
+        out["Fuente"] = reservoir_label or "Aporte observado"
+    out = out.dropna(subset=["Fecha_dia"]).sort_values("Fecha_dia")
+    if out.empty:
+        return out
+
+    # Ceros/negativos en aportes diarios son tratados como huecos operativos.
+    # Esto evita la línea roja pegada al eje inferior cuando Aquarius entrega 0
+    # en días que realmente deben conservar la continuidad del hidrograma.
+    if AP_OBS_ZERO_IS_MISSING:
+        out.loc[out["Valor"] <= 0, "Valor"] = np.nan
+
+    # Si hay duplicados, conserva el último valor válido del día. Si el último
+    # era NaN por un cero, usa el último valor válido de ese mismo día.
+    def _last_valid(series: pd.Series):
+        valid = pd.to_numeric(series, errors="coerce").dropna()
+        return valid.iloc[-1] if not valid.empty else np.nan
+
+    out = out.groupby("Fecha_dia", as_index=False).agg(
+        Valor=("Valor", _last_valid),
+        Fuente=("Fuente", "last"),
+    ).sort_values("Fecha_dia")
+
+    valid_dates = out.loc[out["Valor"].notna(), "Fecha_dia"]
+    if valid_dates.empty:
+        return out
+
+    start = _aporte_repair_start_date(out["Fecha_dia"])
+    if start is None:
+        return out
+    last_valid = pd.to_datetime(valid_dates.max()).normalize()
+    today = today_panama()
+    end = max(pd.to_datetime(out["Fecha_dia"].max()).normalize(), last_valid)
+    # Solo se extiende al día actual si el último dato válido está cerca; así no
+    # se replica una serie vieja por muchos días.
+    if today > end and (today - last_valid).days <= AP_OBS_GAP_REPAIR_MAX_EXTENSION_DAYS:
+        end = today
+    end = min(end, today) if pd.notna(today) else end
+    if pd.isna(start) or pd.isna(end) or start > end:
+        return out
+
+    full_idx = pd.date_range(start=start, end=end, freq="D")
+    if full_idx.empty:
+        return out
+
+    base = out.set_index("Fecha_dia").sort_index()
+    base = base[~base.index.duplicated(keep="last")]
+    re = base.reindex(base.index.union(full_idx)).sort_index()
+
+    # Valores anterior/siguiente para escoger el vecino más cercano.
+    prev_val = re["Valor"].ffill()
+    next_val = re["Valor"].bfill()
+    prev_src = re["Fuente"].ffill()
+    next_src = re["Fuente"].bfill()
+
+    idx_series = pd.Series(re.index, index=re.index)
+    valid_mask = re["Valor"].notna()
+    prev_date = idx_series.where(valid_mask).ffill()
+    next_date = idx_series.where(valid_mask).bfill()
+
+    repair_mask = re.index.isin(full_idx) & re["Valor"].isna()
+    for idx in re.index[repair_mask]:
+        pv, nv = prev_val.loc[idx], next_val.loc[idx]
+        if pd.isna(pv) and pd.isna(nv):
+            continue
+        use_next = False
+        if pd.isna(pv):
+            use_next = True
+        elif pd.notna(nv):
+            try:
+                dprev = abs((idx - pd.to_datetime(prev_date.loc[idx])).days)
+                dnext = abs((pd.to_datetime(next_date.loc[idx]) - idx).days)
+                use_next = dnext < dprev
+            except Exception:
+                use_next = False
+        if use_next:
+            re.at[idx, "Valor"] = float(nv)
+            src = str(next_src.loc[idx]) if pd.notna(next_src.loc[idx]) else (reservoir_label or "Aporte observado")
+        else:
+            re.at[idx, "Valor"] = float(pv)
+            src = str(prev_src.loc[idx]) if pd.notna(prev_src.loc[idx]) else (reservoir_label or "Aporte observado")
+        re.at[idx, "Fuente"] = f"{src} · relleno vecino cercano"
+
+    result = re.reset_index().rename(columns={"index": "Fecha_dia"})
+    result["Fecha_dia"] = pd.to_datetime(result["Fecha_dia"], errors="coerce").dt.normalize()
+    result = result.dropna(subset=["Fecha_dia", "Valor"]).sort_values("Fecha_dia")
+    # Mantener todos los datos originales fuera del tramo y el tramo reparado.
+    result = result.groupby("Fecha_dia", as_index=False).agg(
+        Valor=("Valor", "last"),
+        Fuente=("Fuente", "last"),
+    )
+    return result.sort_values("Fecha_dia")
+
+
+def _observed_csv_priority(path: Path) -> Tuple[int, float, str]:
+    """Prioriza CSV críticos de aporte/nivel frente a archivos auxiliares."""
+    name = path.name.lower()
+    priority = 50
+    critical = (
+        "discharge_at_gat_diario.csv",
+        "discharge_at_alha_diario.csv",
+        "lake_res_elevation_telem_avg_gat.csv",
+        "lake_res_elevation_telem_radar_mad.csv",
+    )
+    if name in critical:
+        priority = 0
+    elif name.startswith("discharge_at_"):
+        priority = 1
+    elif "lake_res_elevation" in name:
+        priority = 2
+    elif name.startswith("bulkexport"):
+        priority = 3
+    return (priority, -float(path.stat().st_mtime), name)
+
+
 def discover_local_bulk_csvs() -> List[Path]:
     """Descubre CSV observados, priorizando la carpeta ./data.
 
@@ -942,7 +1103,7 @@ def discover_local_bulk_csvs() -> List[Path]:
                         seen[p.resolve()] = p
                 except OSError:
                     continue
-    return sorted(seen.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+    return sorted(seen.values(), key=_observed_csv_priority)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3387,9 +3548,10 @@ def load_observed_data() -> Tuple[
     remote_errors: List[Dict[str, object]] = []
 
     if use_local:
-        # discover_local_bulk_csvs() retorna primero los más recientes. Se invierte
-        # para que, al consolidar por día, el archivo local más nuevo prevalezca.
-        for p in reversed(discover_local_bulk_csvs()[:20]):
+        # discover_local_bulk_csvs() prioriza los CSV críticos de aporte/nivel.
+        # Se invierte para que, al consolidar por día, los archivos críticos
+        # normalizados prevalezcan sobre BulkExport antiguos o copias auxiliares.
+        for p in reversed(discover_local_bulk_csvs()[:120]):
             try:
                 sources.append((p.read_bytes(), p.name))
             except Exception:
@@ -3463,6 +3625,7 @@ def load_observed_data() -> Tuple[
             out = out.groupby("Fecha_dia", as_index=False).agg(
                 Valor=("Valor", "last"), Fuente=("Fuente", "last")
             )
+            out = repair_observed_aporte_gaps(out, enabled=AP_OBS_GAP_REPAIR_ENABLED)
         return out
 
     return _concat(gat_nivel, "nivel"), _concat(alh_nivel, "nivel"), _concat(gat_aporte, "aporte"), _concat(alh_aporte, "aporte")
