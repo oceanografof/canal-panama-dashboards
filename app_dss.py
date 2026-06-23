@@ -47,7 +47,7 @@ st.set_page_config(
 APP_TITLE   = "DSS Simulación 2026 · Embalses ACP"
 AUTHOR_NOTE = "· Hidrólogo / Oceanógrafo Físico · ACP-HIMH"
 SIMULATION_NOTE = "Simulación realizada por JFRodriguez"
-PROJ_NOTE   = "Proyecciones basadas en el decenio 2015-2024."
+PROJ_NOTE   = "Proyecciones basadas en el decenio 2016-2025."
 VIEW_FILE   = "dss_views.txt"
 VIEW_STATE_DIR = ".app_state"
 RADAR_URL   = "https://radar-meteorologico.delcanal.com/es.gif"
