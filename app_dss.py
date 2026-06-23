@@ -3918,7 +3918,7 @@ def _weekly_ap_obs_vs_dss_table(
         for col in detail.columns:
             if col not in ("Embalse", "Percentil AP DSS"):
                 if "semana" not in col.lower():
-                    detail[col] = pd.to_numeric(detail[col], errors="ignore")
+                    detail[col] = pd.to_numeric(detail[col], errors="coerce")
     return summary, detail
 
 
@@ -4102,6 +4102,465 @@ def tab_aportes_obs_semanal(
 
 
 
+# ─────────────────────────────────────────────────────────────────────
+# AP SEMANAL GRÁFICO / ESCLUSAJES GATÚN
+# ─────────────────────────────────────────────────────────────────────
+def _week_start_options_for_tab(key: str, default: str = "Lunes a domingo") -> Tuple[str, int, str]:
+    """Selector local de semana para pestañas semanales.
+
+    No cambia la semana operativa global de la aplicación ni la distribución
+    diaria del DSS. Solo define cómo se agrupan los promedios en la pestaña
+    donde se llama.
+    """
+    day_options = {
+        "Lunes a domingo": 0,
+        "Sábado a viernes (semana operativa DSS)": 5,
+    }
+    labels = list(day_options.keys())
+    index = labels.index(default) if default in labels else 0
+    label = st.radio(
+        "Definición de semana",
+        labels,
+        index=index,
+        horizontal=True,
+        key=key,
+        help="Cambia solo la agrupación de esta pestaña; no modifica el resto del app.",
+    )
+    week_start = int(day_options[label])
+    rango_txt = "lunes a domingo" if week_start == 0 else "sábado a viernes"
+    return label, week_start, rango_txt
+
+
+def _weekly_ap_graph_data(
+    dss_bytes: bytes,
+    res_key: str,
+    flow_unit: str,
+    obs_aportes: Optional[pd.DataFrame],
+    evap_cfs: float = 0.0,
+    week_start: int = 0,
+) -> Tuple[pd.DataFrame, List[str], Optional[str]]:
+    """Construye AP DSS semanal por percentiles y aporte observado semanal.
+
+    El DSS se promedia semanalmente con la misma definición de semana que el
+    observado. El observado también se promedia por semana, evitando mezclar
+    valores diarios con curvas semanales.
+    """
+    if dss_bytes is None:
+        return pd.DataFrame(), [], None
+
+    cfg = RESERVOIR_CONFIG[res_key]
+    raw = load_dss_sheet(dss_bytes, cfg["sheet"])
+    daily = to_daily(raw, cfg)
+    daily = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_aportes)
+    if daily is None or daily.empty:
+        return pd.DataFrame(), [], None
+
+    ap_cols = cols_by_prefix(daily, "AP", cfg["token"])
+    if not ap_cols:
+        return pd.DataFrame(), [], None
+
+    base = daily.copy()
+    base["Fecha_dia"] = pd.to_datetime(base["Fecha_dia"], errors="coerce").dt.normalize()
+    base = base[base["Fecha_dia"].notna()].sort_values("Fecha_dia")
+    base = add_operational_week_columns(base, week_start=week_start)
+    base["Año semana"] = pd.to_datetime(base["Inicio semana"], errors="coerce").dt.year
+    group_cols = ["Año semana", "Semana operativa", "Inicio semana", "Fin semana"]
+
+    pct_map = ordered_percentile_map_by_value(base, ap_cols)
+    evap = clean_evap_cfs(evap_cfs)
+    plot_cols: List[str] = []
+    for col in ap_cols:
+        pct = int(pct_map.get(col, exceedance_pct(col)))
+        label = f"AP DSS semanal P{pct} [{unit_label(flow_unit)}]"
+        while label in base.columns:
+            label = f"AP DSS semanal P{pct} {col} [{unit_label(flow_unit)}]"
+        base[label] = convert_flow(ap_total_dss_cfs(base[col], evap), flow_unit)
+        plot_cols.append(label)
+
+    agg_spec = {c: "mean" for c in plot_cols}
+    agg_spec["Fecha_dia"] = "count"
+    weekly = base.groupby(group_cols, as_index=False).agg(agg_spec)
+    weekly = weekly.rename(columns={"Fecha_dia": "Días DSS"})
+    weekly["Fecha_dia"] = pd.to_datetime(weekly["Inicio semana"], errors="coerce")
+    weekly["Etiqueta semana"] = (
+        "Sem. " + weekly["Semana operativa"].astype(int).astype(str)
+        + " · " + pd.to_datetime(weekly["Inicio semana"]).dt.strftime("%d-%m")
+        + " a " + pd.to_datetime(weekly["Fin semana"]).dt.strftime("%d-%m")
+    )
+
+    obs_col = f"Aporte observado semanal [{unit_label(flow_unit)}]"
+    if obs_aportes is not None and isinstance(obs_aportes, pd.DataFrame) and not obs_aportes.empty:
+        obs = clamp_observed_future_dates(obs_aportes, "Fecha_dia").copy()
+        obs["Fecha_dia"] = pd.to_datetime(obs["Fecha_dia"], errors="coerce").dt.normalize()
+        obs["Valor"] = pd.to_numeric(obs["Valor"], errors="coerce")
+        obs = obs.dropna(subset=["Fecha_dia", "Valor"]).sort_values("Fecha_dia")
+        obs = obs[obs["Valor"] > 0].copy()
+        if not obs.empty:
+            obs = add_operational_week_columns(obs, week_start=week_start)
+            obs["Año semana"] = pd.to_datetime(obs["Inicio semana"], errors="coerce").dt.year
+            weekly_obs = obs.groupby(group_cols, as_index=False).agg(
+                Aporte_obs_prom_cfs=("Valor", "mean"),
+                Dias_obs_validos=("Valor", "count"),
+                Aporte_obs_min_cfs=("Valor", "min"),
+                Aporte_obs_max_cfs=("Valor", "max"),
+            )
+            weekly_obs[obs_col] = convert_flow(weekly_obs["Aporte_obs_prom_cfs"], flow_unit)
+            weekly = weekly.merge(
+                weekly_obs[group_cols + [obs_col, "Dias_obs_validos", "Aporte_obs_min_cfs", "Aporte_obs_max_cfs"]],
+                on=group_cols,
+                how="left",
+            )
+        else:
+            weekly[obs_col] = np.nan
+            weekly["Dias_obs_validos"] = 0
+    else:
+        weekly[obs_col] = np.nan
+        weekly["Dias_obs_validos"] = 0
+
+    plot_cols = order_cols_wet_to_dry(plot_cols)
+    return weekly.sort_values("Fecha_dia"), plot_cols, obs_col
+
+
+def tab_ap_semanal_grafico(
+    dss_bytes: bytes,
+    flow_unit: str,
+    obs_gat: Optional[pd.DataFrame],
+    obs_alh: Optional[pd.DataFrame],
+    evap_gat_cfs: float = 0.0,
+    evap_alh_cfs: float = 0.0,
+) -> None:
+    """Pestaña de gráficos semanales de AP para ambos embalses."""
+    st.subheader("📈 AP semanal DSS y observado — ambos embalses")
+    _, week_start, rango_txt = _week_start_options_for_tab("apwg_week_start", default="Lunes a domingo")
+    st.caption(
+        f"Cada punto representa el **promedio semanal** con semana {rango_txt}. "
+        "El aporte observado también se promedia por semana antes de compararlo con las curvas AP DSS."
+    )
+
+    for res_key, obs_df, evap in [
+        ("gatun", obs_gat, evap_gat_cfs),
+        ("alhajuela", obs_alh, evap_alh_cfs),
+    ]:
+        cfg = RESERVOIR_CONFIG[res_key]
+        st.markdown(f"#### {cfg['name']}")
+        try:
+            weekly, ap_cols, obs_col = _weekly_ap_graph_data(
+                dss_bytes=dss_bytes,
+                res_key=res_key,
+                flow_unit=flow_unit,
+                obs_aportes=obs_df,
+                evap_cfs=evap,
+                week_start=week_start,
+            )
+        except Exception as exc:
+            st.warning(f"{cfg['name']}: no se pudo construir la gráfica semanal — {exc}")
+            continue
+
+        if weekly.empty or not ap_cols:
+            st.info(f"No hay AP semanal disponible para {cfg['name']}.")
+            continue
+
+        obs_for_chart = obs_col if obs_col in weekly.columns and weekly[obs_col].notna().any() else None
+        _unit_key = str(flow_unit).replace("³", "3").replace("/", "_").replace(" ", "")
+        fan_chart(
+            weekly,
+            ap_cols,
+            f"{cfg['name']} · AP total DSS semanal y aporte observado semanal ({unit_label(flow_unit)})",
+            unit_label(flow_unit),
+            f"apwg_{res_key}_{week_start}_{_unit_key}",
+            obs_col=obs_for_chart,
+            obs_label="Aporte observado semanal",
+            show_band=True,
+        )
+
+        if obs_for_chart:
+            last_obs = weekly[weekly[obs_for_chart].notna()].sort_values("Fecha_dia").tail(1)
+            if not last_obs.empty:
+                r = last_obs.iloc[0]
+                st.caption(
+                    f"Última semana con observado: semana {int(r['Semana operativa'])} "
+                    f"({pd.to_datetime(r['Inicio semana']):%d-%m-%Y} a {pd.to_datetime(r['Fin semana']):%d-%m-%Y}) · "
+                    f"promedio observado: {float(r[obs_for_chart]):,.2f} {unit_label(flow_unit)} · "
+                    f"días válidos: {int(r.get('Dias_obs_validos', 0) or 0)}."
+                )
+
+        with st.expander(f"📋 Tabla semanal — {cfg['name']}", expanded=False):
+            show = weekly.copy()
+            date_cols = ["Inicio semana", "Fin semana"]
+            for c in date_cols:
+                if c in show.columns:
+                    show[c] = pd.to_datetime(show[c], errors="coerce").dt.strftime("%d-%m-%Y")
+            numeric_cols = [c for c in show.columns if c not in ["Fecha_dia", "Etiqueta semana", "Inicio semana", "Fin semana"]]
+            for c in numeric_cols:
+                show[c] = pd.to_numeric(show[c], errors="coerce").round(3)
+            st.dataframe(show.drop(columns=["Fecha_dia"], errors="ignore"), use_container_width=True, hide_index=True, height=430)
+            st.download_button(
+                f"⬇️ Descargar AP semanal gráfico — {cfg['token']}",
+                show.to_csv(index=False).encode("utf-8-sig"),
+                f"ap_semanal_grafico_{res_key}.csv",
+                "text/csv",
+                key=f"apwg_dl_{res_key}",
+            )
+
+
+def _gatun_esclusajes_daily(daily: pd.DataFrame) -> Tuple[pd.DataFrame, List[int]]:
+    """Calcula EG, EP y total de esclusajes de Gatún por percentil."""
+    if daily is None or daily.empty:
+        return pd.DataFrame(), []
+    cfg = RESERVOIR_CONFIG["gatun"]
+    token = cfg["token"]
+    eg_cols = cols_by_prefix(daily, "EG", token)
+    ep_cols = cols_by_prefix(daily, "EP", token)
+    pcts = sorted(set(exceedance_pct(c) for c in eg_cols + ep_cols))
+    if not pcts:
+        return pd.DataFrame(), []
+
+    out = daily[["Fecha_dia"]].copy()
+    out["Fecha_dia"] = pd.to_datetime(out["Fecha_dia"], errors="coerce").dt.normalize()
+    for pct in pcts:
+        eg_c = next((c for c in eg_cols if exceedance_pct(c) == pct), None)
+        ep_c = next((c for c in ep_cols if exceedance_pct(c) == pct), None)
+        eg = pd.to_numeric(daily[eg_c], errors="coerce") if eg_c and eg_c in daily.columns else pd.Series(np.nan, index=daily.index)
+        ep = pd.to_numeric(daily[ep_c], errors="coerce") if ep_c and ep_c in daily.columns else pd.Series(np.nan, index=daily.index)
+        total = pd.concat([eg, ep], axis=1).sum(axis=1, min_count=1)
+
+        out[f"EG P{pct} (p³/s)"] = eg
+        out[f"EP P{pct} (p³/s)"] = ep
+        out[f"Total esclusajes P{pct} (p³/s)"] = total
+        out[f"Total esclusajes P{pct} (m³/s)"] = convert_flow(total, "m³/s")
+        out[f"Total esclusajes P{pct} (hm³/d)"] = convert_flow(total, "hm³/d")
+        out[f"EG P{pct} (hm³/d)"] = convert_flow(eg, "hm³/d")
+        out[f"EP P{pct} (hm³/d)"] = convert_flow(ep, "hm³/d")
+    return out.sort_values("Fecha_dia"), pcts
+
+
+def _nearest_available_pct(pct: int, available: List[int]) -> Optional[int]:
+    if not available:
+        return None
+    return int(min(available, key=lambda p: (abs(int(p) - int(pct)), -int(p))))
+
+
+def _esclusajes_weekly_table(esc_daily: pd.DataFrame, pcts: List[int], week_start: int = 5) -> pd.DataFrame:
+    if esc_daily is None or esc_daily.empty or not pcts:
+        return pd.DataFrame()
+    base = add_operational_week_columns(esc_daily, week_start=week_start)
+    group_cols = ["Semana operativa", "Inicio semana", "Fin semana"]
+    rows: List[Dict[str, object]] = []
+    for keys, g in base.groupby(group_cols, dropna=False):
+        semana, inicio, fin = keys
+        row: Dict[str, object] = {
+            "Semana": int(semana) if pd.notna(semana) else 0,
+            "Inicio semana": pd.to_datetime(inicio).strftime("%d-%m-%Y") if pd.notna(inicio) else "—",
+            "Fin semana": pd.to_datetime(fin).strftime("%d-%m-%Y") if pd.notna(fin) else "—",
+            "Días DSS": int(g["Fecha_dia"].nunique()),
+        }
+        for pct in pcts:
+            hm3d_col = f"Total esclusajes P{pct} (hm³/d)"
+            cfs_col = f"Total esclusajes P{pct} (p³/s)"
+            m3s_col = f"Total esclusajes P{pct} (m³/s)"
+            if hm3d_col not in g.columns:
+                continue
+            hm3d = pd.to_numeric(g[hm3d_col], errors="coerce")
+            row[f"Prom. P{pct} (hm³/d)"] = round(float(hm3d.mean()), 3) if hm3d.notna().any() else np.nan
+            row[f"Volumen P{pct} (hm³/semana)"] = round(float(hm3d.sum()), 3) if hm3d.notna().any() else np.nan
+            if cfs_col in g.columns:
+                cfs = pd.to_numeric(g[cfs_col], errors="coerce")
+                row[f"Prom. P{pct} (p³/s)"] = round(float(cfs.mean()), 1) if cfs.notna().any() else np.nan
+            if m3s_col in g.columns:
+                m3s = pd.to_numeric(g[m3s_col], errors="coerce")
+                row[f"Prom. P{pct} (m³/s)"] = round(float(m3s.mean()), 2) if m3s.notna().any() else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("Semana") if rows else pd.DataFrame()
+
+
+def tab_esclusajes_gatun(
+    dss_bytes: bytes,
+    flow_unit: str,
+    pct_ref_gat: int,
+    obs_gat_aporte: Optional[pd.DataFrame],
+    evap_gat_cfs: float = 0.0,
+) -> None:
+    """Pestaña de consumo de esclusajes de Gatún por percentil."""
+    st.subheader("🚢 Esclusajes Gatún — consumo EG + EP")
+    st.caption(
+        "Muestra el consumo de esclusajes por percentil DSS. La referencia operativa usa el percentil AP "
+        "más cercano al aporte observado de Gatún cuando está disponible. El consumo se reporta en hm³/día, "
+        "m³/s y p³/s."
+    )
+
+    cfg = RESERVOIR_CONFIG["gatun"]
+    try:
+        raw = load_dss_sheet(dss_bytes, cfg["sheet"])
+        daily = to_daily(raw, cfg)
+        daily_for_ap = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_gat_aporte)
+    except Exception as exc:
+        st.error(f"No se pudo cargar Gatún para esclusajes: {exc}")
+        return
+
+    if daily is None or daily.empty:
+        st.warning("No se pudo construir el diario DSS de Gatún.")
+        return
+
+    esc_daily, pcts = _gatun_esclusajes_daily(daily)
+    if esc_daily.empty or not pcts:
+        st.warning("No se encontraron columnas EG/EP de esclusajes para Gatún en el DSS.")
+        return
+
+    # Percentil de referencia según AP observado más cercano.
+    indicator_pct = int(pct_ref_gat)
+    nearest = None
+    if obs_gat_aporte is not None and isinstance(obs_gat_aporte, pd.DataFrame) and not obs_gat_aporte.empty:
+        obs = clamp_observed_future_dates(obs_gat_aporte, "Fecha_dia").copy()
+        obs["Fecha_dia"] = pd.to_datetime(obs["Fecha_dia"], errors="coerce").dt.normalize()
+        obs["Valor"] = pd.to_numeric(obs["Valor"], errors="coerce")
+        obs = obs.dropna(subset=["Fecha_dia", "Valor"]).sort_values("Fecha_dia")
+        obs = obs[(obs["Valor"] > 0) & (obs["Fecha_dia"] <= today_panama())]
+        if not obs.empty:
+            last_obs = obs.iloc[-1]
+            nearest = _nearest_ap_percentile(
+                daily_for_ap,
+                cfg,
+                pd.to_datetime(last_obs["Fecha_dia"]),
+                float(last_obs["Valor"]),
+                dss_add_cfs=clean_evap_cfs(evap_gat_cfs),
+            )
+            if nearest:
+                indicator_pct = int(nearest["percentile"])
+
+    esc_ref_pct = _nearest_available_pct(indicator_pct, pcts)
+    if esc_ref_pct is None:
+        st.warning("No hay percentiles de esclusajes disponibles.")
+        return
+
+    # Filtro temporal de la pestaña.
+    valid_dates = esc_daily["Fecha_dia"].dropna()
+    mn, mx = valid_dates.min().date(), valid_dates.max().date()
+    default_s = max(mn, (pd.Timestamp(mx) - pd.Timedelta(days=60)).date())
+    c1, c2 = st.columns(2)
+    s = c1.date_input("Desde", value=default_s, min_value=mn, max_value=mx, key="escgat_s")
+    e = c2.date_input("Hasta", value=mx, min_value=mn, max_value=mx, key="escgat_e")
+    if s > e:
+        st.warning("Fecha inicial mayor que final. Se muestra todo el período.")
+        s, e = mn, mx
+    show_daily = esc_daily[(esc_daily["Fecha_dia"].dt.date >= s) & (esc_daily["Fecha_dia"].dt.date <= e)].copy()
+
+    today = today_panama()
+    ref_rows = esc_daily[esc_daily["Fecha_dia"] <= today]
+    ref_row = ref_rows.iloc[-1] if not ref_rows.empty else esc_daily.iloc[-1]
+    ref_date = pd.to_datetime(ref_row["Fecha_dia"])
+
+    total_hm3d = pd.to_numeric(pd.Series([ref_row.get(f"Total esclusajes P{esc_ref_pct} (hm³/d)", np.nan)]), errors="coerce").iloc[0]
+    total_m3s = pd.to_numeric(pd.Series([ref_row.get(f"Total esclusajes P{esc_ref_pct} (m³/s)", np.nan)]), errors="coerce").iloc[0]
+    total_cfs = pd.to_numeric(pd.Series([ref_row.get(f"Total esclusajes P{esc_ref_pct} (p³/s)", np.nan)]), errors="coerce").iloc[0]
+    eg_hm3d = pd.to_numeric(pd.Series([ref_row.get(f"EG P{esc_ref_pct} (hm³/d)", np.nan)]), errors="coerce").iloc[0]
+    ep_hm3d = pd.to_numeric(pd.Series([ref_row.get(f"EP P{esc_ref_pct} (hm³/d)", np.nan)]), errors="coerce").iloc[0]
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Indicador AP observado", nearest["label"] if nearest else f"P{pct_ref_gat}")
+    m2.metric("Percentil esclusajes usado", f"P{esc_ref_pct}")
+    m3.metric("Total EG+EP (hm³/d)", f"{total_hm3d:,.3f}" if pd.notna(total_hm3d) else "—")
+    m4.metric("Total EG+EP (m³/s)", f"{total_m3s:,.2f}" if pd.notna(total_m3s) else "—")
+    m5.metric("EG (hm³/d)", f"{eg_hm3d:,.3f}" if pd.notna(eg_hm3d) else "—")
+    m6.metric("EP (hm³/d)", f"{ep_hm3d:,.3f}" if pd.notna(ep_hm3d) else "—")
+    st.caption(
+        f"Fecha DSS usada para la tarjeta: {ref_date:%d-%m-%Y}. "
+        f"Equivalente total: {total_cfs:,.1f} p³/s." if pd.notna(total_cfs) else f"Fecha DSS usada para la tarjeta: {ref_date:%d-%m-%Y}."
+    )
+
+    default_pcts: List[int] = []
+    for p in [esc_ref_pct, int(pct_ref_gat), 10, 50, 90]:
+        if p in pcts and p not in default_pcts:
+            default_pcts.append(int(p))
+    if not default_pcts:
+        default_pcts = pcts[:3]
+    c3, c4 = st.columns([1.2, 0.8])
+    sel_pcts = c3.multiselect(
+        "Percentiles a mostrar",
+        pcts,
+        default=default_pcts,
+        format_func=lambda x: f"P{x}",
+        key="escgat_pcts",
+    )
+    graph_unit = c4.radio(
+        "Unidad gráfica",
+        ["hm³/d", "m³/s", "cfs"],
+        index=0,
+        format_func=unit_label,
+        horizontal=True,
+        key="escgat_graph_unit",
+    )
+
+    if PLOTLY_OK and sel_pcts:
+        plot_df = show_daily[["Fecha_dia"]].copy()
+        plot_cols = []
+        for pct in sorted(sel_pcts):
+            source_unit = "p³/s" if graph_unit == "cfs" else graph_unit
+            src_col = f"Total esclusajes P{pct} ({source_unit})"
+            if src_col not in show_daily.columns:
+                continue
+            new_col = f"Total esclusajes P{pct} [{unit_label(graph_unit)}]"
+            plot_df[new_col] = show_daily[src_col]
+            plot_cols.append(new_col)
+        fan_chart(
+            plot_df,
+            plot_cols,
+            f"Gatún · Consumo diario de esclusajes EG+EP ({unit_label(graph_unit)})",
+            unit_label(graph_unit),
+            f"escgat_plot_{graph_unit}_{len(sel_pcts)}",
+            show_band=False,
+        )
+
+    _, week_start, rango_txt = _week_start_options_for_tab("escgat_week_start", default="Sábado a viernes (semana operativa DSS)")
+    st.markdown(f"#### Resumen semanal de consumo de esclusajes · semana {rango_txt}")
+    weekly = _esclusajes_weekly_table(show_daily, pcts, week_start=week_start)
+    if weekly.empty:
+        st.info("No hay datos semanales de esclusajes en el período seleccionado.")
+    else:
+        keep_cols = ["Semana", "Inicio semana", "Fin semana", "Días DSS"]
+        for pct in sorted(sel_pcts or pcts):
+            keep_cols += [
+                f"Prom. P{pct} (hm³/d)",
+                f"Volumen P{pct} (hm³/semana)",
+                f"Prom. P{pct} (m³/s)",
+                f"Prom. P{pct} (p³/s)",
+            ]
+        keep_cols = [c for c in keep_cols if c in weekly.columns]
+        st.dataframe(weekly[keep_cols], use_container_width=True, hide_index=True, height=430)
+        st.download_button(
+            "⬇️ Descargar resumen semanal de esclusajes",
+            weekly.to_csv(index=False).encode("utf-8-sig"),
+            "gatun_esclusajes_semanal.csv",
+            "text/csv",
+            key="escgat_weekly_dl",
+        )
+
+    with st.expander("📋 Tabla diaria de esclusajes", expanded=False):
+        daily_show = show_daily.copy()
+        daily_show["Fecha"] = daily_show["Fecha_dia"].dt.strftime("%d-%m-%Y")
+        cols = ["Fecha"]
+        for pct in sorted(sel_pcts or pcts):
+            for c in [
+                f"EG P{pct} (hm³/d)",
+                f"EP P{pct} (hm³/d)",
+                f"Total esclusajes P{pct} (hm³/d)",
+                f"Total esclusajes P{pct} (m³/s)",
+                f"Total esclusajes P{pct} (p³/s)",
+            ]:
+                if c in daily_show.columns:
+                    cols.append(c)
+        for c in cols:
+            if c != "Fecha":
+                daily_show[c] = pd.to_numeric(daily_show[c], errors="coerce").round(3)
+        st.dataframe(daily_show[cols], use_container_width=True, hide_index=True, height=430)
+        st.download_button(
+            "⬇️ Descargar detalle diario de esclusajes",
+            daily_show[cols].to_csv(index=False).encode("utf-8-sig"),
+            "gatun_esclusajes_diario.csv",
+            "text/csv",
+            key="escgat_daily_dl",
+        )
+
+
 def tab_hp_semanal(dss_bytes: bytes) -> None:
     st.subheader("⚡ Hidrogeneración DSS")
     st.caption("Promedio semanal de HP del DSS. Semana operativa sábado-viernes.")
@@ -4199,8 +4658,8 @@ Esta versión incorpora mejoras puntuales para la lectura operativa:
 2. **Orden visual húmedo-seco en las gráficas.**  
    Las gráficas y el visor unificado de Plotly se ordenan de **húmedo a seco**: **P5 arriba** y **P95 abajo**. Este criterio aplica a niveles, hidrogeneración, aportes, vertidos y esclusajes cuando las series estén disponibles.
 
-3. **Pestaña AP semanal observado.**  
-   Se agregó una pestaña independiente para calcular el **promedio semanal observado de aportes** por embalse, usando la misma semana operativa sábado-viernes del app. Para cada semana se compara el promedio observado contra todos los AP DSS y se reporta el **percentil de excedencia más cercano**.
+3. **Pestañas AP semanal observado y AP semanal gráfico.**  
+   Se calcula el **promedio semanal observado de aportes** por embalse y se compara contra todos los AP DSS para reportar el **percentil de excedencia más cercano**. Además, la pestaña gráfica semanal muestra las curvas AP DSS promediadas por semana y el observado semanal, con opción lunes-domingo o sábado-viernes.
 
 4. **Pestaña Aporte instantáneo.**  
    Se agregó una pestaña para ver el visor meteorológico/radar y comparar:
@@ -4512,6 +4971,8 @@ def main() -> None:
         "🌧️ Aporte GAT obs",
         "🌧️ Aporte ALHA obs",
         "📅 AP semanal obs",
+        "📈 AP semanal gráfico",
+        "🚢 Esclusajes GAT",
         "🔀 Comparativo",
         "⚡ Hidrogeneración DSS",
         "⚡ Aporte instantáneo",
@@ -4532,14 +4993,18 @@ def main() -> None:
     with tabs[5]:
         _run_tab("AP semanal obs", tab_aportes_obs_semanal, dss_bytes, flow_unit, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
     with tabs[6]:
-        _run_tab("Comparativo", tab_comparativo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_nivel, obs_alh_nivel, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
+        _run_tab("AP semanal gráfico", tab_ap_semanal_grafico, dss_bytes, flow_unit, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
     with tabs[7]:
-        _run_tab("Hidrogeneración DSS", tab_hp_semanal, dss_bytes)
+        _run_tab("Esclusajes GAT", tab_esclusajes_gatun, dss_bytes, flow_unit, pct_ref_gat, obs_gat_aporte, evap_gat_cfs)
     with tabs[8]:
-        _run_tab("Aporte instantáneo", tab_aporte_instantaneo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
+        _run_tab("Comparativo", tab_comparativo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_nivel, obs_alh_nivel, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
     with tabs[9]:
-        _run_tab("Exportar", tab_exportar_percentil, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, evap_gat_cfs, evap_alh_cfs, obs_gat_aporte, obs_alh_aporte)
+        _run_tab("Hidrogeneración DSS", tab_hp_semanal, dss_bytes)
     with tabs[10]:
+        _run_tab("Aporte instantáneo", tab_aporte_instantaneo, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, obs_gat_aporte, obs_alh_aporte, evap_gat_cfs, evap_alh_cfs)
+    with tabs[11]:
+        _run_tab("Exportar", tab_exportar_percentil, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, evap_gat_cfs, evap_alh_cfs, obs_gat_aporte, obs_alh_aporte)
+    with tabs[12]:
         _run_tab("Instructivo", tab_instructivo)
 
     st.markdown(
