@@ -1532,6 +1532,48 @@ def _base_layout(title: str, y_title: str, height: int = 560) -> dict:
     )
 
 
+def _apply_full_yaxis_from_traces(fig, force_zero: bool = True, pad_fraction: float = 0.08) -> None:
+    """Ajusta el eje Y usando el rango completo de las trazas visibles.
+
+    Antes el gráfico diario de aportes usaba percentiles 2%-98% para evitar
+    que valores extremos aplastaran la curva observada. Eso podía ocultar
+    picos DSS y hacer que el gráfico diario se viera distinto al semanal.
+    Para AP se usa el rango completo, de modo que diario y semanal muestren
+    la misma magnitud real de las curvas.
+    """
+    try:
+        y_parts = []
+        for tr in fig.data:
+            if getattr(tr, "visible", True) == "legendonly":
+                continue
+            y = getattr(tr, "y", None)
+            if y is None:
+                continue
+            vals = pd.to_numeric(pd.Series(y), errors="coerce")
+            vals = vals[np.isfinite(vals)]
+            if not vals.empty:
+                y_parts.append(vals)
+        if not y_parts:
+            return
+        y_all = pd.concat(y_parts, ignore_index=True)
+        if y_all.empty:
+            return
+        y_min = float(y_all.min())
+        y_max = float(y_all.max())
+        if not np.isfinite(y_min) or not np.isfinite(y_max):
+            return
+        if y_max <= y_min:
+            pad = max(abs(y_max) * pad_fraction, 1.0)
+        else:
+            pad = max((y_max - y_min) * pad_fraction, 1.0)
+        lower = 0.0 if force_zero and y_min >= 0 else y_min - pad
+        upper = y_max + pad
+        if upper > lower:
+            fig.update_yaxes(range=[lower, upper])
+    except Exception:
+        pass
+
+
 def fan_chart(df: pd.DataFrame, cols: List[str], title: str, y_label: str, key: str,
               obs_col: Optional[str] = None, obs_label: str = "Observado",
               show_band: bool = True) -> None:
@@ -2794,11 +2836,14 @@ def tab_aporte_obs_embalse(
                 nearest_ref_pct = int(latest_nearest_for_ref["percentile"])
 
     default_p = []
-    for p in [nearest_ref_pct, int(pct_ref), 90, 50, 10]:
+    # Mostrar por defecto las mismas curvas representativas que ayudan a leer
+    # las pestañas semanales: seco (P95/P90), medio (P50) y húmedo (P10/P5),
+    # más el percentil cercano al último observado.
+    for p in [nearest_ref_pct, int(pct_ref), 95, 90, 50, 10, 5]:
         if p in pcts_available and p not in default_p:
             default_p.append(p)
     if not default_p:
-        default_p = pcts_available[:3]
+        default_p = pcts_available[:5]
 
     sel_pcts = st.multiselect(
         f"Percentiles AP total DSS estimado — {embalse}",
@@ -2916,23 +2961,9 @@ def tab_aporte_obs_embalse(
                 marker=dict(size=22, color="#d90429", symbol="star", line=dict(width=2, color="white")),
             ))
 
-    # Ajuste de eje Y para que ALHA y GAT no se aplasten por valores extremos aislados.
-    y_sources = []
-    for tr in fig.data:
-        try:
-            y_arr = pd.to_numeric(pd.Series(tr.y), errors="coerce").dropna()
-            if not y_arr.empty:
-                y_sources.append(y_arr)
-        except Exception:
-            pass
-    if y_sources:
-        y_all = pd.concat(y_sources)
-        if not y_all.empty:
-            y_min = float(y_all.quantile(0.02))
-            y_max = float(y_all.quantile(0.98))
-            if y_max > y_min:
-                pad = max((y_max - y_min) * 0.12, 1.0)
-                fig.update_yaxes(range=[max(0, y_min - pad), y_max + pad])
+    # Usar el rango completo de las trazas para que los picos DSS no queden
+    # recortados. Esto mantiene consistencia visual con las gráficas semanales.
+    _apply_full_yaxis_from_traces(fig, force_zero=True, pad_fraction=0.08)
 
     _today_line(fig, daily_f["Fecha_dia"])
     fig.update_layout(**_base_layout(
@@ -4035,7 +4066,25 @@ def tab_aportes_obs_semanal(
     ].copy()
 
     st.markdown("#### Resumen por semana")
-    st.dataframe(show_tbl, use_container_width=True, hide_index=True, height=520)
+    obs_prom_col = next((c for c in show_tbl.columns if c.startswith("Aporte observado prom.")), None)
+    dss_cercano_col = next((c for c in show_tbl.columns if c.startswith("AP DSS semanal cercano")), None)
+    obs_min_col = next((c for c in show_tbl.columns if c.startswith("Obs. mínimo")), None)
+    obs_max_col = next((c for c in show_tbl.columns if c.startswith("Obs. máximo")), None)
+    obs_dss_col = next((c for c in show_tbl.columns if c.startswith("Obs-DSS")), None)
+
+    preferred_cols = [
+        "Embalse", "Semana", "Inicio semana", "Fin semana", "Definición semana", "Días obs. válidos",
+        obs_prom_col, dss_cercano_col, "Percentil AP DSS más cercano",
+        obs_min_col, obs_max_col, obs_dss_col, "Diferencia abs. (%)", "Estado",
+        "Días DSS", "Evap. sumada al DSS (p³/s)", "Modo AP DSS", "Fuente obs.",
+    ]
+    preferred_cols = [c for c in preferred_cols if c and c in show_tbl.columns]
+    remaining_cols = [
+        c for c in show_tbl.columns
+        if c not in preferred_cols and c not in {"Fecha gráfica", "Etiqueta semana"}
+    ]
+    show_display = show_tbl[preferred_cols + remaining_cols].copy()
+    st.dataframe(show_display, use_container_width=True, hide_index=True, height=520)
 
     if not show_tbl.empty:
         latest = show_tbl.sort_values(["Embalse", "Semana"]).groupby("Embalse", as_index=False).tail(1)
@@ -4051,7 +4100,8 @@ def tab_aportes_obs_semanal(
                 help=f"Aporte observado prom.: {r[obs_col]:,.2f} {unit_label(flow_unit)} · Diferencia abs.: {r['Diferencia abs. (%)']:.2f}%" if obs_col else None,
             )
 
-    csv = show_tbl.to_csv(index=False).encode("utf-8-sig")
+    csv_source = show_display if "show_display" in locals() else show_tbl
+    csv = csv_source.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "⬇️ Descargar resumen semanal observado vs DSS",
         csv,
@@ -4818,7 +4868,7 @@ Permite revisar Gatún en detalle:
 - consumos por esclusajes EG + EP, cuando estén disponibles;
 - tabla diaria descargable.
 
-Las tarjetas superiores muestran el percentil más cercano al dato observado disponible. La gráfica mantiene el orden visual **P5 húmedo arriba** y **P95 seco abajo**.
+Las tarjetas superiores muestran el percentil más cercano al dato observado disponible. La gráfica mantiene el orden visual **P5 húmedo arriba** y **P95 seco abajo**. En aportes, el eje Y usa el rango completo de las curvas visibles para no ocultar picos DSS; por eso el gráfico diario y el semanal conservan la misma escala física de los valores mostrados.
 
 ---
 
@@ -4898,7 +4948,7 @@ Las pestañas semanales ahora usan una misma lógica de agrupación para evitar 
 - **Esclusajes GAT**
 - **Hidrogeneración DSS**
 
-Por defecto todas trabajan con **sábado a viernes**, la semana operativa DSS. También se puede seleccionar **lunes a domingo** dentro de cada pestaña. El cambio solo afecta la pestaña activa, pero siempre agrupa **DSS y observado con el mismo criterio**.
+Por defecto todas trabajan con **sábado a viernes**, la semana operativa DSS. También se puede seleccionar **lunes a domingo** dentro de cada pestaña. El cambio solo afecta la pestaña activa, pero siempre agrupa **DSS y observado con el mismo criterio**. En las gráficas de AP, la pestaña diaria y la semanal usan la misma lógica de AP total DSS estimado: **AP neto DSS + evaporación** y la misma corrección de etiquetas de excedencia (**P5 húmedo → P95 seco**).
 
 Para 2026 usando sábado-viernes:
 
