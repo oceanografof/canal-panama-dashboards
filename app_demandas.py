@@ -1882,6 +1882,222 @@ def _obtener_balance_detallado_lkh(n_dias=5):
     except Exception:
         return None
 
+
+@st.cache_data(show_spinner=False)
+def _leer_alertas_saltos_lkh(path_o_bytes, source_id, umbral_pct=35.0, umbral_hm3=0.75):
+    """Detecta saltos diarios en demandas/volúmenes LakeHouse entre el último y el día anterior.
+
+    La función es solo diagnóstica: no modifica controles, balances ni valores del dashboard.
+    Devuelve alertas cuando el cambio absoluto supera `umbral_hm3` y el cambio relativo supera `umbral_pct`.
+    """
+    try:
+        import openpyxl
+        from io import BytesIO
+
+        def _num(v):
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, str) and v.strip().startswith("#"):
+                    return None
+                out = float(v)
+                return out if np.isfinite(out) else None
+            except Exception:
+                return None
+
+        def _find(header_l, *tokens, exact=None):
+            if exact:
+                exact_l = [str(e).lower() for e in exact]
+                for i, h in enumerate(header_l):
+                    if h in exact_l:
+                        return i
+            for i, h in enumerate(header_l):
+                if all(str(t).lower() in h for t in tokens):
+                    return i
+            return None
+
+        def _get(row, idx, key):
+            i = idx.get(key)
+            return row[i] if i is not None and i < len(row) else None
+
+        def _sum_valid(vals):
+            vals = [_num(v) for v in vals]
+            vals = [v for v in vals if v is not None]
+            return float(sum(vals)) if vals else None
+
+        def _hm3_direct(row, idx, *keys):
+            return _sum_valid([_get(row, idx, k) for k in keys])
+
+        def _hm3_mcf(row, idx, *keys):
+            # LakeHouse expresa estos campos como MCF/MPC por día.
+            val = _sum_valid([_get(row, idx, k) for k in keys])
+            return val * MPC_TO_HM3 if val is not None else None
+
+        def _hm3_prefer_mcf(row, idx, mcf_keys=(), hm3_keys=()):
+            val_mcf = _hm3_mcf(row, idx, *mcf_keys)
+            if val_mcf is not None:
+                return val_mcf
+            return _hm3_direct(row, idx, *hm3_keys)
+
+        def _row_components(row, idx):
+            alh_gen = _hm3_direct(row, idx, "gen_mad_hm3")
+            alh_pot = _hm3_prefer_mcf(row, idx, ("pot_m_mcf",), ("pot_m_hm3",))
+            alh_fug = _hm3_prefer_mcf(row, idx, ("fug_m_mcf",), ("fug_m_hm3",))
+            alh_ver = _hm3_mcf(row, idx, "vert_m_mcf")
+            alh_evap = _hm3_direct(row, idx, "evap_m_hm3")
+
+            gat_pnx = _hm3_prefer_mcf(row, idx, ("gat_mcf", "pm_mcf"), ("gat_hm3", "pm_hm3"))
+            gat_npx = _hm3_prefer_mcf(row, idx, ("acl_mcf", "ccl_mcf"), ("acl_hm3", "ccl_hm3"))
+            gat_gen = _hm3_direct(row, idx, "gen_gat_hm3")
+            gat_pot = _hm3_prefer_mcf(row, idx, ("pot_g_mcf",), ("pot_g_hm3",))
+            gat_fug = _hm3_prefer_mcf(row, idx, ("fug_g_mcf",), ("fug_g_hm3",))
+            gat_ver = _hm3_mcf(row, idx, "vert_g_mcf")
+            gat_flush = _hm3_direct(row, idx, "zz_ccl_hm3", "zz_acl_hm3")
+            gat_evap = _hm3_direct(row, idx, "evap_g_hm3")
+
+            aporte_alh_gat = _sum_valid([alh_gen, alh_fug, alh_ver])
+            total_alh = _sum_valid([alh_gen, alh_pot, alh_fug, alh_ver, alh_evap])
+            total_gat = _sum_valid([gat_pnx, gat_npx, gat_gen, gat_pot, gat_fug, gat_ver, gat_flush, gat_evap])
+            total_sistema = _sum_valid([total_alh, total_gat])
+            total_oficial = _hm3_direct(row, idx, "total_consumo_hm3")
+
+            return {
+                "Alhajuela · Generación Madden": alh_gen,
+                "Alhajuela · Potabilización": alh_pot,
+                "Alhajuela · Fugas": alh_fug,
+                "Alhajuela · Vertidos Madden": alh_ver,
+                "Alhajuela · Evaporación LakeHouse": alh_evap,
+                "Gatún · Esclusajes PNX": gat_pnx,
+                "Gatún · Esclusajes NPX": gat_npx,
+                "Gatún · Generación Gatún": gat_gen,
+                "Gatún · Potabilización": gat_pot,
+                "Gatún · Fugas": gat_fug,
+                "Gatún · Vertido Gatún": gat_ver,
+                "Gatún · ZZ-Flush": gat_flush,
+                "Gatún · Evaporación LakeHouse": gat_evap,
+                "Aporte ALH→GAT · Gen Madden + fugas + vertidos": aporte_alh_gat,
+                "Total Alhajuela demanda": total_alh,
+                "Total Gatún demanda": total_gat,
+                "Total sistema calculado": total_sistema,
+                "Total oficial LakeHouse": total_oficial,
+            }
+
+        src = BytesIO(path_o_bytes) if isinstance(path_o_bytes, (bytes, bytearray)) else path_o_bytes
+        wb = openpyxl.load_workbook(src, read_only=True, data_only=True)
+        hojas = [x for x in wb.sheetnames if x not in ["Sheet1", "Para BalanceH"]] or wb.sheetnames
+
+        for hoja in hojas:
+            ws = wb[hoja]
+            rows_iter = ws.iter_rows(values_only=True)
+            try:
+                header = next(rows_iter)
+            except StopIteration:
+                continue
+
+            header_l = [str(c).strip().lower() if c is not None else "" for c in header]
+            idx = {
+                "fecha": _find(header_l, "date"),
+                "gat_hm3": _find(header_l, exact=["gatlockhm3"]),
+                "pm_hm3": _find(header_l, exact=["pmlockhm3"]),
+                "acl_hm3": _find(header_l, exact=["aclockhm3"]),
+                "ccl_hm3": _find(header_l, exact=["ccllockhm3"]),
+                "gat_mcf": _find(header_l, "gatlockmcf"),
+                "pm_mcf": _find(header_l, "pmlockmcf"),
+                "acl_mcf": _find(header_l, "aclockmcf"),
+                "ccl_mcf": _find(header_l, "ccllockmcf"),
+                "gen_mad_hm3": _find(header_l, exact=["madhm3"]),
+                "gen_gat_hm3": _find(header_l, exact=["gathm3"]),
+                "pot_m_hm3": _find(header_l, exact=["munic_mad_hm3"]),
+                "pot_g_hm3": _find(header_l, exact=["munic_gat_hm3"]),
+                "pot_m_mcf": _find(header_l, exact=["munic_mad"]),
+                "pot_g_mcf": _find(header_l, exact=["munic_gat"]),
+                "fug_m_hm3": _find(header_l, exact=["leak_mad_hm3"]),
+                "fug_g_hm3": _find(header_l, exact=["leak_gat_hm3"]),
+                "fug_m_mcf": _find(header_l, exact=["leak_mad"]),
+                "fug_g_mcf": _find(header_l, exact=["leak_gat"]),
+                "vert_m_mcf": _find(header_l, exact=["madspill"]),
+                "vert_g_mcf": _find(header_l, exact=["gatspill"]),
+                "evap_m_hm3": _find(header_l, exact=["vol_evap_ala_hm3"]),
+                "evap_g_hm3": _find(header_l, exact=["vol_evap_gat_hm3"]),
+                "total_consumo_hm3": _find(header_l, exact=["agua_consumida_ala_gat_hm3"]),
+                "zz_ccl_hm3": _find(header_l, exact=["ccl_zz_flush"]),
+                "zz_acl_hm3": _find(header_l, exact=["acl_zz_flush"]),
+            }
+
+            ult = []
+            for row in rows_iter:
+                vals = list(row)
+                comps = _row_components(vals, idx)
+                if any(v is not None for v in comps.values()):
+                    ult.append(vals)
+                    if len(ult) > 2:
+                        ult.pop(0)
+
+            if len(ult) < 2:
+                continue
+
+            prev_row, cur_row = ult[-2], ult[-1]
+            prev = _row_components(prev_row, idx)
+            cur = _row_components(cur_row, idx)
+            fecha_prev = _get(prev_row, idx, "fecha")
+            fecha_cur = _get(cur_row, idx, "fecha")
+            alertas = []
+
+            for nombre, val_cur in cur.items():
+                val_prev = prev.get(nombre)
+                if val_cur is None or val_prev is None:
+                    continue
+                val_cur = float(val_cur)
+                val_prev = float(val_prev)
+                dif = val_cur - val_prev
+                if abs(dif) < float(umbral_hm3):
+                    continue
+                base = abs(val_prev) if abs(val_prev) > 1e-9 else max(abs(val_cur), 1e-9)
+                pct = abs(dif) / base * 100.0
+                if pct < float(umbral_pct):
+                    continue
+                alertas.append({
+                    "Componente": nombre,
+                    "Tipo": "Subida" if dif > 0 else "Bajada",
+                    "Anterior hm³/d": round(val_prev, 3),
+                    "Último hm³/d": round(val_cur, 3),
+                    "Δ hm³/d": round(dif, 3),
+                    "Cambio %": round(pct, 1),
+                    "Anterior cfs": round(val_prev / CFS2HM3, 1),
+                    "Último cfs": round(val_cur / CFS2HM3, 1),
+                })
+
+            alertas = sorted(alertas, key=lambda x: abs(float(x.get("Δ hm³/d", 0.0))), reverse=True)
+            return {
+                "hoja": hoja,
+                "fecha_anterior": fecha_prev,
+                "fecha_ultimo": fecha_cur,
+                "umbral_pct": float(umbral_pct),
+                "umbral_hm3": float(umbral_hm3),
+                "alertas": alertas,
+            }
+    except Exception:
+        return None
+    return None
+
+
+def _obtener_alertas_saltos_lkh(umbral_pct=35.0, umbral_hm3=0.75):
+    """Wrapper seguro para alertas LakeHouse usando la misma fuente local/subida del app."""
+    src, sid = _lkh_sidebar_source()
+    if not src or not sid:
+        return None
+    try:
+        if hasattr(src, "getvalue"):
+            src.seek(0)
+            payload = src.getvalue()
+        else:
+            payload = src
+        sid_alert = f"{sid}:alertas_saltos:{float(umbral_pct):.1f}:{float(umbral_hm3):.3f}"
+        return _leer_alertas_saltos_lkh(payload, sid_alert, float(umbral_pct), float(umbral_hm3))
+    except Exception:
+        return None
+
+
 _info_niveles_lkh = _aplicar_niveles_lkh_si_corresponde()
 # El período seleccionado en la pestaña 📂 Datos Lake House también alimenta
 # los valores iniciales/editables del sidebar y, por lo tanto, el balance principal.
@@ -2403,6 +2619,38 @@ st.sidebar.markdown("---")
 unidad  = st.sidebar.radio("Unidad visual", ["hm³/día", "cfs", "m³/s"], horizontal=True)
 u_label = unidad
 u_cv    = 1 if unidad == "hm³/día" else (1/CFS2HM3 if unidad == "cfs" else HM3D2M3S)
+
+with st.sidebar.expander("🔔 Alertas de saltos LakeHouse", expanded=False):
+    alertas_lkh_activas = st.checkbox(
+        "Activar alertas",
+        value=True,
+        key="alertas_lkh_activas",
+        help="Revisa el último día contra el día anterior para detectar saltos bruscos en demandas y volúmenes del LakeHouse.",
+    )
+    alerta_pct_lkh = st.slider(
+        "Cambio relativo mínimo (%)",
+        min_value=10,
+        max_value=200,
+        value=35,
+        step=5,
+        key="alerta_pct_lkh",
+        help="Se genera alerta cuando el cambio relativo supera este porcentaje.",
+    )
+    alerta_abs_hm3_lkh = st.number_input(
+        "Cambio mínimo absoluto (hm³/d)",
+        min_value=0.00,
+        max_value=50.00,
+        value=0.75,
+        step=0.25,
+        key="alerta_abs_hm3_lkh",
+        help="Evita alertas por cambios pequeños aunque el porcentaje sea alto.",
+    )
+
+_alertas_saltos_lkh = (
+    _obtener_alertas_saltos_lkh(alerta_pct_lkh, alerta_abs_hm3_lkh)
+    if alertas_lkh_activas else None
+)
+
 st.sidebar.markdown("---")
 st.sidebar.caption(f"📅 Sesión: {AHORA}")
 
@@ -2502,7 +2750,7 @@ else:
 
 # ── Visor principal único: valores organizados por embalse ───────────────────
 st.markdown("#### 📌 Variables operativas por embalse")
-_src_col, _dias_col, _obs_col = st.columns([2.35, 1.0, 0.95])
+_src_col, _dias_col, _obs_col, _alhgat_col = st.columns([2.25, 1.0, 0.95, 0.95])
 with _src_col:
     fuente_kpis_superiores = st.radio(
         "Fuente de los valores",
@@ -2536,6 +2784,13 @@ with _obs_col:
         value=False,
         key="mostrar_aportes_observados",
         help="Muestra un visor compacto con los aportes observados diarios de Aquarius (Discharge AT GAT/ALHA).",
+    )
+with _alhgat_col:
+    mostrar_aporte_alh_gatun = st.checkbox(
+        "Ver ALH→GAT",
+        value=True,
+        key="mostrar_aporte_alh_gatun",
+        help="Muestra el aporte que entra al sistema Gatún desde Alhajuela: generación Madden + fugas Alhajuela + vertidos Madden.",
     )
 
 _detalle_kpi_lkh = (_info_balance_lkh or {}).get("detalle", [])
@@ -2572,6 +2827,30 @@ _detalle_principal_lkh = {
     "gat_ver":  _buscar_detalle_lkh("Gatún", prefijo_uso="Vertido"),
     "gat_flush": float(_zz_lkh) if _zz_lkh is not None and pd.notna(_zz_lkh) else None,
 }
+
+
+def _sumar_validos_o_none(valores):
+    """Suma valores válidos y devuelve None si no hay ninguna fuente válida."""
+    _validos = []
+    for _valor in valores:
+        try:
+            if _valor is not None and pd.notna(_valor):
+                _validos.append(float(_valor))
+        except Exception:
+            continue
+    return float(sum(_validos)) if _validos else None
+
+
+# Aporte que sale de Alhajuela/Madden y entra al sistema Gatún.
+# No altera el balance base: es un visor de apoyo operativo.
+_aporte_alh_gatun_app = float(gen_alh + alh_fug + alh_vert)
+_aporte_alh_gatun_lkh = _sumar_validos_o_none([
+    _detalle_principal_lkh["alh_gen"],
+    _detalle_principal_lkh["alh_fug"],
+    _detalle_principal_lkh["alh_ver"],
+])
+_aporte_alh_gatun_fuente = "Generación Madden + fugas Alhajuela + vertidos Madden"
+_aporte_alh_gatun_lkh_fuente = f"LakeHouse · {_aporte_alh_gatun_fuente} · {dias_kpi_superiores} días"
 
 
 def _total_promedio_lkh(componentes, evaporacion_app):
@@ -2878,6 +3157,57 @@ for _i, _item in enumerate(_detalle_principal_app_alh):
 
 st.markdown("##### 🌊 Gatún")
 
+
+def _tarjeta_aporte_alh_gatun():
+    """Muestra el aporte desde Alhajuela que debe considerarse como entrada al sistema Gatún."""
+    _aporte, _fuente, _comparacion, _origen = _seleccionar_flujo_principal(
+        _aporte_alh_gatun_app,
+        _aporte_alh_gatun_lkh,
+        fuente_lkh=_aporte_alh_gatun_lkh_fuente,
+        fuente_app=f"App · {_aporte_alh_gatun_fuente}",
+    )
+    _gat_base, _gat_fuente, _, _ = _seleccionar_flujo_principal(
+        gat_total,
+        _gat_total_lkh,
+        fuente_lkh=f"LakeHouse + evap. {evap_fuente_corta} · {dias_kpi_superiores} días",
+    )
+
+    if _aporte is None or pd.isna(_aporte):
+        _valor_txt = "N/D"
+        _conv_txt = "p³/s: N/D · m³/s: N/D"
+    else:
+        _aporte = float(_aporte)
+        _valor_txt = f"{_aporte:.3f} hm³/d"
+        _conv_txt = f"{_aporte / CFS2HM3:.1f} p³/s · {_aporte * HM3D2M3S:.2f} m³/s"
+
+    _neto_html = ""
+    if _aporte is not None and _gat_base is not None and pd.notna(_gat_base):
+        _neto = float(_gat_base) - float(_aporte)
+        _neto_html = (
+            f'<div class="flow-conv"><b>Gatún neto con aporte ALH:</b> {_neto:.3f} hm³/d · '
+            f'{_neto / CFS2HM3:.1f} p³/s · {_neto * HM3D2M3S:.2f} m³/s</div>'
+        )
+
+    _comparacion_html = f'<div class="flow-compare">{_comparacion}</div>' if _comparacion else ""
+    st.markdown(
+        f"""
+        <div class="flow-card flow-card-gat">
+            <div class="flow-label">🔁 Aporte ALH→GAT</div>
+            <div class="flow-value">{_valor_txt}</div>
+            <div class="flow-conv">{_conv_txt}</div>
+            {_neto_html}
+            <div class="flow-source">{_fuente}</div>
+            <div class="flow-compare">Suma hidrogeneración Madden + fugas Alhajuela + vertidos Madden. No modifica el balance base.</div>
+            {_comparacion_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+if mostrar_aporte_alh_gatun:
+    _tarjeta_aporte_alh_gatun()
+
 # ── Esclusajes integrados en el mismo visor de Gatún ─────────────────────────
 def _numero_valido(_valor):
     return _valor is not None and pd.notna(_valor)
@@ -3069,6 +3399,29 @@ if _info_balance_lkh:
 else:
     st.caption("LakeHouse no disponible; el visor mantiene los valores calculados por el app.")
 
+
+if alertas_lkh_activas:
+    _alertas_lista = (_alertas_saltos_lkh or {}).get("alertas", []) if _alertas_saltos_lkh else []
+    _fecha_ant_alerta = _fecha_lkh_texto((_alertas_saltos_lkh or {}).get("fecha_anterior")) if _alertas_saltos_lkh else "N/D"
+    _fecha_ult_alerta = _fecha_lkh_texto((_alertas_saltos_lkh or {}).get("fecha_ultimo")) if _alertas_saltos_lkh else "N/D"
+    with st.expander(f"🔔 Alertas LakeHouse por salto diario ({len(_alertas_lista)})", expanded=len(_alertas_lista) > 0):
+        if _alertas_lista:
+            st.warning(
+                f"Se detectaron cambios bruscos entre **{_fecha_ant_alerta}** y **{_fecha_ult_alerta}** "
+                f"(umbral: ≥{alerta_abs_hm3_lkh:.2f} hm³/d y ≥{alerta_pct_lkh:.0f}%)."
+            )
+            st.dataframe(pd.DataFrame(_alertas_lista), use_container_width=True, hide_index=True)
+            st.caption(
+                "Las alertas son diagnósticas. Revise principalmente LakeHouse, vertidos, fugas, generación, esclusajes, "
+                "evaporación y el aporte ALH→GAT antes de reportar el escenario."
+            )
+        elif _alertas_saltos_lkh:
+            st.success(
+                f"Sin saltos relevantes entre **{_fecha_ant_alerta}** y **{_fecha_ult_alerta}** "
+                f"con los umbrales configurados."
+            )
+        else:
+            st.info("No hay LakeHouse suficiente para comparar el último día contra el día anterior.")
 
 st.markdown("---")
 
@@ -3969,6 +4322,8 @@ with tabs[8]:
                 {"Parámetro":"Evap volumen Gatún aplicado","Valor":evap_gat,"Unidad":"hm³/día"},
                 {"Parámetro":"Evap volumen Alhajuela aplicado","Valor":evap_alh,"Unidad":"hm³/día"},
                 {"Parámetro":"Evap total aplicado","Valor":evap_tot,"Unidad":"hm³/día"},
+                {"Parámetro":"Aporte ALH→GAT aplicado","Valor":round(_aporte_alh_gatun_app,4),"Unidad":"hm³/día"},
+                {"Parámetro":"Gatún neto con aporte ALH","Valor":round(gat_total-_aporte_alh_gatun_app,4),"Unidad":"hm³/día"},
                 {"Parámetro":"Área espejo Gatún","Valor":round(area_gat,2),"Unidad":"km²"},
                 {"Parámetro":"Área espejo Alhajuela","Valor":round(area_alh,2),"Unidad":"km²"},
                 {"Parámetro":"Modo área Gatún","Valor":area_modo_gat,"Unidad":""},
@@ -4276,6 +4631,15 @@ with tabs[9]:
             f"el consumo de esclusajes se muestra una sola vez y corresponde al promedio del período seleccionado"
             f"{(' · fuente: ' + _cons_escl_fuente) if _cons_escl_fuente else ''}."
         )
+
+        if alertas_lkh_activas:
+            _alertas_lista_tab = (_alertas_saltos_lkh or {}).get("alertas", []) if _alertas_saltos_lkh else []
+            with st.expander(f"🔔 Alertas de saltos del LakeHouse ({len(_alertas_lista_tab)})", expanded=len(_alertas_lista_tab) > 0):
+                if _alertas_lista_tab:
+                    st.warning("Revise estos saltos antes de usar el LakeHouse como base operativa.")
+                    st.dataframe(pd.DataFrame(_alertas_lista_tab), use_container_width=True, hide_index=True)
+                else:
+                    st.success("Sin saltos relevantes con los umbrales activos.")
 
         # ── Promedios operativos por categoría ──────────────────────────────────
         st.markdown("---")
@@ -4824,6 +5188,8 @@ with tabs[10]:
         {"Control": "Usar en el balance", "Dónde": "Sidebar · Fuente de consumo", "Efecto": "Define si el balance usa valores del sidebar o del modelo físico, con o sin ahorro."},
         {"Control": "Fuente de evaporación", "Dónde": "Sidebar · Evaporación", "Efecto": "Por defecto usa Aquarius · lámina (mm/día). Manual y volumen V Evap 0.85 quedan como alternativas."},
         {"Control": "Ver aportes obs.", "Dónde": "Visor principal superior", "Efecto": "Muestra arriba el visor compacto de aportes observados de Aquarius para Gatún, Alhajuela y total."},
+        {"Control": "Ver ALH→GAT", "Dónde": "Visor principal superior", "Efecto": "Muestra la suma que entra a Gatún desde Alhajuela: generación Madden + fugas Alhajuela + vertidos Madden, y el Gatún neto con ese aporte."},
+        {"Control": "Alertas de saltos LakeHouse", "Dónde": "Sidebar", "Efecto": "Compara el último día contra el día anterior y alerta cambios bruscos en demandas/volúmenes LakeHouse."},
         {"Control": "Unidad visual", "Dónde": "Final del sidebar", "Efecto": "Solo cambia la presentación entre hm³/día, cfs y m³/s; no altera el cálculo base."},
     ])
     st.dataframe(controles, use_container_width=True, hide_index=True)
@@ -4881,6 +5247,25 @@ with tabs[10]:
         </div>
         """, unsafe_allow_html=True)
 
+    c7, c8 = st.columns(2)
+    with c7:
+        st.markdown(f"""
+        <div class="lkh-card">
+            <div class="label">Aporte ALH→GAT</div>
+            <div class="value">{_aporte_alh_gatun_app:.3f}</div>
+            <div class="sub">hm³/d · {_aporte_alh_gatun_app/CFS2HM3:.1f} p³/s · gen Madden + fugas + vertidos.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c8:
+        _n_alertas_instr = len(((_alertas_saltos_lkh or {}).get("alertas", [])) if alertas_lkh_activas else [])
+        st.markdown(f"""
+        <div class="lkh-card">
+            <div class="label">Alertas LakeHouse</div>
+            <div class="value">{_n_alertas_instr}</div>
+            <div class="sub">Saltos diarios activos con umbral {alerta_abs_hm3_lkh:.2f} hm³/d y {alerta_pct_lkh:.0f}%.</div>
+        </div>
+        """, unsafe_allow_html=True)
+
     st.markdown("### 🧩 Mapa rápido del dashboard")
     guia_tabs = pd.DataFrame([
         {"Pestaña": "📊 Balance", "Uso principal": "Validar demanda total, distribución por embalse y detalle operativo.", "Revise antes de reportar": "Total sistema, Alhajuela, Gatún y fuente de cada componente."},
@@ -4890,8 +5275,8 @@ with tabs[10]:
         {"Pestaña": "⚡ Generación", "Uso principal": "Validar MW y conversión a caudal/volumen.", "Revise antes de reportar": "Factor cfs/MW, MW por planta y hm³/día."},
         {"Pestaña": "💾 Ahorro de Agua", "Uso principal": "Evaluar tinas, cámara corta, crossfilling y Turn Around NPX.", "Revise antes de reportar": "Ahorro total y modo de balance que lo está usando."},
         {"Pestaña": "📐 Área Espejo", "Uso principal": "Validar área por nivel y evaporación.", "Revise antes de reportar": "Daily por defecto, cálculo desde nivel, área km² y hm³/d aplicado al balance."},
-        {"Pestaña": "📂 Datos Lake House", "Uso principal": "Confirmar datos reales recientes.", "Revise antes de reportar": "Archivo, hoja, fecha final, promedios 1/5/7/10/30 días y salidas por embalse."},
-        {"Pestaña": "📤 Exportar", "Uso principal": "Generar respaldo en Excel.", "Revise antes de reportar": "Parámetros, demandas por embalse y hoja de áreas."},
+        {"Pestaña": "📂 Datos Lake House", "Uso principal": "Confirmar datos reales recientes.", "Revise antes de reportar": "Archivo, hoja, fecha final, promedios 1/5/7/10/30 días, salidas por embalse y alertas de saltos."},
+        {"Pestaña": "📤 Exportar", "Uso principal": "Generar respaldo en Excel.", "Revise antes de reportar": "Parámetros, aporte ALH→GAT, Gatún neto con aporte, demandas por embalse y hoja de áreas."},
         {"Pestaña": "📈 Aportes observados", "Uso principal": "Ver aportes diarios observados de Aquarius.", "Revise antes de reportar": "Último dato, promedio del período LakeHouse/30 días y coherencia Gatún + Alhajuela."},
     ])
     st.dataframe(guia_tabs, use_container_width=True, hide_index=True)
@@ -4906,6 +5291,8 @@ with tabs[10]:
         {"Elemento": "EED", "Criterio": "Se muestra como equivalente diario de consumo. Es una referencia visual; no cambia el balance base."},
         {"Elemento": "Área espejo", "Criterio": "Por defecto usa curva hipsométrica Daily y área calculada desde nivel para Gatún y Alhajuela. Manual queda como respaldo."},
         {"Elemento": "Evaporación", "Criterio": "Por defecto usa Aquarius lámina (CZL/PMG) con área Daily calculada desde nivel: hm³/d = mm/d × área(km²) × 0.001 × 0.85. Aquarius volumen usa V Evap 0.85 directo."},
+        {"Elemento": "Aporte ALH→GAT", "Criterio": "El visor Ver ALH→GAT suma generación Madden + fugas Alhajuela + vertidos Madden para estimar la entrada de Alhajuela al sistema Gatún y calcular Gatún neto con ese aporte."},
+        {"Elemento": "Alertas LakeHouse", "Criterio": "Comparan el último día contra el día anterior y alertan saltos bruscos en todas las demandas/volúmenes disponibles, incluyendo aporte ALH→GAT."},
         {"Elemento": "Aportes observados", "Criterio": "El visor compacto se activa con Ver aportes obs.; la pestaña 📈 Aportes observados muestra series, último dato y promedios en hm³/d, m³/s y p³/s."},
         {"Elemento": "Conversor de volumen", "Criterio": "Permite hm³, MPC y Mgal. Mgal corresponde a millones de galones US."},
         {"Elemento": "Unidad visual", "Criterio": "Cambiar hm³/día, cfs o m³/s solo cambia la visualización; el cálculo base queda en hm³/día."},
@@ -4929,6 +5316,7 @@ with tabs[10]:
         - Panamax y NeoPanamax revisados.
         - Generación, potable y fugas revisadas.
         - Vertidos, ZZ-Flush y ahorros revisados.
+        - Aporte ALH→GAT revisado si está activo.
         """)
     with chk3:
         st.markdown("""
@@ -4939,6 +5327,7 @@ with tabs[10]:
         - Evaporación validada.
         - Área Daily desde nivel confirmada.
         - Aportes observados revisados si aplica.
+        - Alertas LakeHouse revisadas.
         - Excel exportado.
         """)
 
@@ -4953,10 +5342,12 @@ with tabs[10]:
         {"Situación": "Evaporación no coincide", "Solución": "Revise la fuente activa, la curva Daily y que el área esté en Calcular desde nivel (ft). Manual y Aquarius mm aplican lámina × área × 0.001 × 0.85; Aquarius volumen usa V Evap 0.85 de GAT/MAD directamente."},
         {"Situación": "El área aparece diferente a la esperada", "Solución": "Confirme que la curva esté en Daily y que el modo sea Calcular desde nivel (ft). El área cambia automáticamente con el nivel operativo."},
         {"Situación": "No veo los aportes observados", "Solución": "Active Ver aportes obs. en el visor superior o entre a la pestaña 📈 Aportes observados; verifique los CSV Discharge_AT_GAT/ALHA."},
+        {"Situación": "No veo el aporte ALH→GAT", "Solución": "Active Ver ALH→GAT en el visor superior. El valor suma generación Madden + fugas Alhajuela + vertidos Madden y muestra Gatún neto con ese aporte."},
+        {"Situación": "Aparecen alertas LakeHouse", "Solución": "Revise el último día contra el día anterior en LakeHouse. Si el salto es real, valide el escenario; si es ruido, ajuste los umbrales del sidebar."},
     ])
     st.dataframe(problemas, use_container_width=True, hide_index=True)
 
-    st.success("Ruta recomendada: Datos LakeHouse → Niveles y área Daily → Tránsitos → Fuente de esclusajes → Evaporación → Aportes observados → Balance → Exportar.")
+    st.success("Ruta recomendada: Datos LakeHouse → Alertas LakeHouse → Niveles y área Daily → Tránsitos → Fuente de esclusajes → ALH→GAT → Evaporación → Aportes observados → Balance → Exportar.")
 
 
 # ═══ TAB 11 — APORTES OBSERVADOS ═══
