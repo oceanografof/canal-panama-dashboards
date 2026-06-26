@@ -8,6 +8,7 @@ Versión simplificada y blindada:
 - Manejo robusto de errores en toda lectura de datos
 - Sin pestañas redundantes ni funciones muertas
 - Soporte nativo para BulkExport-GAT/MAD/TstCHCP (niveles y aportes directos)
+- Semana DSS unificada en pestañas semanales: sábado-viernes por defecto, con opción lunes-domingo
 
 Ejecución (Windows):
     py -m pip install streamlit openpyxl plotly pandas numpy
@@ -132,6 +133,15 @@ AP_OBS_GAP_REPAIR_MAX_EXTENSION_DAYS = 5
 AP_OBS_ZERO_IS_MISSING = True
 
 PERCENTILE_ORDER = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95]
+
+# Definición única para todas las pestañas semanales.
+# DSS operativo por defecto: sábado-viernes. El usuario puede cambiar a
+# lunes-domingo dentro de cada pestaña semanal sin afectar las demás.
+DEFAULT_WEEK_START_LABEL = "Sábado a viernes (semana operativa DSS)"
+WEEK_START_OPTIONS = {
+    DEFAULT_WEEK_START_LABEL: 5,
+    "Lunes a domingo": 0,
+}
 EXCEEDANCE_COLORS = {
     95: "#001f5b", 90: "#003f88", 80: "#005f99", 70: "#0077b6",
     60: "#0096c7", 50: "#48cae4", 40: "#90e0ef",
@@ -3702,15 +3712,24 @@ def load_observed_data() -> Tuple[
 # SEMANA OPERATIVA SÁBADO-VIERNES / HP SEMANAL / INSTRUCTIVO
 # ─────────────────────────────────────────────────────────────────────
 def operational_week_info(date_value, week_start: int = 5) -> Tuple[int, pd.Timestamp, pd.Timestamp]:
-    """Semana operativa con día de inicio configurable.
+    """Semana DSS con día de inicio configurable.
 
-    week_start sigue la convención de pandas weekday: lunes=0 ... domingo=6.
-    Por defecto week_start=5 (sábado), conservando la semana operativa DSS
-    sábado-viernes usada en el resto del app. Para week_start=0 la semana
-    abarca lunes-domingo.
+    `week_start` sigue la convención de pandas weekday: lunes=0 ... domingo=6.
+    Por defecto se usa 5, es decir **sábado-viernes**, que es la semana
+    operativa DSS. Cuando el usuario selecciona lunes-domingo, se usa el mismo
+    cálculo para DSS y observado, evitando que las pestañas semanales queden
+    desalineadas entre sí.
 
-    Para 2026 con sábado: 30-may al 05-jun = semana 23; desde 06-jun inicia semana 24.
+    Para 2026 con sábado: 30-may al 05-jun = semana 23; desde 06-jun inicia
+    semana 24.
     """
+    try:
+        week_start = int(week_start)
+    except Exception:
+        week_start = 5
+    if week_start not in range(7):
+        week_start = 5
+
     d = pd.to_datetime(date_value, errors="coerce")
     if pd.isna(d):
         return 0, pd.NaT, pd.NaT
@@ -3890,6 +3909,7 @@ def _weekly_ap_obs_vs_dss_table(
             "Semana": int(r["Semana operativa"]),
             "Inicio semana": pd.to_datetime(r["Inicio semana"]).strftime("%d-%m-%Y"),
             "Fin semana": pd.to_datetime(r["Fin semana"]).strftime("%d-%m-%Y"),
+            "Definición semana": "lunes-domingo" if week_start == 0 else "sábado-viernes",
             "Días obs. válidos": int(r.get("Dias_obs_validos", 0)),
             f"Aporte observado prom. ({unit_label(flow_unit)})": round(float(obs_unit), 3),
             f"Obs. mínimo ({unit_label(flow_unit)})": round(float(obs_min_unit), 3) if pd.notna(obs_min_unit) else np.nan,
@@ -3934,23 +3954,21 @@ def tab_aportes_obs_semanal(
     st.subheader("📅 Aporte observado semanal vs AP DSS")
 
     # Selector de día de inicio de semana, solo para esta pestaña.
-    # No altera la semana operativa sábado-viernes del resto del app.
-    day_options = {
-        "Lunes a domingo": 0,
-        "Sábado a viernes (semana operativa DSS)": 5,
-    }
+    # Por defecto se usa sábado-viernes para mantener consistencia DSS con las
+    # demás pestañas semanales. El usuario puede cambiar a lunes-domingo aquí.
+    labels = list(WEEK_START_OPTIONS.keys())
     week_start_label = st.radio(
         "Definición de semana (solo en esta pestaña)",
-        list(day_options.keys()),
-        index=0,
+        labels,
+        index=labels.index(DEFAULT_WEEK_START_LABEL),
         horizontal=True,
         key="apw_week_start",
         help=(
-            "Cambia el día de inicio de la semana únicamente en esta pestaña. "
-            "No afecta la semana operativa sábado-viernes usada en el resto del app."
+            "Por defecto usa sábado-viernes, igual que la semana operativa DSS. "
+            "Si selecciona lunes-domingo, observado y DSS se agrupan con ese mismo criterio solo en esta pestaña."
         ),
     )
-    week_start = day_options[week_start_label]
+    week_start = int(WEEK_START_OPTIONS[week_start_label])
     rango_txt = "lunes a domingo" if week_start == 0 else "sábado a viernes"
 
     st.caption(
@@ -3986,14 +4004,20 @@ def tab_aportes_obs_semanal(
         return
 
     table = pd.concat(tables, ignore_index=True).sort_values(["Embalse", "Semana"])
+    table["Fecha gráfica"] = pd.to_datetime(table["Inicio semana"], format="%d-%m-%Y", errors="coerce")
+    table["Etiqueta semana"] = (
+        "Sem. " + table["Semana"].astype(int).astype(str)
+        + " · " + table["Inicio semana"].astype(str)
+        + " a " + table["Fin semana"].astype(str)
+    )
     detail_table = pd.concat(details, ignore_index=True) if details else pd.DataFrame()
 
     min_week = int(table["Semana"].min())
     max_week = int(table["Semana"].max())
     default_start = max(23, min_week) if max_week >= 23 else min_week
     c1, c2, c3 = st.columns([0.8, 0.8, 1.1])
-    w1 = c1.number_input("Semana inicial", min_value=min_week, max_value=max_week, value=default_start, step=1, key="apw_s")
-    w2 = c2.number_input("Semana final", min_value=min_week, max_value=max_week, value=max_week, step=1, key="apw_e")
+    w1 = c1.number_input("Semana inicial", min_value=min_week, max_value=max_week, value=default_start, step=1, key=f"apw_s_{week_start}")
+    w2 = c2.number_input("Semana final", min_value=min_week, max_value=max_week, value=max_week, step=1, key=f"apw_e_{week_start}")
     embalse_sel = c3.multiselect(
         "Embalse",
         sorted(table["Embalse"].dropna().unique().tolist()),
@@ -4045,6 +4069,9 @@ def tab_aportes_obs_semanal(
                 plot_rows.append({
                     "Embalse": r["Embalse"],
                     "Semana": int(r["Semana"]),
+                    "Inicio semana": r.get("Inicio semana", "—"),
+                    "Fin semana": r.get("Fin semana", "—"),
+                    "Fecha gráfica": r.get("Fecha gráfica", pd.NaT),
                     "Serie": "Aporte observado semanal",
                     "Valor": r[obs_col],
                     "Percentil": "Observado",
@@ -4052,6 +4079,9 @@ def tab_aportes_obs_semanal(
                 plot_rows.append({
                     "Embalse": r["Embalse"],
                     "Semana": int(r["Semana"]),
+                    "Inicio semana": r.get("Inicio semana", "—"),
+                    "Fin semana": r.get("Fin semana", "—"),
+                    "Fecha gráfica": r.get("Fecha gráfica", pd.NaT),
                     "Serie": "AP DSS semanal más cercano",
                     "Valor": r[dss_col],
                     "Percentil": r["Percentil AP DSS más cercano"],
@@ -4059,15 +4089,16 @@ def tab_aportes_obs_semanal(
             plot_df = pd.DataFrame(plot_rows)
             fig = px.line(
                 plot_df,
-                x="Semana",
+                x="Fecha gráfica",
                 y="Valor",
                 color="Serie",
                 line_dash="Embalse",
                 markers=True,
-                hover_data=["Embalse", "Percentil"],
-                title=f"Aporte observado semanal vs AP DSS más cercano ({unit_label(flow_unit)})",
+                hover_data=["Embalse", "Semana", "Inicio semana", "Fin semana", "Percentil"],
+                title=f"Aporte observado semanal vs AP DSS más cercano · semana {rango_txt} ({unit_label(flow_unit)})",
             )
             fig.update_layout(height=560, hovermode="x unified")
+            fig.update_xaxes(title="Inicio de semana")
             fig.update_yaxes(title=unit_label(flow_unit))
             st.plotly_chart(fig, use_container_width=True, key="apw_plot")
 
@@ -4105,28 +4136,28 @@ def tab_aportes_obs_semanal(
 # ─────────────────────────────────────────────────────────────────────
 # AP SEMANAL GRÁFICO / ESCLUSAJES GATÚN
 # ─────────────────────────────────────────────────────────────────────
-def _week_start_options_for_tab(key: str, default: str = "Lunes a domingo") -> Tuple[str, int, str]:
+def _week_start_options_for_tab(key: str, default: str = DEFAULT_WEEK_START_LABEL) -> Tuple[str, int, str]:
     """Selector local de semana para pestañas semanales.
 
-    No cambia la semana operativa global de la aplicación ni la distribución
-    diaria del DSS. Solo define cómo se agrupan los promedios en la pestaña
-    donde se llama.
+    Todas las pestañas semanales usan este mismo selector para evitar que el DSS
+    se vea con rangos distintos entre gráficas/tablas. Por defecto se usa
+    sábado-viernes, la semana operativa DSS; lunes-domingo queda disponible
+    como alternativa local dentro de la pestaña.
     """
-    day_options = {
-        "Lunes a domingo": 0,
-        "Sábado a viernes (semana operativa DSS)": 5,
-    }
-    labels = list(day_options.keys())
-    index = labels.index(default) if default in labels else 0
+    labels = list(WEEK_START_OPTIONS.keys())
+    index = labels.index(default) if default in labels else labels.index(DEFAULT_WEEK_START_LABEL)
     label = st.radio(
         "Definición de semana",
         labels,
         index=index,
         horizontal=True,
         key=key,
-        help="Cambia solo la agrupación de esta pestaña; no modifica el resto del app.",
+        help=(
+            "Por defecto usa sábado-viernes, igual que la semana operativa DSS. "
+            "El cambio aplica solo a esta pestaña y agrupa DSS y observado con el mismo criterio."
+        ),
     )
-    week_start = int(day_options[label])
+    week_start = int(WEEK_START_OPTIONS[label])
     rango_txt = "lunes a domingo" if week_start == 0 else "sábado a viernes"
     return label, week_start, rango_txt
 
@@ -4231,7 +4262,7 @@ def tab_ap_semanal_grafico(
 ) -> None:
     """Pestaña de gráficos semanales de AP para ambos embalses."""
     st.subheader("📈 AP semanal DSS y observado — ambos embalses")
-    _, week_start, rango_txt = _week_start_options_for_tab("apwg_week_start", default="Lunes a domingo")
+    _, week_start, rango_txt = _week_start_options_for_tab("apwg_week_start", default=DEFAULT_WEEK_START_LABEL)
     st.caption(
         f"Cada punto representa el **promedio semanal** con semana {rango_txt}. "
         "El aporte observado también se promedia por semana antes de compararlo con las curvas AP DSS."
@@ -4344,10 +4375,11 @@ def _esclusajes_weekly_table(esc_daily: pd.DataFrame, pcts: List[int], week_star
     if esc_daily is None or esc_daily.empty or not pcts:
         return pd.DataFrame()
     base = add_operational_week_columns(esc_daily, week_start=week_start)
-    group_cols = ["Semana operativa", "Inicio semana", "Fin semana"]
+    base["Año semana"] = pd.to_datetime(base["Inicio semana"], errors="coerce").dt.year
+    group_cols = ["Año semana", "Semana operativa", "Inicio semana", "Fin semana"]
     rows: List[Dict[str, object]] = []
     for keys, g in base.groupby(group_cols, dropna=False):
-        semana, inicio, fin = keys
+        _, semana, inicio, fin = keys
         row: Dict[str, object] = {
             "Semana": int(semana) if pd.notna(semana) else 0,
             "Inicio semana": pd.to_datetime(inicio).strftime("%d-%m-%Y") if pd.notna(inicio) else "—",
@@ -4510,7 +4542,7 @@ def tab_esclusajes_gatun(
             show_band=False,
         )
 
-    _, week_start, rango_txt = _week_start_options_for_tab("escgat_week_start", default="Sábado a viernes (semana operativa DSS)")
+    _, week_start, rango_txt = _week_start_options_for_tab("escgat_week_start", default=DEFAULT_WEEK_START_LABEL)
     st.markdown(f"#### Resumen semanal de consumo de esclusajes · semana {rango_txt}")
     weekly = _esclusajes_weekly_table(show_daily, pcts, week_start=week_start)
     if weekly.empty:
@@ -4563,7 +4595,11 @@ def tab_esclusajes_gatun(
 
 def tab_hp_semanal(dss_bytes: bytes) -> None:
     st.subheader("⚡ Hidrogeneración DSS")
-    st.caption("Promedio semanal de HP del DSS. Semana operativa sábado-viernes.")
+    _, week_start, rango_txt = _week_start_options_for_tab("hpw_week_start", default=DEFAULT_WEEK_START_LABEL)
+    st.caption(
+        f"Promedio semanal de HP del DSS con semana {rango_txt}. "
+        "La misma definición se usa para la tabla, la gráfica y la descarga."
+    )
 
     rows = []
     for res_key, cfg in RESERVOIR_CONFIG.items():
@@ -4578,16 +4614,19 @@ def tab_hp_semanal(dss_bytes: bytes) -> None:
         hp_cols = cols_by_prefix(daily, "HP", cfg["token"])
         if not hp_cols:
             continue
-        daily = add_operational_week_columns(daily)
-        group_cols = ["Semana operativa", "Inicio semana", "Fin semana"]
+        daily = add_operational_week_columns(daily, week_start=week_start)
+        daily["Año semana"] = pd.to_datetime(daily["Inicio semana"], errors="coerce").dt.year
+        group_cols = ["Año semana", "Semana operativa", "Inicio semana", "Fin semana"]
         weekly = daily.groupby(group_cols, as_index=False)[hp_cols].mean()
         for _, r in weekly.iterrows():
             row = {
                 "Variable": "Hidrogeneración DSS",
                 "Embalse": cfg["name"],
+                "Año semana": int(r["Año semana"]) if pd.notna(r["Año semana"]) else np.nan,
                 "Semana": int(r["Semana operativa"]),
                 "Inicio semana": pd.to_datetime(r["Inicio semana"]).strftime("%d-%m-%Y"),
                 "Fin semana": pd.to_datetime(r["Fin semana"]).strftime("%d-%m-%Y"),
+                "Definición semana": rango_txt,
             }
             for c in hp_cols:
                 row[f"HP P{exceedance_pct(c)} (MW)"] = round(float(r[c]), 3) if pd.notna(r[c]) else np.nan
@@ -4597,35 +4636,53 @@ def tab_hp_semanal(dss_bytes: bytes) -> None:
         st.warning("No se encontraron columnas HP en el DSS.")
         return
 
-    df = pd.DataFrame(rows).sort_values(["Embalse", "Semana"])
-    min_week = max(23, int(df["Semana"].min()))
-    max_week = int(df["Semana"].max())
+    df = pd.DataFrame(rows).sort_values(["Embalse", "Año semana", "Semana"])
     df = df[df["Semana"] >= 23].copy()
+    if df.empty:
+        st.warning("No hay registros de HP desde la semana 23 para la definición de semana seleccionada.")
+        return
+    min_week = int(df["Semana"].min())
+    max_week = int(df["Semana"].max())
     c1, c2 = st.columns(2)
-    w1 = c1.number_input("Semana inicial", min_value=min_week, max_value=max_week, value=min_week, step=1, key="hpw_s")
-    w2 = c2.number_input("Semana final", min_value=min_week, max_value=max_week, value=max_week, step=1, key="hpw_e")
+    w1 = c1.number_input("Semana inicial", min_value=min_week, max_value=max_week, value=min_week, step=1, key=f"hpw_s_{week_start}")
+    w2 = c2.number_input("Semana final", min_value=min_week, max_value=max_week, value=max_week, step=1, key=f"hpw_e_{week_start}")
     if w1 > w2:
         w1, w2 = min_week, max_week
         st.warning("Semana inicial mayor que final. Se muestra todo el período.")
     show = df[(df["Semana"] >= int(w1)) & (df["Semana"] <= int(w2))].copy()
 
     st.markdown("#### Tabla semanal de Hidrogeneración DSS")
-    st.caption("La variable **Hidrogeneración DSS** inicia en la semana operativa 23.")
+    st.caption(
+        f"La variable **Hidrogeneración DSS** inicia en la semana 23. "
+        f"Agrupación activa: **{rango_txt}**."
+    )
     st.dataframe(show, use_container_width=True, hide_index=True, height=520)
     csv = show.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ Descargar CSV HP semanal", csv, "hidrogeneracion_dss_semanal.csv", "text/csv", key="hpw_dl")
+    st.download_button("⬇️ Descargar CSV HP semanal", csv, "hidrogeneracion_dss_semanal.csv", "text/csv", key=f"hpw_dl_{week_start}")
 
     # Gráfica simple P50 si existe
     if PLOTLY_OK:
         p50_cols = [c for c in show.columns if c == "HP P50 (MW)"]
         if p50_cols:
             plot = show.copy()
-            plot["Etiqueta semana"] = plot["Semana"].astype(str) + " · " + plot["Inicio semana"].astype(str)
-            fig = px.line(plot, x="Semana", y="HP P50 (MW)", color="Embalse", markers=True,
-                          title="HP P50 semanal por embalse")
+            plot["Fecha_grafica"] = pd.to_datetime(plot["Inicio semana"], format="%d-%m-%Y", errors="coerce")
+            plot["Etiqueta semana"] = (
+                "Sem. " + plot["Semana"].astype(str)
+                + " · " + plot["Inicio semana"].astype(str)
+                + " a " + plot["Fin semana"].astype(str)
+            )
+            fig = px.line(
+                plot,
+                x="Fecha_grafica",
+                y="HP P50 (MW)",
+                color="Embalse",
+                markers=True,
+                hover_data=["Semana", "Inicio semana", "Fin semana", "Definición semana"],
+                title=f"HP P50 semanal por embalse · semana {rango_txt}",
+            )
             fig.update_layout(height=520, hovermode="x unified")
-            st.plotly_chart(fig, use_container_width=True, key="hpw_plot")
-
+            fig.update_xaxes(title="Inicio de semana")
+            st.plotly_chart(fig, use_container_width=True, key=f"hpw_plot_{week_start}")
 
 def tab_instructivo() -> None:
     st.subheader("📘 Instructivo operativo del dashboard DSS")
@@ -4658,8 +4715,8 @@ Esta versión incorpora mejoras puntuales para la lectura operativa:
 2. **Orden visual húmedo-seco en las gráficas.**  
    Las gráficas y el visor unificado de Plotly se ordenan de **húmedo a seco**: **P5 arriba** y **P95 abajo**. Este criterio aplica a niveles, hidrogeneración, aportes, vertidos y esclusajes cuando las series estén disponibles.
 
-3. **Pestañas AP semanal observado y AP semanal gráfico.**  
-   Se calcula el **promedio semanal observado de aportes** por embalse y se compara contra todos los AP DSS para reportar el **percentil de excedencia más cercano**. Además, la pestaña gráfica semanal muestra las curvas AP DSS promediadas por semana y el observado semanal, con opción lunes-domingo o sábado-viernes.
+3. **Pestañas semanales con semana DSS unificada.**  
+   Las pestañas **AP semanal obs**, **AP semanal gráfico**, **Esclusajes GAT** e **Hidrogeneración DSS** usan el mismo criterio de agrupación. Por defecto trabajan con **sábado-viernes**, que es la semana operativa DSS. Dentro de cada pestaña se puede cambiar a **lunes-domingo**; cuando se cambia, tanto DSS como observado se agrupan con el mismo criterio para evitar diferencias visuales entre gráficas y tablas.
 
 4. **Pestaña Aporte instantáneo.**  
    Se agregó una pestaña para ver el visor meteorológico/radar y comparar:
@@ -4832,16 +4889,23 @@ Cuando se selecciona AP, también puede mostrar el aporte observado de cada emba
 
 ---
 
-### Pestaña Hidrogeneración DSS
+### Pestañas semanales DSS
 
-Resume la hidrogeneración DSS por semana operativa. La semana operativa se calcula de **sábado a viernes**.
+Las pestañas semanales ahora usan una misma lógica de agrupación para evitar que las semanas se vean diferentes entre gráficos:
 
-Para 2026:
+- **AP semanal obs**
+- **AP semanal gráfico**
+- **Esclusajes GAT**
+- **Hidrogeneración DSS**
+
+Por defecto todas trabajan con **sábado a viernes**, la semana operativa DSS. También se puede seleccionar **lunes a domingo** dentro de cada pestaña. El cambio solo afecta la pestaña activa, pero siempre agrupa **DSS y observado con el mismo criterio**.
+
+Para 2026 usando sábado-viernes:
 
 - Del 30-may al 05-jun corresponde a la **semana 23**.
 - Desde el 06-jun inicia la **semana 24**.
 
-La variable **Hidrogeneración DSS** inicia en la semana operativa 23. Esta pestaña permite revisar el patrón semanal de hidrogeneración por embalse y relacionarlo con el percentil operativo evaluado.
+La variable **Hidrogeneración DSS** inicia en la semana 23. La gráfica HP usa como eje X el **inicio de semana**, no solo el número de semana, para que el rango graficado sea claro.
 
 ---
 
@@ -4915,8 +4979,9 @@ Secuencia recomendada:
 7. Revisar **Manejo / Decisión**.
 8. Validar cada embalse en **GATÚN DSS** y **ALHAJUELA DSS**.
 9. Revisar **Aporte GAT obs** y **Aporte ALHA obs** para identificar el percentil hidrológico actual.
-10. Usar **Aporte instantáneo** si se requiere comparar un aporte manual o monitorear el radar.
-11. Usar **Exportar** para generar una tabla del percentil operativo evaluado.
+10. En las pestañas semanales, mantener **sábado-viernes** para lectura operativa DSS o cambiar a **lunes-domingo** cuando se requiera una comparación calendario. No mezclar criterios al comparar pestañas.
+11. Usar **Aporte instantáneo** si se requiere comparar un aporte manual o monitorear el radar.
+12. Usar **Exportar** para generar una tabla del percentil operativo evaluado.
 
 La lectura final debe considerar siempre la consistencia entre nivel observado, aporte observado, percentil DSS, vertidos, esclusajes e hidrogeneración.
 """)
