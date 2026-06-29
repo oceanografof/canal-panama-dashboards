@@ -3450,8 +3450,20 @@ def build_percentile_export_table(
     pct_ref: int,
     flow_unit: str,
     evap_cfs: float = 0.0,
+    include_ap_neto: bool = True,
+    include_ap_total: bool = True,
+    include_evap_column: bool = True,
+    ap_distribution_label: str = "DSS original",
 ) -> pd.DataFrame:
-    """Construye tabla diaria para exportar el percentil elegido por embalse."""
+    """Construye tabla diaria para exportar el percentil elegido por embalse.
+
+    Opciones AP:
+    - include_ap_neto: exporta el AP DSS neto del percentil seleccionado.
+    - include_ap_total: exporta AP total DSS = AP neto DSS + evaporación.
+    - include_evap_column: muestra el caudal evaporado sumado.
+    - ap_distribution_label: documenta si el AP diario viene del DSS original
+      o de la simulación con hidrograma observado de mayo.
+    """
     if daily is None or daily.empty:
         return pd.DataFrame()
     base = daily.copy()
@@ -3474,6 +3486,7 @@ def build_percentile_export_table(
         "Fecha": base["Fecha_dia"],
         "Embalse": cfg["name"],
         "Percentil solicitado": f"P{pct_ref}",
+        "Modo AP diario": ap_distribution_label,
         "Percentiles usados": (
             f"NP P{np_pct if np_pct is not None else '—'} · "
             f"HP P{hp_pct if hp_pct is not None else '—'} · "
@@ -3487,14 +3500,29 @@ def build_percentile_export_table(
     out[f"NP P{np_pct if np_pct is not None else pct_ref} (ft PLD)"] = pd.to_numeric(base[np_col], errors="coerce") if np_col else np.nan
     out[f"HP P{hp_pct if hp_pct is not None else pct_ref} (MW)"] = pd.to_numeric(base[hp_col], errors="coerce") if hp_col else np.nan
 
+    # Garantiza que siempre exista al menos una salida de AP cuando hay AP DSS.
+    if not include_ap_neto and not include_ap_total:
+        include_ap_neto = True
+
     if ap_col:
-        ap_total_cfs = ap_total_dss_cfs(base[ap_col], evap_cfs)
-        out[f"AP neto DSS P{ap_pct if ap_pct is not None else pct_ref} (p³/s)"] = pd.to_numeric(base[ap_col], errors="coerce")
-        out[f"Evaporación sumada AP DSS (p³/s)"] = clean_evap_cfs(evap_cfs)
-        out[f"AP total DSS P{ap_pct if ap_pct is not None else pct_ref} (p³/s)"] = ap_total_cfs
-        out[f"AP total DSS P{ap_pct if ap_pct is not None else pct_ref} ({unit_label(flow_unit)})"] = convert_flow(ap_total_cfs, flow_unit)
+        ap_label = f"P{ap_pct if ap_pct is not None else pct_ref}"
+        ap_neto_cfs = pd.to_numeric(base[ap_col], errors="coerce")
+        ap_total_cfs = ap_total_dss_cfs(ap_neto_cfs, evap_cfs)
+        if include_ap_neto:
+            out[f"AP neto DSS {ap_label} (p³/s)"] = ap_neto_cfs
+            if flow_unit != "cfs":
+                out[f"AP neto DSS {ap_label} ({unit_label(flow_unit)})"] = convert_flow(ap_neto_cfs, flow_unit)
+        if include_evap_column and include_ap_total:
+            evap_series_cfs = pd.Series([clean_evap_cfs(evap_cfs)] * len(base), index=base.index)
+            out[f"Evaporación sumada al AP DSS (p³/s)"] = evap_series_cfs
+            if flow_unit != "cfs":
+                out[f"Evaporación sumada al AP DSS ({unit_label(flow_unit)})"] = convert_flow(evap_series_cfs, flow_unit)
+        if include_ap_total:
+            out[f"AP total DSS {ap_label} = AP neto + evaporación (p³/s)"] = ap_total_cfs
+            if flow_unit != "cfs":
+                out[f"AP total DSS {ap_label} = AP neto + evaporación ({unit_label(flow_unit)})"] = convert_flow(ap_total_cfs, flow_unit)
     else:
-        out[f"AP total DSS P{pct_ref} ({unit_label(flow_unit)})"] = np.nan
+        out[f"AP DSS P{pct_ref} ({unit_label(flow_unit)})"] = np.nan
 
     if v_col:
         out[f"Vertido DSS P{v_pct if v_pct is not None else pct_ref} (p³/s)"] = pd.to_numeric(base[v_col], errors="coerce")
@@ -3517,8 +3545,9 @@ def build_percentile_export_table(
         total_cfs = pd.concat(parts, axis=1).sum(axis=1, min_count=1)
         out[f"Total esclusajes EG+EP ({unit_label(flow_unit)})"] = convert_flow(total_cfs, flow_unit)
 
+    text_cols = ("Fecha", "Embalse", "Percentil solicitado", "Modo AP diario", "Percentiles usados")
     for c in out.columns:
-        if c not in ("Fecha", "Embalse", "Percentil solicitado", "Percentiles usados"):
+        if c not in text_cols:
             out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
     return out
 
@@ -3551,10 +3580,42 @@ def tab_exportar_percentil(
     evap = evap_gat_cfs if res_key == "gatun" else evap_alh_cfs
     obs_ap_df = obs_gat_aporte if res_key == "gatun" else obs_alh_aporte
 
+    st.markdown("#### ⚙️ Opciones de exportación AP")
+    with st.container():
+        c1, c2, c3 = st.columns([1.25, 1.25, 1.0])
+        with c1:
+            simular_hidro_mayo = st.checkbox(
+                "🌊 Simular hidrograma observado de mayo",
+                value=bool(st.session_state.get("ap_hydrograph_enabled", False)),
+                key="exp_simular_hidro_mayo",
+                help=(
+                    "Redistribuye diariamente el AP DSS usando la forma del último hidrograma válido de mayo. "
+                    "Conserva la suma/promedio semanal del DSS; evita que el aporte exportado quede constante día tras día."
+                ),
+            )
+        with c2:
+            sumar_evap_ap = st.checkbox(
+                "➕ Sumar evaporación al AP del percentil",
+                value=True,
+                key="exp_sumar_evap_ap",
+                help="Calcula AP total DSS = AP neto DSS del percentil seleccionado + caudal evaporado.",
+            )
+        with c3:
+            incluir_ap_neto = st.checkbox(
+                "Mostrar también AP neto",
+                value=True,
+                key="exp_incluir_ap_neto",
+                help="Incluye una columna separada con el AP neto DSS antes de sumar evaporación.",
+            )
+        st.caption(
+            "Estas opciones solo cambian la tabla exportada. La simulación con mayo mantiene el volumen semanal DSS; "
+            "la evaporación se suma como término positivo al AP del percentil escogido."
+        )
+
     try:
         raw = load_dss_sheet(dss_bytes, cfg["sheet"])
         daily = to_daily(raw, cfg)
-        daily = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_ap_df)
+        daily = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_ap_df, enabled=simular_hidro_mayo)
     except Exception as exc:
         st.error(f"Error cargando DSS: {exc}")
         return
@@ -3562,8 +3623,37 @@ def tab_exportar_percentil(
         st.warning("No se pudo construir el diario DSS para exportación.")
         return
 
-    _show_ap_may_adjustment_note(daily, res_key, "exportación")
-    table = build_percentile_export_table(daily, cfg, int(pct), flow_unit, evap)
+    meta_ap = getattr(daily, "attrs", {}) or {}
+    if simular_hidro_mayo:
+        if meta_ap.get("ap_may_adjustment"):
+            _show_ap_may_adjustment_note(daily, res_key, "exportación")
+        else:
+            st.warning(
+                "No se pudo aplicar la simulación con hidrograma observado de mayo; "
+                f"se usa el AP DSS original. Motivo: {meta_ap.get('reason', 'sin detalle disponible')}."
+            )
+    else:
+        st.info("Modo AP diario: se exporta el AP DSS original, sin redistribución con mayo.")
+
+    include_ap_total = bool(sumar_evap_ap)
+    include_evap_column = bool(sumar_evap_ap)
+    include_ap_neto = bool(incluir_ap_neto or not include_ap_total)
+    if include_ap_total:
+        ap_distribution_label = "Hidrograma observado de mayo" if meta_ap.get("ap_may_adjustment") else "DSS original + evaporación"
+    else:
+        ap_distribution_label = "Hidrograma observado de mayo" if meta_ap.get("ap_may_adjustment") else "DSS original"
+
+    table = build_percentile_export_table(
+        daily,
+        cfg,
+        int(pct),
+        flow_unit,
+        evap,
+        include_ap_neto=include_ap_neto,
+        include_ap_total=include_ap_total,
+        include_evap_column=include_evap_column,
+        ap_distribution_label=ap_distribution_label,
+    )
     if table.empty:
         st.warning("No hay datos para exportar.")
         return
@@ -3577,6 +3667,39 @@ def tab_exportar_percentil(
         table = table[(table["Fecha"].dt.date >= s) & (table["Fecha"].dt.date <= e)].copy()
     else:
         st.warning("Fecha inicial mayor que final. Se exporta el período completo.")
+
+    # Resumen operativo rápido para confirmar que las opciones seleccionadas
+    # están haciendo lo esperado antes de descargar el archivo.
+    ap_total_cols = [c for c in table.columns if c.startswith("AP total DSS") and f"({unit_label(flow_unit)})" in c]
+    ap_neto_cols = [c for c in table.columns if c.startswith("AP neto DSS") and f"({unit_label(flow_unit)})" in c]
+    evap_cols = [c for c in table.columns if c.startswith("Evaporación sumada") and f"({unit_label(flow_unit)})" in c]
+    m1, m2, m3 = st.columns(3)
+    if ap_neto_cols:
+        m1.metric(f"AP neto medio ({unit_label(flow_unit)})", f"{pd.to_numeric(table[ap_neto_cols[0]], errors='coerce').mean():,.3f}")
+    else:
+        m1.metric("AP neto medio", "—")
+    if ap_total_cols:
+        m2.metric(f"AP total medio ({unit_label(flow_unit)})", f"{pd.to_numeric(table[ap_total_cols[0]], errors='coerce').mean():,.3f}")
+    else:
+        m2.metric("AP total medio", "—")
+    if evap_cols:
+        m3.metric(f"Evaporación sumada ({unit_label(flow_unit)})", f"{pd.to_numeric(table[evap_cols[0]], errors='coerce').mean():,.3f}")
+    else:
+        m3.metric("Evaporación sumada", "—")
+
+    if PLOTLY_OK and (ap_total_cols or ap_neto_cols):
+        with st.expander("📈 Vista previa del AP exportado", expanded=False):
+            fig = go.Figure()
+            for col in ap_neto_cols[:1] + ap_total_cols[:1]:
+                fig.add_trace(go.Scatter(
+                    x=table["Fecha"],
+                    y=pd.to_numeric(table[col], errors="coerce"),
+                    mode="lines+markers",
+                    name=col,
+                ))
+            fig.update_layout(**_base_layout("AP exportado del percentil seleccionado", unit_label(flow_unit), height=420))
+            _today_line(fig, table["Fecha"])
+            st.plotly_chart(fig, use_container_width=True, key="exp_ap_preview")
 
     st.dataframe(table, use_container_width=True, hide_index=True, height=520)
     fname_base = f"export_{cfg['token']}_P{int(pct)}".replace(" ", "_")
