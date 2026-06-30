@@ -2440,11 +2440,14 @@ pct_crossfill = (n_crossfill_total_aplicado / max(_n_pnx_seguro, 1.0)) * 100.0
 _V_CC = AC_NPX * max(_H_m - EQ_CC_m, 0) * 1e-6   # hm³ / tránsito normal lado Cocolí
 _V_AC = AC_NPX * max(_H_m - EQ_AC_m, 0) * 1e-6   # hm³ / tránsito normal lado Agua Clara
 
-# Turn Around NPX aplicado: se limita a la cantidad de NPX/día para evitar sobreconteo.
-n_turnaround_npx_aplicado = min(float(n_turnaround_npx) if usar_turnaround_npx else 0.0, max(float(n_npx), 0.0))
-n_npx_normal = max(float(n_npx) - n_turnaround_npx_aplicado, 0.0)
-if usar_turnaround_npx and float(n_turnaround_npx) > max(float(n_npx), 0.0) + 1e-9:
-    st.sidebar.warning("Los Turn Around NPX superan los NPX/día; el cálculo se limitó al total NPX para no sobrecontar.")
+# Turn Around NPX aplicado como evento operativo independiente.
+# Importante: NO se limita ni se descuenta de los NPX/día, porque un Turn Around
+# puede representar una maniobra/cambio de dirección adicional aunque el conteo de
+# tránsitos NPX normales sea bajo o incluso cero. Así el balance lo calcula también
+# cuando no se usan tinas.
+n_turnaround_npx_aplicado = max(float(n_turnaround_npx), 0.0) if usar_turnaround_npx else 0.0
+n_npx_normal = max(float(n_npx), 0.0)
+n_npx_balance_unidades = n_npx_normal + n_turnaround_npx_aplicado
 
 # Tinas NPX en tránsito normal.
 # La hoja NeoPanamax calcula el volumen por tránsito como Cocolí + Agua Clara.
@@ -2467,7 +2470,11 @@ _ta_cc_consumo_modelo = _ta_cc_base_modelo * (1.0 - FRAC_TINAS_TA_NPX if usar_ti
 _ta_ac_consumo_modelo = _ta_ac_base_modelo * (1.0 - FRAC_TINAS_TA_NPX if usar_tinas_ta_ac else 1.0)
 turnaround_npx_consumo_tr_modelo = _ta_cc_consumo_modelo + _ta_ac_consumo_modelo
 turnaround_npx_ahorro_tr_modelo = max(turnaround_npx_base_tr_modelo - turnaround_npx_consumo_tr_modelo, 0.0)
+consumo_turnaround_npx_modelo = n_turnaround_npx_aplicado * turnaround_npx_consumo_tr_modelo
+consumo_turnaround_npx_base_modelo = n_turnaround_npx_aplicado * turnaround_npx_base_tr_modelo
 ahorro_turnaround_npx_modelo = n_turnaround_npx_aplicado * turnaround_npx_ahorro_tr_modelo
+# Alias usado en exportación y reportes para evitar errores si se descarga el Excel.
+ahorro_turnaround_aplicado = ahorro_turnaround_npx_modelo
 
 # Versión sidebar/LakeHouse: se conserva la proporción física CC/AC, pero se escala al
 # volumen NPX seleccionado en el sidebar para que el balance baje en la misma lógica.
@@ -2483,6 +2490,8 @@ turnaround_npx_consumo_tr_sidebar = turnaround_npx_base_tr_sidebar * (
     + _ta_ac_share * (1.0 - FRAC_TINAS_TA_NPX if usar_tinas_ta_ac else 1.0)
 )
 turnaround_npx_ahorro_tr_sidebar = max(turnaround_npx_base_tr_sidebar - turnaround_npx_consumo_tr_sidebar, 0.0)
+consumo_turnaround_npx_sidebar = n_turnaround_npx_aplicado * turnaround_npx_consumo_tr_sidebar
+consumo_turnaround_npx_base_sidebar = n_turnaround_npx_aplicado * turnaround_npx_base_tr_sidebar
 ahorro_turnaround_npx_sidebar = n_turnaround_npx_aplicado * turnaround_npx_ahorro_tr_sidebar
 
 _sav_cc_tr       = _pnx_ahorro_cc_per_transit(nivel_modelo_ft)
@@ -2500,26 +2509,38 @@ ahorro_total_esc = (
 # Vol/tránsito efectivo con estrategias activas.
 # Para PNX se replica la estructura de la hoja Panamax incluyendo cambio de dirección;
 # luego se descuentan Cámara Corta y CrossFilling.
+dem_pnx_simple_modelo = _n_pnx_seguro * _vp_fis
 dem_pnx_base_modelo = _pnx_consumo_base_con_turnaround(nivel_modelo_ft, _n_pnx_seguro, n_pnx_dud, n_pnx_ddu)
+# Diferencia por cambio de dirección PNX: puede subir o bajar consumo frente al PNX simple.
+ajuste_cambio_dir_pnx_modelo = dem_pnx_base_modelo - dem_pnx_simple_modelo
 dem_pnx_efectivo_modelo = max(dem_pnx_base_modelo - ahorro_cam_corta - ahorro_xfill, 0.0)
 vp_base_modelo = dem_pnx_base_modelo / max(_n_pnx_seguro, 1.0)
 vp_efectivo = dem_pnx_efectivo_modelo / max(_n_pnx_seguro, 1.0)
 _ahorro_pnx_prom_tr = (ahorro_cam_corta + ahorro_xfill) / max(_n_pnx_seguro, 1.0)
-vp_sidebar_ahorro = max(vp - _ahorro_pnx_prom_tr, 0.001)
 
-# Para NPX se calcula el promedio diario correcto: tránsitos normales + Turn Around.
+# En modo Sidebar + ahorro también se aplica el cambio de dirección. Se escala el
+# ajuste físico al volumen de tránsito que el usuario haya seleccionado (LakeHouse/manual).
+_factor_sidebar_pnx = max(float(vp), 0.0) / max(_vp_fis, 1e-9)
+ajuste_cambio_dir_pnx_sidebar = ajuste_cambio_dir_pnx_modelo * _factor_sidebar_pnx
+dem_pnx_sidebar_base = max(_n_pnx_seguro * float(vp) + ajuste_cambio_dir_pnx_sidebar, 0.0)
+dem_pnx_sidebar_ahorro = max(dem_pnx_sidebar_base - ahorro_cam_corta - ahorro_xfill, 0.0)
+vp_sidebar_ahorro = dem_pnx_sidebar_ahorro / max(_n_pnx_seguro, 1.0)
+
+# Para NPX se calcula el promedio diario correcto: NPX normales + eventos Turn Around.
+# Si no se usan tinas, Turn Around no genera ahorro, pero sí entra como consumo en el balance.
 dem_npx_base_modelo = n_npx_normal * _vn_fis + n_turnaround_npx_aplicado * turnaround_npx_base_tr_modelo
 dem_npx_efectivo_modelo = n_npx_normal * vn_normal_efectivo + n_turnaround_npx_aplicado * turnaround_npx_consumo_tr_modelo
+dem_npx_sidebar_base = n_npx_normal * float(vn) + n_turnaround_npx_aplicado * turnaround_npx_base_tr_sidebar
 dem_npx_sidebar_ahorro = n_npx_normal * vn_normal_sidebar_ahorro + n_turnaround_npx_aplicado * turnaround_npx_consumo_tr_sidebar
 
-vn_base_modelo = dem_npx_base_modelo / max(float(n_npx), 1.0)
-vn_efectivo = dem_npx_efectivo_modelo / max(float(n_npx), 1.0)
-vn_sidebar_ahorro = dem_npx_sidebar_ahorro / max(float(n_npx), 1.0)
+vn_base_modelo = dem_npx_base_modelo / max(n_npx_balance_unidades, 1.0)
+vn_efectivo = dem_npx_efectivo_modelo / max(n_npx_balance_unidades, 1.0)
+vn_sidebar_ahorro = dem_npx_sidebar_ahorro / max(n_npx_balance_unidades, 1.0)
 frac_ahorro_npx = min(max(vn_normal_efectivo / max(_vn_fis, 1e-9), 0.0), 1.0)
 
 dem_escl_modelo         = dem_npx_base_modelo + dem_pnx_base_modelo
 dem_escl_efectivo       = max(dem_npx_efectivo_modelo + dem_pnx_efectivo_modelo, 0.0)
-dem_escl_sidebar_ahorro = max(dem_npx_sidebar_ahorro + n_pnx * vp_sidebar_ahorro, 0.0)
+dem_escl_sidebar_ahorro = max(dem_npx_sidebar_ahorro + dem_pnx_sidebar_ahorro, 0.0)
 
 st.sidebar.markdown("### ☀️ Evaporación")
 fuente_evap = st.sidebar.radio(
@@ -2784,26 +2805,35 @@ st.sidebar.caption(f"📅 Sesión: {AHORA}")
 
 
 # ═══ CÁLCULOS ═══
+# El balance usa demandas diarias calculadas directamente. Esto evita perder los
+# eventos Turn Around NPX cuando NPX/día es 0 y permite que el cambio de dirección
+# PNX afecte el consumo aun cuando se use el modo Sidebar + ahorro.
 if modo_balance_esclusajes == "Manual sidebar":
-    vp_balance = vp
-    vn_balance = vn
+    dem_pnx = max(float(n_pnx) * float(vp), 0.0)
+    dem_npx = max(float(n_npx) * float(vn), 0.0)
+    vp_balance = float(vp)
+    vn_balance = float(vn)
     balance_escl_label = "Manual sidebar"
 elif modo_balance_esclusajes == "Sidebar + ahorro":
-    vp_balance = vp_sidebar_ahorro
-    vn_balance = vn_sidebar_ahorro
+    dem_pnx = max(dem_pnx_sidebar_ahorro, 0.0)
+    dem_npx = max(dem_npx_sidebar_ahorro, 0.0)
+    vp_balance = dem_pnx / max(float(n_pnx), 1.0)
+    vn_balance = dem_npx / max(n_npx_balance_unidades, 1.0)
     balance_escl_label = "Sidebar + ahorro"
 elif modo_balance_esclusajes == "Modelo físico base":
+    dem_pnx = max(dem_pnx_base_modelo, 0.0)
+    dem_npx = max(dem_npx_base_modelo, 0.0)
     vp_balance = vp_base_modelo
     vn_balance = vn_base_modelo
     balance_escl_label = "Modelo físico base"
 else:
+    dem_pnx = max(dem_pnx_efectivo_modelo, 0.0)
+    dem_npx = max(dem_npx_efectivo_modelo, 0.0)
     vp_balance = vp_efectivo
     vn_balance = vn_efectivo
     balance_escl_label = "Modelo físico + ahorro"
 
-dem_pnx       = n_pnx * vp_balance
-dem_npx_bruto = n_npx * vn_balance
-dem_npx       = max(dem_npx_bruto, 0.0)
+dem_npx_bruto = dem_npx
 dem_escl      = dem_pnx + dem_npx
 gen_alh   = gm_mw*mw_madden*CFS2HM3
 gen_gat   = gg_mw*mw_gatun *CFS2HM3
@@ -3894,8 +3924,8 @@ with tabs[5]:
                f"{(ahorro_tinas_cc+ahorro_tinas_ac):.3f} hm³/d",
                delta=f"{(ahorro_tinas_cc+ahorro_tinas_ac)/CFS2HM3:.0f} cfs")
     ah3.metric("Turn Around NPX",
-               f"{ahorro_turnaround_npx_modelo:.3f} hm³/d",
-               delta=f"{ahorro_turnaround_npx_modelo/CFS2HM3:.0f} cfs")
+               f"{consumo_turnaround_npx_modelo:.3f} hm³/d",
+               delta=f"Ahorro tinas: {ahorro_turnaround_npx_modelo:.3f} hm³/d")
     ah4.metric("Cámaras Cortas PNX",
                f"{ahorro_cam_corta:.3f} hm³/d",
                delta=f"{ahorro_cam_corta/CFS2HM3:.0f} cfs")
@@ -3904,6 +3934,34 @@ with tabs[5]:
                delta=f"{ahorro_xfill/CFS2HM3:.0f} cfs")
     _equiv_transitos = ahorro_total_esc / max(_vn_fis, 0.001)
     ah6.metric("Tránsitos equiv. ahorrados", f"{_equiv_transitos:.1f}/d")
+
+    # Los cambios de dirección no siempre son ahorros: pueden ser consumo adicional.
+    imp1, imp2, imp3 = st.columns(3)
+    imp1.metric(
+        "Consumo TA NPX en balance",
+        f"{consumo_turnaround_npx_modelo:.3f} hm³/d",
+        delta=f"{consumo_turnaround_npx_modelo/CFS2HM3:.0f} cfs"
+    )
+    imp2.metric(
+        "Ajuste cambio dirección PNX",
+        f"{ajuste_cambio_dir_pnx_modelo:+.3f} hm³/d",
+        delta=f"{ajuste_cambio_dir_pnx_modelo/CFS2HM3:+.0f} cfs"
+    )
+    imp3.metric(
+        "Esclusajes usados en balance",
+        f"{dem_escl:.3f} hm³/d",
+        delta=f"{balance_escl_label}"
+    )
+    if n_turnaround_npx_aplicado > 0 and ahorro_turnaround_npx_modelo <= 1e-9:
+        st.info(
+            "Turn Around NPX está activo sin tinas: no se reporta como ahorro, "
+            f"pero sí suma {consumo_turnaround_npx_modelo:.3f} hm³/d al consumo de esclusajes."
+        )
+    if abs(ajuste_cambio_dir_pnx_modelo) > 1e-9:
+        st.info(
+            f"Cambio de dirección PNX aplicado: ajuste {ajuste_cambio_dir_pnx_modelo:+.3f} hm³/d "
+            "frente al PNX simple. En modo Sidebar + ahorro también se aplica al balance."
+        )
 
     st.markdown("---")
 
@@ -3999,7 +4057,7 @@ with tabs[5]:
     with col_ah2:
         st.markdown("#### Ahorro diario por mecanismo (hm³/d)")
         mec_lbl = ["Tinas Cocolí\n(NPX)", "Tinas A.Clara\n(NPX)",
-                   "Turn Around\n(NPX)", "Cámaras Cortas\n(PNX)", "CrossFilling\n(PNX)"]
+                   "Ahorro tinas\nTA NPX", "Cámaras Cortas\n(PNX)", "CrossFilling\n(PNX)"]
         mec_val = [ahorro_tinas_cc, ahorro_tinas_ac, ahorro_turnaround_npx_modelo, ahorro_cam_corta, ahorro_xfill]
         mec_clr = [COL["npx"], COL["flush"], COL["gatun"], COL["pnx"], COL["esclusas"]]
         fig_mec = go.Figure(go.Bar(
@@ -4040,7 +4098,7 @@ with tabs[5]:
         stackgroup="one", line=dict(color=COL["npx"]),   fillcolor="rgba(22,160,133,0.55)"))
     fig_sen.add_trace(go.Scatter(x=_nv_sens, y=_aho_ac, name="Tinas A.Clara",
         stackgroup="one", line=dict(color=COL["flush"]),  fillcolor="rgba(26,188,156,0.55)"))
-    fig_sen.add_trace(go.Scatter(x=_nv_sens, y=_aho_ta, name="Turn Around NPX",
+    fig_sen.add_trace(go.Scatter(x=_nv_sens, y=_aho_ta, name="Ahorro tinas TA NPX",
         stackgroup="one", line=dict(color=COL["gatun"]),  fillcolor="rgba(26,82,118,0.45)"))
     fig_sen.add_trace(go.Scatter(x=_nv_sens, y=_aho_c,  name="Cámaras Cortas",
         stackgroup="one", line=dict(color=COL["pnx"]),    fillcolor="rgba(44,62,80,0.55)"))
@@ -4083,9 +4141,10 @@ with tabs[5]:
         {"Parámetro":"Ahorro con tinas tránsito normal","Valor":f"{FRAC_TINAS*100:.0f}%","Fuente":"Hoja NeoPanamax"},
         {"Parámetro":"Vol/tránsito NPX base","Valor":f"{_vn_fis:.4f} hm³","Fuente":"Constantes NoSaving por nivel"},
         {"Parámetro":"Vol/tránsito NPX efectivo promedio","Valor":f"{vn_efectivo:.4f} hm³","Fuente":"Cálculo físico"},
-        {"Parámetro":"Turn Around NPX/día","Valor":f"{n_turnaround_npx:.1f}","Fuente":"Sidebar"},
-        {"Parámetro":"Ahorro Turn Around NPX por evento","Valor":f"{turnaround_npx_ahorro_tr_modelo:.5f} hm³","Fuente":"Workbook / cálculo"},
-        {"Parámetro":"Ahorro Turn Around NPX total","Valor":f"{ahorro_turnaround_npx_modelo:.4f} hm³/d","Fuente":"Cálculo físico"},
+        {"Parámetro":"Turn Around NPX/día","Valor":f"{n_turnaround_npx_aplicado:.1f}","Fuente":"Sidebar"},
+        {"Parámetro":"Consumo Turn Around NPX por evento sin/según tinas","Valor":f"{turnaround_npx_consumo_tr_modelo:.5f} hm³","Fuente":"Workbook / cálculo"},
+        {"Parámetro":"Consumo Turn Around NPX total","Valor":f"{consumo_turnaround_npx_modelo:.4f} hm³/d","Fuente":"Cálculo físico"},
+        {"Parámetro":"Ahorro Turn Around NPX por tinas","Valor":f"{ahorro_turnaround_npx_modelo:.4f} hm³/d","Fuente":"Cálculo físico"},
         {"Parámetro":"Área cámara PNX Regular","Valor":f"{AC_PNX_REG:,.1f} m²","Fuente":"Hoja Panamax"},
         {"Parámetro":"Área cámara PNX Corta","Valor":f"{AC_PNX_COR:,.1f} m²","Fuente":"Hoja Panamax"},
         {"Parámetro":"Nivel equiv. PedroMiguel","Valor":f"{EQ_PM_ft:.3f} ft","Fuente":"Hoja Panamax"},
@@ -4101,6 +4160,7 @@ with tabs[5]:
         {"Parámetro":"CrossFilling Gatún/día aplicado","Valor":f"{n_crossfill_ga_aplicado:.1f}","Fuente":"Sidebar"},
         {"Parámetro":"Cambio dirección PNX Up→Down/día","Valor":f"{n_pnx_dud:.1f}","Fuente":"Sidebar / hoja Panamax"},
         {"Parámetro":"Cambio dirección PNX Down→Up/día","Valor":f"{n_pnx_ddu:.1f}","Fuente":"Sidebar / hoja Panamax"},
+        {"Parámetro":"Ajuste consumo por cambio dirección PNX","Valor":f"{ajuste_cambio_dir_pnx_modelo:+.4f} hm³/d","Fuente":"Cálculo físico"},
     ])
     st.dataframe(tbl_fis, use_container_width=True, hide_index=True)
 
@@ -4415,13 +4475,18 @@ with tabs[8]:
                 {"Parámetro":"Fecha de sesión","Valor":AHORA,"Unidad":""},
                 {"Parámetro":"Unidad visual","Valor":unidad,"Unidad":""},
                 {"Parámetro":"Fuente balance esclusajes","Valor":balance_escl_label,"Unidad":""},
-                {"Parámetro":"Turn Around NPX/día","Valor":n_turnaround_npx,"Unidad":"eventos/día"},
-                {"Parámetro":"Ahorro Turn Around aplicado","Valor":round(ahorro_turnaround_aplicado,4),"Unidad":"hm³/día"},
+                {"Parámetro":"Turn Around NPX/día aplicado","Valor":n_turnaround_npx_aplicado,"Unidad":"eventos/día"},
+                {"Parámetro":"Consumo Turn Around NPX aplicado","Valor":round(consumo_turnaround_npx_modelo,4),"Unidad":"hm³/día"},
+                {"Parámetro":"Ahorro Turn Around por tinas","Valor":round(ahorro_turnaround_aplicado,4),"Unidad":"hm³/día"},
                 {"Parámetro":"PNX/día","Valor":n_pnx,"Unidad":"esclusajes"},
-                {"Parámetro":"NPX/día","Valor":n_npx,"Unidad":"esclusajes"},
+                {"Parámetro":"NPX/día normal","Valor":n_npx,"Unidad":"esclusajes"},
+                {"Parámetro":"NPX unidades para balance","Valor":round(n_npx_balance_unidades,2),"Unidad":"NPX normales + TA"},
                 {"Parámetro":"Cámaras Cortas PNX/día aplicadas","Valor":round(n_cam_corta_aplicado,2),"Unidad":"eventos/día"},
                 {"Parámetro":"CrossFilling PM/día aplicado","Valor":round(n_crossfill_pm_aplicado,2),"Unidad":"eventos/día"},
                 {"Parámetro":"CrossFilling Gatún/día aplicado","Valor":round(n_crossfill_ga_aplicado,2),"Unidad":"eventos/día"},
+                {"Parámetro":"Cambio dirección PNX Up→Down/día","Valor":n_pnx_dud,"Unidad":"eventos/día"},
+                {"Parámetro":"Cambio dirección PNX Down→Up/día","Valor":n_pnx_ddu,"Unidad":"eventos/día"},
+                {"Parámetro":"Ajuste cambio dirección PNX","Valor":round(ajuste_cambio_dir_pnx_modelo,4),"Unidad":"hm³/día"},
                 {"Parámetro":"Ahorro PNX Cámara Corta","Valor":round(ahorro_cam_corta,4),"Unidad":"hm³/día"},
                 {"Parámetro":"Ahorro PNX CrossFilling","Valor":round(ahorro_xfill,4),"Unidad":"hm³/día"},
                 {"Parámetro":"Vol PNX usado en balance","Valor":round(vp_balance,4),"Unidad":"hm³/escl"},
@@ -5273,7 +5338,8 @@ with tabs[10]:
         Revise dos controles distintos:
         - **Fuente vol/tránsito:** Nivel, LakeHouse o Manual. Por defecto queda **Basado en LakeHouse**.
         - **Usar en el balance:** Manual, Sidebar + ahorro, Modelo físico base o Modelo físico + ahorro.
-        - En **PNX — Eficiencia operativa**, ingrese eventos/día de Cámaras Cortas y CrossFilling PM/Gatún; el balance descuenta los hm³/d ahorrados del consumo de esclusajes.
+        - En **PNX — Eficiencia operativa**, ingrese eventos/día de Cámaras Cortas, CrossFilling PM/Gatún y **Cambio dirección PNX Up→Down / Down→Up**; el balance aplica el ajuste de consumo y descuenta los hm³/d ahorrados.
+        - En **NPX — Turn Around**, el evento se calcula aunque no use tinas. Sin tinas se suma como consumo; con tinas se muestra además el ahorro correspondiente.
 
         La app muestra PNX y NPX en hm³/esclusaje con equivalentes p³/s y m³/s. En el visor también se presenta EED como referencia operativa diaria.
 
@@ -5288,7 +5354,7 @@ with tabs[10]:
         - Generación Madden y Gatún. Madden queda por defecto con **Tabla de agua**.
         - Potabilización y fugas.
         - Vertidos, ZZ-Flush y evaporación.
-        - Ahorros por tinas, cámara corta, crossfilling y Turn Around NPX.
+        - Ahorros por tinas, cámara corta y crossfilling; además, consumo operativo por Turn Around NPX y cambio de dirección PNX.
 
         En evaporación, la fuente recomendada por defecto es **Aquarius · lámina (mm/día)**; las áreas se calculan con curva **Daily** y nivel operativo.
         """)
