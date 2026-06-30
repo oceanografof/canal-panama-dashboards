@@ -115,11 +115,16 @@ EVAP_SERIES_PATTERNS: Dict[str, List[str]] = {
 }
 
 # Ajuste morfológico de AP DSS: usa la forma del hidrograma observado de
-# los últimos días de mayo, pero conserva el volumen/promedio de cada semana
-# operativa DSS. Semana operativa: sábado a viernes.
+# la última semana de mayo y las tres semanas siguientes de junio. Conserva
+# el volumen/promedio semanal DSS. Semana operativa: sábado a viernes.
 AP_HYDROGRAPH_ADJUSTMENT_ENABLED = True
-AP_MAY_HYDROGRAPH_DAYS = 7
-AP_MAY_HYDROGRAPH_MIN_DAYS = 3
+AP_HYDROGRAPH_REFERENCE_WEEKS = 4
+AP_HYDROGRAPH_REFERENCE_DAYS = AP_HYDROGRAPH_REFERENCE_WEEKS * 7
+AP_HYDROGRAPH_REFERENCE_MIN_DAYS = 10
+AP_HYDROGRAPH_REFERENCE_LABEL = "última semana de mayo + tres semanas siguientes de junio"
+# Alias para compatibilidad con textos y funciones anteriores.
+AP_MAY_HYDROGRAPH_DAYS = AP_HYDROGRAPH_REFERENCE_DAYS
+AP_MAY_HYDROGRAPH_MIN_DAYS = AP_HYDROGRAPH_REFERENCE_MIN_DAYS
 
 # Reparación defensiva para aportes observados Aquarius/BulkExport.
 # En algunas corridas, los CSV de `Discharge_AT_*_Diario` pueden venir con
@@ -1302,14 +1307,22 @@ def _ap_operational_week_pos(date_series: pd.Series) -> pd.Series:
 
 
 def _last_may_hydrograph_factors(obs_aportes: Optional[pd.DataFrame]) -> Tuple[Dict[int, float], Dict[str, object]]:
-    """Calcula factores de forma usando el hidrograma observado de fin de mayo.
+    """Calcula factores de forma con 4 semanas observadas Mayo-Junio.
 
-    Los factores representan la distribución diaria relativa del hidrograma de
-    los últimos días disponibles de mayo. Luego se aplican al AP DSS y se
-    renormalizan por semana para que el promedio/volumen semanal DSS no cambie.
+    La referencia solicitada para exportación AP es:
+    - última semana operativa de mayo;
+    - tres semanas operativas siguientes de junio.
+
+    El resultado es una secuencia de 28 factores diarios. Luego se aplica al
+    AP DSS por ciclo de 4 semanas y se renormaliza por semana operativa para
+    conservar la suma/promedio semanal DSS.
     """
     meta: Dict[str, object] = {
         "ap_may_adjustment": False,
+        "ap_distribution_mode": "semanal_dss",
+        "reference_label": AP_HYDROGRAPH_REFERENCE_LABEL,
+        "cycle_days": AP_HYDROGRAPH_REFERENCE_DAYS,
+        "reference_weeks": AP_HYDROGRAPH_REFERENCE_WEEKS,
         "reason": "sin datos observados de aporte",
     }
     if not _valid_df(obs_aportes) or "Fecha_dia" not in obs_aportes.columns or "Valor" not in obs_aportes.columns:
@@ -1320,46 +1333,79 @@ def _last_may_hydrograph_factors(obs_aportes: Optional[pd.DataFrame]) -> Tuple[D
     obs["Valor"] = pd.to_numeric(obs["Valor"], errors="coerce")
     obs = obs.dropna(subset=["Fecha_dia", "Valor"])
     obs = obs[obs["Valor"] > 0].sort_values("Fecha_dia")
-    obs = obs[obs["Fecha_dia"].dt.month == 5]
     if obs.empty:
-        meta["reason"] = "sin aportes observados en mayo"
+        meta["reason"] = "sin aportes observados válidos"
         return {}, meta
 
-    # Usar el último año con datos de mayo, para no mezclar años.
-    latest_year = int(obs["Fecha_dia"].dt.year.max())
-    obs = obs[obs["Fecha_dia"].dt.year == latest_year]
-    obs = obs.groupby("Fecha_dia", as_index=False).agg(Valor=("Valor", "mean"))
-    last_date = obs["Fecha_dia"].max()
-    start_date = last_date - pd.Timedelta(days=AP_MAY_HYDROGRAPH_DAYS - 1)
-    obs = obs[obs["Fecha_dia"] >= start_date].copy()
+    # Usar el año más reciente que tenga datos de mayo para no mezclar años.
+    may_obs = obs[obs["Fecha_dia"].dt.month == 5]
+    if may_obs.empty:
+        meta["reason"] = "sin aportes observados en mayo"
+        return {}, meta
+    latest_year = int(may_obs["Fecha_dia"].dt.year.max())
+    obs = obs[obs["Fecha_dia"].dt.year == latest_year].copy()
+    may_obs = obs[obs["Fecha_dia"].dt.month == 5]
+    if may_obs.empty:
+        meta["reason"] = f"sin aportes observados de mayo en {latest_year}"
+        return {}, meta
 
-    if obs["Fecha_dia"].nunique() < AP_MAY_HYDROGRAPH_MIN_DAYS:
+    # Última semana operativa de mayo: se toma el sábado que inicia la semana
+    # donde cae el último dato válido de mayo; luego se agregan tres semanas.
+    last_may_date = pd.to_datetime(may_obs["Fecha_dia"].max()).normalize()
+    ref_start = pd.to_datetime(_ap_operational_week_start(pd.Series([last_may_date])).iloc[0]).normalize()
+    ref_end = ref_start + pd.Timedelta(days=AP_HYDROGRAPH_REFERENCE_DAYS - 1)
+
+    obs = obs.groupby("Fecha_dia", as_index=False).agg(Valor=("Valor", "mean"))
+    window = obs[(obs["Fecha_dia"] >= ref_start) & (obs["Fecha_dia"] <= ref_end)].copy()
+    valid_days = int(window["Fecha_dia"].nunique())
+    if valid_days < AP_HYDROGRAPH_REFERENCE_MIN_DAYS:
         meta.update({
-            "reason": f"menos de {AP_MAY_HYDROGRAPH_MIN_DAYS} días válidos de mayo",
+            "reason": (
+                f"solo {valid_days} días válidos entre {ref_start:%d-%m-%Y} y {ref_end:%d-%m-%Y}; "
+                f"se requieren al menos {AP_HYDROGRAPH_REFERENCE_MIN_DAYS}"
+            ),
             "may_year": latest_year,
-            "may_days": int(obs["Fecha_dia"].nunique()),
+            "may_start": ref_start,
+            "may_end": ref_end,
+            "reference_start": ref_start,
+            "reference_end": ref_end,
+            "reference_days": valid_days,
         })
         return {}, meta
 
-    mean_val = float(obs["Valor"].mean())
-    if not np.isfinite(mean_val) or mean_val <= 0:
-        meta["reason"] = "promedio de aporte observado inválido"
+    # Completar huecos dentro de las 4 semanas con interpolación temporal y
+    # vecinos cercanos, para que los 28 días tengan factor disponible.
+    full_idx = pd.date_range(ref_start, ref_end, freq="D")
+    window = window.set_index("Fecha_dia").reindex(full_idx)
+    window.index.name = "Fecha_dia"
+    window["Valor"] = pd.to_numeric(window["Valor"], errors="coerce")
+    window["Valor"] = window["Valor"].interpolate(method="time", limit_direction="both").ffill().bfill()
+    if window["Valor"].isna().all():
+        meta["reason"] = "no se pudo reconstruir la ventana Mayo-Junio"
         return {}, meta
 
-    obs["week_pos"] = _ap_operational_week_pos(obs["Fecha_dia"]).astype(int)
-    factors_s = obs.groupby("week_pos")["Valor"].mean() / mean_val
-    factors = {int(k): float(v) for k, v in factors_s.items() if np.isfinite(v) and v > 0}
-    if not factors:
-        meta["reason"] = "factores de hidrograma inválidos"
+    mean_val = float(window["Valor"].mean())
+    if not np.isfinite(mean_val) or mean_val <= 0:
+        meta["reason"] = "promedio de aporte observado inválido en ventana Mayo-Junio"
         return {}, meta
+
+    factors: Dict[int, float] = {}
+    for i, value in enumerate(window["Valor"].to_numpy(dtype=float)):
+        factor = float(value / mean_val) if np.isfinite(value) and value > 0 else 1.0
+        factors[int(i)] = factor
 
     meta.update({
         "ap_may_adjustment": True,
+        "ap_distribution_mode": "hidrograma_observado_mayo_junio_4_semanas",
         "reason": "ok",
         "may_year": latest_year,
-        "may_start": pd.to_datetime(obs["Fecha_dia"].min()),
-        "may_end": pd.to_datetime(obs["Fecha_dia"].max()),
-        "may_days": int(obs["Fecha_dia"].nunique()),
+        "may_start": ref_start,
+        "may_end": ref_end,
+        "reference_start": ref_start,
+        "reference_end": ref_end,
+        "reference_days": valid_days,
+        "cycle_days": AP_HYDROGRAPH_REFERENCE_DAYS,
+        "reference_weeks": AP_HYDROGRAPH_REFERENCE_WEEKS,
         "factor_min": float(min(factors.values())),
         "factor_max": float(max(factors.values())),
     })
@@ -1372,7 +1418,7 @@ def apply_may_hydrograph_ap_adjustment(
     obs_aportes: Optional[pd.DataFrame] = None,
     enabled: Optional[bool] = None,
 ) -> pd.DataFrame:
-    """Ajusta la forma diaria del AP DSS con el hidrograma observado de mayo.
+    """Ajusta la forma diaria del AP DSS con el hidrograma observado Mayo-Junio.
 
     Importante: no cambia el volumen/promedio semanal del DSS. Para cada columna
     AP y cada semana operativa sábado-viernes, se redistribuye la forma diaria y
@@ -1388,6 +1434,7 @@ def apply_may_hydrograph_ap_adjustment(
                 out.attrs.update({
                     "ap_may_adjustment": False,
                     "ap_distribution_mode": "semanal_dss",
+                    "reference_label": AP_HYDROGRAPH_REFERENCE_LABEL,
                     "reason": "modo semanal DSS seleccionado",
                 })
         except Exception:
@@ -1407,8 +1454,17 @@ def apply_may_hydrograph_ap_adjustment(
     out = daily.copy()
     out["Fecha_dia"] = pd.to_datetime(out["Fecha_dia"], errors="coerce").dt.normalize()
     week_start = _ap_operational_week_start(out["Fecha_dia"])
-    week_pos = _ap_operational_week_pos(out["Fecha_dia"])
-    factor_series = week_pos.map(factors).astype(float).fillna(1.0)
+
+    # Secuencia de 28 días: primera semana DSS usa la última semana observada
+    # de mayo; las tres semanas siguientes usan las tres semanas observadas de junio.
+    try:
+        dss_cycle_start = pd.to_datetime(week_start.dropna().min()).normalize()
+        cycle_days = int(meta.get("cycle_days", AP_HYDROGRAPH_REFERENCE_DAYS) or AP_HYDROGRAPH_REFERENCE_DAYS)
+        seq = ((out["Fecha_dia"] - dss_cycle_start).dt.days % cycle_days).astype("Int64")
+        factor_series = seq.map(factors).astype(float)
+    except Exception:
+        factor_series = pd.Series(1.0, index=out.index)
+    factor_series = factor_series.replace([np.inf, -np.inf], np.nan).fillna(1.0)
 
     for col in ap_cols:
         raw = pd.to_numeric(out[col], errors="coerce")
@@ -1426,16 +1482,17 @@ def apply_may_hydrograph_ap_adjustment(
 
 
 def _show_ap_may_adjustment_note(df: pd.DataFrame, res_key: str, location: str = "") -> None:
-    """Muestra una nota breve si el AP DSS fue redistribuido con el hidrograma de mayo."""
+    """Muestra una nota breve si el AP DSS fue redistribuido con hidrograma observado."""
     try:
         meta = getattr(df, "attrs", {}) or {}
         if not meta.get("ap_may_adjustment"):
             return
-        start = pd.to_datetime(meta.get("may_start"))
-        end = pd.to_datetime(meta.get("may_end"))
+        start = pd.to_datetime(meta.get("reference_start", meta.get("may_start")))
+        end = pd.to_datetime(meta.get("reference_end", meta.get("may_end")))
+        label = str(meta.get("reference_label", AP_HYDROGRAPH_REFERENCE_LABEL))
         st.caption(
             f"Ajuste AP DSS activo{(' · ' + location) if location else ''}: se usa la forma del hidrograma observado "
-            f"de mayo ({start:%d-%m-%Y} a {end:%d-%m-%Y}) y se conserva la suma semanal DSS "
+            f"de {label} ({start:%d-%m-%Y} a {end:%d-%m-%Y}) y se conserva la suma semanal DSS "
             f"por semana operativa sábado-viernes."
         )
     except Exception:
@@ -1756,11 +1813,11 @@ def sidebar() -> Dict:
     st.sidebar.header("🌊 Distribución de aportes DSS")
     ap_distribution_mode = st.sidebar.radio(
         "Forma diaria de los aportes DSS",
-        ["Simular último hidrograma de mayo", "Ver aporte semanal DSS"],
+        ["Simular hidrograma observado mayo-junio", "Ver aporte semanal DSS"],
         index=1,
         key="ap_distribution_mode",
         help=(
-            "Simular último hidrograma de mayo redistribuye la forma diaria del AP, "
+            "Simular hidrograma observado mayo-junio redistribuye la forma diaria del AP con 4 semanas observadas, "
             "pero conserva el volumen/promedio semanal DSS. Ver aporte semanal DSS deja "
             "el AP como viene del DSS."
         ),
@@ -1768,7 +1825,7 @@ def sidebar() -> Dict:
     ap_hydrograph_enabled = ap_distribution_mode.startswith("Simular")
     st.session_state["ap_hydrograph_enabled"] = bool(ap_hydrograph_enabled)
     if ap_hydrograph_enabled:
-        st.sidebar.caption("Modo activo: AP DSS redistribuido con el último hidrograma válido de mayo, conservando la suma semanal.")
+        st.sidebar.caption("Modo activo: AP DSS redistribuido con la última semana de mayo y tres semanas siguientes de junio, conservando la suma semanal.")
     else:
         st.sidebar.caption("Modo activo: AP semanal DSS original, sin redistribución diaria.")
 
@@ -3454,6 +3511,7 @@ def build_percentile_export_table(
     include_ap_total: bool = True,
     include_evap_column: bool = True,
     ap_distribution_label: str = "DSS original",
+    ap_reduction_pct: float = 0.0,
 ) -> pd.DataFrame:
     """Construye tabla diaria para exportar el percentil elegido por embalse.
 
@@ -3462,7 +3520,9 @@ def build_percentile_export_table(
     - include_ap_total: exporta AP total DSS = AP neto DSS + evaporación.
     - include_evap_column: muestra el caudal evaporado sumado.
     - ap_distribution_label: documenta si el AP diario viene del DSS original
-      o de la simulación con hidrograma observado de mayo.
+      o de la simulación con hidrograma observado Mayo-Junio.
+    - ap_reduction_pct: porcentaje que se descuenta al AP exportable después
+      de sumar evaporación. Ejemplo: 20 significa exportar 80% del AP base.
     """
     if daily is None or daily.empty:
         return pd.DataFrame()
@@ -3508,6 +3568,20 @@ def build_percentile_export_table(
         ap_label = f"P{ap_pct if ap_pct is not None else pct_ref}"
         ap_neto_cfs = pd.to_numeric(base[ap_col], errors="coerce")
         ap_total_cfs = ap_total_dss_cfs(ap_neto_cfs, evap_cfs)
+        try:
+            reduction_pct = float(ap_reduction_pct or 0.0)
+        except Exception:
+            reduction_pct = 0.0
+        reduction_pct = max(0.0, min(95.0, reduction_pct))
+        reduction_factor = 1.0 - (reduction_pct / 100.0)
+
+        # El AP exportable se calcula sobre el AP que el usuario pidió exportar.
+        # Si está activa la evaporación: AP base = AP neto DSS + evaporación.
+        # Si no está activa: AP base = AP neto DSS.
+        ap_base_export_cfs = ap_total_cfs if include_ap_total else ap_neto_cfs
+        ap_export_cfs = ap_base_export_cfs * reduction_factor
+        ap_reduction_cfs = ap_base_export_cfs - ap_export_cfs
+
         if include_ap_neto:
             out[f"AP neto DSS {ap_label} (p³/s)"] = ap_neto_cfs
             if flow_unit != "cfs":
@@ -3518,9 +3592,23 @@ def build_percentile_export_table(
             if flow_unit != "cfs":
                 out[f"Evaporación sumada al AP DSS ({unit_label(flow_unit)})"] = convert_flow(evap_series_cfs, flow_unit)
         if include_ap_total:
-            out[f"AP total DSS {ap_label} = AP neto + evaporación (p³/s)"] = ap_total_cfs
+            out[f"AP total DSS {ap_label} = AP neto + evaporación antes de reducción (p³/s)"] = ap_total_cfs
             if flow_unit != "cfs":
-                out[f"AP total DSS {ap_label} = AP neto + evaporación ({unit_label(flow_unit)})"] = convert_flow(ap_total_cfs, flow_unit)
+                out[f"AP total DSS {ap_label} = AP neto + evaporación antes de reducción ({unit_label(flow_unit)})"] = convert_flow(ap_total_cfs, flow_unit)
+        if reduction_pct > 0:
+            out["Reducción aplicada al AP exportado (%)"] = reduction_pct
+            out[f"Descuento AP exportado {reduction_pct:g}% (p³/s)"] = ap_reduction_cfs
+            if flow_unit != "cfs":
+                out[f"Descuento AP exportado {reduction_pct:g}% ({unit_label(flow_unit)})"] = convert_flow(ap_reduction_cfs, flow_unit)
+            base_label = "AP neto + evaporación" if include_ap_total else "AP neto DSS"
+            out[f"AP exportable ajustado {ap_label} = ({base_label}) - {reduction_pct:g}% (p³/s)"] = ap_export_cfs
+            if flow_unit != "cfs":
+                out[f"AP exportable ajustado {ap_label} = ({base_label}) - {reduction_pct:g}% ({unit_label(flow_unit)})"] = convert_flow(ap_export_cfs, flow_unit)
+        elif not include_ap_total:
+            # Si se exporta sin evaporación y sin reducción, mantener una salida clara.
+            out[f"AP exportable {ap_label} = AP neto DSS (p³/s)"] = ap_export_cfs
+            if flow_unit != "cfs":
+                out[f"AP exportable {ap_label} = AP neto DSS ({unit_label(flow_unit)})"] = convert_flow(ap_export_cfs, flow_unit)
     else:
         out[f"AP DSS P{pct_ref} ({unit_label(flow_unit)})"] = np.nan
 
@@ -3582,15 +3670,16 @@ def tab_exportar_percentil(
 
     st.markdown("#### ⚙️ Opciones de exportación AP")
     with st.container():
-        c1, c2, c3 = st.columns([1.25, 1.25, 1.0])
+        c1, c2, c3, c4 = st.columns([1.35, 1.20, 1.0, 1.15])
         with c1:
             simular_hidro_mayo = st.checkbox(
-                "🌊 Simular hidrograma observado de mayo",
+                "🌊 Simular hidrograma observado mayo-junio",
                 value=bool(st.session_state.get("ap_hydrograph_enabled", False)),
                 key="exp_simular_hidro_mayo",
                 help=(
-                    "Redistribuye diariamente el AP DSS usando la forma del último hidrograma válido de mayo. "
-                    "Conserva la suma/promedio semanal del DSS; evita que el aporte exportado quede constante día tras día."
+                    "Redistribuye diariamente el AP DSS usando la forma observada de la última semana de mayo "
+                    "y las tres semanas siguientes de junio. Conserva la suma/promedio semanal del DSS; "
+                    "evita que el aporte exportado quede constante día tras día."
                 ),
             )
         with c2:
@@ -3598,7 +3687,7 @@ def tab_exportar_percentil(
                 "➕ Sumar evaporación al AP del percentil",
                 value=True,
                 key="exp_sumar_evap_ap",
-                help="Calcula AP total DSS = AP neto DSS del percentil seleccionado + caudal evaporado.",
+                help="Calcula AP base = AP neto DSS del percentil seleccionado + caudal evaporado.",
             )
         with c3:
             incluir_ap_neto = st.checkbox(
@@ -3607,9 +3696,23 @@ def tab_exportar_percentil(
                 key="exp_incluir_ap_neto",
                 help="Incluye una columna separada con el AP neto DSS antes de sumar evaporación.",
             )
+        with c4:
+            ap_reduction_pct = st.number_input(
+                "Restar al AP exportado (%)",
+                min_value=0.0,
+                max_value=95.0,
+                value=0.0,
+                step=5.0,
+                format="%.1f",
+                key="exp_ap_reduction_pct",
+                help=(
+                    "Descuenta el porcentaje indicado al AP que se va a exportar. "
+                    "Ejemplo: 20% exporta el 80% de AP neto + evaporación."
+                ),
+            )
         st.caption(
-            "Estas opciones solo cambian la tabla exportada. La simulación con mayo mantiene el volumen semanal DSS; "
-            "la evaporación se suma como término positivo al AP del percentil escogido."
+            "Estas opciones solo cambian la tabla exportada. La simulación mayo-junio mantiene el volumen semanal DSS; "
+            "la evaporación se suma como término positivo y luego se descuenta el porcentaje solicitado al AP exportable."
         )
 
     try:
@@ -3629,7 +3732,7 @@ def tab_exportar_percentil(
             _show_ap_may_adjustment_note(daily, res_key, "exportación")
         else:
             st.warning(
-                "No se pudo aplicar la simulación con hidrograma observado de mayo; "
+                "No se pudo aplicar la simulación con hidrograma observado mayo-junio; "
                 f"se usa el AP DSS original. Motivo: {meta_ap.get('reason', 'sin detalle disponible')}."
             )
     else:
@@ -3639,9 +3742,9 @@ def tab_exportar_percentil(
     include_evap_column = bool(sumar_evap_ap)
     include_ap_neto = bool(incluir_ap_neto or not include_ap_total)
     if include_ap_total:
-        ap_distribution_label = "Hidrograma observado de mayo" if meta_ap.get("ap_may_adjustment") else "DSS original + evaporación"
+        ap_distribution_label = "Hidrograma observado mayo-junio 4 semanas" if meta_ap.get("ap_may_adjustment") else "DSS original + evaporación"
     else:
-        ap_distribution_label = "Hidrograma observado de mayo" if meta_ap.get("ap_may_adjustment") else "DSS original"
+        ap_distribution_label = "Hidrograma observado mayo-junio 4 semanas" if meta_ap.get("ap_may_adjustment") else "DSS original"
 
     table = build_percentile_export_table(
         daily,
@@ -3653,6 +3756,7 @@ def tab_exportar_percentil(
         include_ap_total=include_ap_total,
         include_evap_column=include_evap_column,
         ap_distribution_label=ap_distribution_label,
+        ap_reduction_pct=float(ap_reduction_pct or 0.0),
     )
     if table.empty:
         st.warning("No hay datos para exportar.")
@@ -3670,27 +3774,38 @@ def tab_exportar_percentil(
 
     # Resumen operativo rápido para confirmar que las opciones seleccionadas
     # están haciendo lo esperado antes de descargar el archivo.
+    ap_export_cols = [c for c in table.columns if c.startswith("AP exportable") and f"({unit_label(flow_unit)})" in c]
     ap_total_cols = [c for c in table.columns if c.startswith("AP total DSS") and f"({unit_label(flow_unit)})" in c]
     ap_neto_cols = [c for c in table.columns if c.startswith("AP neto DSS") and f"({unit_label(flow_unit)})" in c]
     evap_cols = [c for c in table.columns if c.startswith("Evaporación sumada") and f"({unit_label(flow_unit)})" in c]
-    m1, m2, m3 = st.columns(3)
+    reduction_cols = [c for c in table.columns if c.startswith("Descuento AP exportado") and f"({unit_label(flow_unit)})" in c]
+    m1, m2, m3, m4 = st.columns(4)
     if ap_neto_cols:
         m1.metric(f"AP neto medio ({unit_label(flow_unit)})", f"{pd.to_numeric(table[ap_neto_cols[0]], errors='coerce').mean():,.3f}")
     else:
         m1.metric("AP neto medio", "—")
-    if ap_total_cols:
+    if ap_export_cols:
+        m2.metric(f"AP exportable medio ({unit_label(flow_unit)})", f"{pd.to_numeric(table[ap_export_cols[0]], errors='coerce').mean():,.3f}")
+    elif ap_total_cols:
         m2.metric(f"AP total medio ({unit_label(flow_unit)})", f"{pd.to_numeric(table[ap_total_cols[0]], errors='coerce').mean():,.3f}")
     else:
-        m2.metric("AP total medio", "—")
-    if evap_cols:
-        m3.metric(f"Evaporación sumada ({unit_label(flow_unit)})", f"{pd.to_numeric(table[evap_cols[0]], errors='coerce').mean():,.3f}")
+        m2.metric("AP exportable medio", "—")
+    if reduction_cols:
+        m3.metric(f"Reducción media ({unit_label(flow_unit)})", f"{pd.to_numeric(table[reduction_cols[0]], errors='coerce').mean():,.3f}")
     else:
-        m3.metric("Evaporación sumada", "—")
+        m3.metric("Reducción media", "0.000")
+    if evap_cols:
+        m4.metric(f"Evaporación sumada ({unit_label(flow_unit)})", f"{pd.to_numeric(table[evap_cols[0]], errors='coerce').mean():,.3f}")
+    else:
+        m4.metric("Evaporación sumada", "—")
 
-    if PLOTLY_OK and (ap_total_cols or ap_neto_cols):
+    if PLOTLY_OK and (ap_export_cols or ap_total_cols or ap_neto_cols):
         with st.expander("📈 Vista previa del AP exportado", expanded=False):
             fig = go.Figure()
-            for col in ap_neto_cols[:1] + ap_total_cols[:1]:
+            preview_cols = ap_neto_cols[:1] + ap_total_cols[:1] + ap_export_cols[:1]
+            # Evitar columnas duplicadas en la vista previa.
+            preview_cols = list(dict.fromkeys(preview_cols))
+            for col in preview_cols:
                 fig.add_trace(go.Scatter(
                     x=table["Fecha"],
                     y=pd.to_numeric(table[col], errors="coerce"),
@@ -3702,7 +3817,11 @@ def tab_exportar_percentil(
             st.plotly_chart(fig, use_container_width=True, key="exp_ap_preview")
 
     st.dataframe(table, use_container_width=True, hide_index=True, height=520)
-    fname_base = f"export_{cfg['token']}_P{int(pct)}".replace(" ", "_")
+    try:
+        reduction_tag = f"_menos{float(ap_reduction_pct):g}pct" if float(ap_reduction_pct or 0.0) > 0 else ""
+    except Exception:
+        reduction_tag = ""
+    fname_base = f"export_{cfg['token']}_P{int(pct)}{reduction_tag}".replace(" ", "_").replace(".", "p")
     csv = table.to_csv(index=False).encode("utf-8-sig")
     st.download_button("⬇️ Descargar CSV", csv, f"{fname_base}.csv", "text/csv", key="exp_csv")
 
@@ -3926,7 +4045,7 @@ def _weekly_ap_obs_vs_dss_table(
     siempre con el mismo week_start, por lo que la comparación queda alineada.
     El AP DSS respeta el modo activo del panel lateral:
     - "Ver aporte semanal DSS": usa el AP como viene en el DSS.
-    - "Simular último hidrograma de mayo": redistribuye diariamente, pero
+    - "Simular hidrograma observado mayo-junio": redistribuye diariamente, pero
       conserva la suma/promedio semanal DSS.
     """
     if dss_bytes is None:
@@ -5147,7 +5266,7 @@ Secuencia recomendada:
 2. Presionar **Recargar archivos** si se actualizaron datos.
 3. Seleccionar la unidad de caudal/flujo.
 4. Seleccionar el percentil de referencia de Gatún y de Alhajuela/Madden.
-5. Seleccionar la distribución de aportes DSS: **Simular último hidrograma de mayo** o **Ver aporte semanal DSS**.
+5. Seleccionar la distribución de aportes DSS: **Simular hidrograma observado mayo-junio** o **Ver aporte semanal DSS**.
 6. Seleccionar evaporación automática CZL/PMG o ingresar el caudal manual por embalse. En modo automático, el área se calcula con el último nivel observado local disponible.
 7. Revisar **Manejo / Decisión**.
 8. Validar cada embalse en **GATÚN DSS** y **ALHAJUELA DSS**.
