@@ -3595,20 +3595,19 @@ def build_percentile_export_table(
             out[f"AP total DSS {ap_label} = AP neto + evaporación antes de reducción (p³/s)"] = ap_total_cfs
             if flow_unit != "cfs":
                 out[f"AP total DSS {ap_label} = AP neto + evaporación antes de reducción ({unit_label(flow_unit)})"] = convert_flow(ap_total_cfs, flow_unit)
+        base_label = "AP neto + evaporación" if include_ap_total else "AP neto DSS"
         if reduction_pct > 0:
             out["Reducción aplicada al AP exportado (%)"] = reduction_pct
             out[f"Descuento AP exportado {reduction_pct:g}% (p³/s)"] = ap_reduction_cfs
             if flow_unit != "cfs":
                 out[f"Descuento AP exportado {reduction_pct:g}% ({unit_label(flow_unit)})"] = convert_flow(ap_reduction_cfs, flow_unit)
-            base_label = "AP neto + evaporación" if include_ap_total else "AP neto DSS"
-            out[f"AP exportable ajustado {ap_label} = ({base_label}) - {reduction_pct:g}% (p³/s)"] = ap_export_cfs
-            if flow_unit != "cfs":
-                out[f"AP exportable ajustado {ap_label} = ({base_label}) - {reduction_pct:g}% ({unit_label(flow_unit)})"] = convert_flow(ap_export_cfs, flow_unit)
-        elif not include_ap_total:
-            # Si se exporta sin evaporación y sin reducción, mantener una salida clara.
-            out[f"AP exportable {ap_label} = AP neto DSS (p³/s)"] = ap_export_cfs
-            if flow_unit != "cfs":
-                out[f"AP exportable {ap_label} = AP neto DSS ({unit_label(flow_unit)})"] = convert_flow(ap_export_cfs, flow_unit)
+
+        # Columna final obligatoria de exportación: aquí queda aplicado el porcentaje.
+        # Fórmula operativa: AP exportable final = (AP neto DSS + evaporación, si está activa) × (1 - reducción/100).
+        final_suffix = f" - {reduction_pct:g}%" if reduction_pct > 0 else " sin reducción"
+        out[f"AP exportable final {ap_label} = ({base_label}){final_suffix} (p³/s)"] = ap_export_cfs
+        if flow_unit != "cfs":
+            out[f"AP exportable final {ap_label} = ({base_label}){final_suffix} ({unit_label(flow_unit)})"] = convert_flow(ap_export_cfs, flow_unit)
     else:
         out[f"AP DSS P{pct_ref} ({unit_label(flow_unit)})"] = np.nan
 
