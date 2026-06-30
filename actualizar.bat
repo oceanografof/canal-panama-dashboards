@@ -66,7 +66,8 @@ echo   1. validar repositorio y rama,
 echo   2. evitar subir credenciales o archivos sensibles,
 echo   3. descargar solo desde panama.aquaticinformatics.net,
 echo   4. normalizar CSV esperados,
-echo   5. hacer commit y push solo de archivos autorizados, incluyendo Excel operativos de raiz.
+echo   5. reparar de forma segura rebases interrumpidos de Git,
+echo   6. hacer commit y push solo de archivos autorizados, incluyendo Excel operativos de raiz.
 echo.
 
 %PYTHON_CMD% "%PY_SCRIPT%"

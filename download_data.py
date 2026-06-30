@@ -571,6 +571,190 @@ def run_git(repo_dir: Path, *cmd: str, env: dict | None = None) -> tuple[int, st
     return result.returncode, stdout, stderr
 
 
+# ── Reparación segura de rebases interrumpidos ─────────────────────────────
+def git_dir_path(repo_dir: Path) -> Path:
+    """Devuelve la carpeta real .git, compatible con worktrees y .git tipo archivo."""
+    code, out, err = run_git(repo_dir, "git", "rev-parse", "--git-dir")
+    if code != 0 or not out.strip():
+        return repo_dir / ".git"
+    git_dir = Path(out.strip())
+    if not git_dir.is_absolute():
+        git_dir = repo_dir / git_dir
+    return git_dir.resolve()
+
+
+def active_rebase_state_dirs(repo_dir: Path) -> list[Path]:
+    """Detecta carpetas internas creadas por un rebase en curso o interrumpido."""
+    git_dir = git_dir_path(repo_dir)
+    return [p for p in (git_dir / "rebase-merge", git_dir / "rebase-apply") if p.exists()]
+
+
+def git_unmerged_paths(repo_dir: Path) -> list[str]:
+    """Lista rutas con conflicto real, no solo una carpeta rebase-merge vieja.
+
+    Se usa primero el índice de Git (`git ls-files -u`), que es más confiable
+    cuando el rebase quedó dañado y `git status` puede emitir advertencias.
+    """
+    paths: set[str] = set()
+
+    code, out, err = run_git(repo_dir, "git", "ls-files", "-u")
+    if code == 0 and out.strip():
+        for line in out.splitlines():
+            # Formato: <mode> <sha> <stage>\t<path>
+            if "\t" in line:
+                paths.add(line.split("\t", 1)[1].strip().replace("\\", "/"))
+
+    code, out, err = run_git(repo_dir, "git", "diff", "--name-only", "--diff-filter=U")
+    if code == 0 and out.strip():
+        for line in out.splitlines():
+            if line.strip():
+                paths.add(line.strip().replace("\\", "/"))
+
+    return sorted(paths)
+
+
+def is_rebase_metadata_corrupt(state_dirs: list[Path], git_error: str = "") -> bool:
+    """Detecta metadata de rebase rota, típica cuando falta head-name/onto.
+
+    Este caso produce errores como:
+    warning: could not read '.git/rebase-merge/head-name': No such file or directory
+
+    Si no hay rutas sin fusionar en el índice, esa carpeta interna puede retirarse
+    sin borrar archivos de trabajo. Los cambios locales quedan para ser validados
+    por el flujo seguro normal antes del commit/push.
+    """
+    msg = (git_error or "").lower()
+    if "could not read" in msg and "rebase" in msg and "no such file" in msg:
+        return True
+
+    for state_dir in state_dirs:
+        name = state_dir.name
+        if name == "rebase-merge":
+            # En un rebase válido estos archivos de control deben existir.
+            if not (state_dir / "head-name").exists() or not (state_dir / "onto").exists():
+                return True
+        elif name == "rebase-apply":
+            # rebase-apply puede variar, pero si no conserva ningún archivo de
+            # control básico, se considera metadata obsoleta/rota.
+            control_files = ("head-name", "onto", "orig-head", "next", "last", "rebasing")
+            if not any((state_dir / item).exists() for item in control_files):
+                return True
+    return False
+
+
+def remove_stale_rebase_dirs(repo_dir: Path, state_dirs: list[Path]) -> None:
+    """Retira carpetas internas de rebase obsoletas sin tocar archivos de trabajo.
+
+    En vez de borrar directamente, las mueve a una carpeta de respaldo dentro de
+    .git/. Git solo reconoce .git/rebase-merge y .git/rebase-apply, por lo que
+    este movimiento desbloquea el repositorio y mantiene evidencia recuperable.
+    """
+    git_dir = git_dir_path(repo_dir)
+    backup_root = git_dir / f"stale-rebase-backup-{datetime.now():%Y%m%d_%H%M%S}"
+    moved_any = False
+
+    for state_dir in state_dirs:
+        state_dir = state_dir.resolve()
+        if state_dir.parent != git_dir:
+            raise RuntimeError(f"Ruta interna de rebase inesperada; no se retira: {state_dir}")
+        if not state_dir.exists():
+            continue
+
+        backup_root.mkdir(parents=True, exist_ok=True)
+        target = backup_root / state_dir.name
+        suffix = 1
+        while target.exists():
+            target = backup_root / f"{state_dir.name}-{suffix}"
+            suffix += 1
+        shutil.move(str(state_dir), str(target))
+        moved_any = True
+
+    if moved_any:
+        print(f"  ℹ️ Respaldo interno creado en .git/{backup_root.name}")
+
+
+def repair_interrupted_rebase_state(repo_dir: Path, *, allow_stale_cleanup: bool = True) -> None:
+    """Repara de forma segura un rebase previo que quedó abierto.
+
+    Prioridad de seguridad:
+    1) Si hay conflictos reales no generados, se detiene y pide revisión manual.
+    2) Si solo hay conflictos en data/ o LakeHouse_Data.xlsx, intenta continuar.
+    3) Si no hay conflictos, ejecuta `git rebase --abort`, que es la forma segura.
+    4) Solo si Git dice que no hay rebase en curso, elimina carpetas internas obsoletas.
+    """
+    state_dirs = active_rebase_state_dirs(repo_dir)
+    if not state_dirs:
+        return
+
+    print("  ⚠️ Se detectó un rebase anterior interrumpido en Git.")
+    for state_dir in state_dirs:
+        print(f"    · {state_dir.name}")
+
+    unmerged = git_unmerged_paths(repo_dir)
+    if unmerged:
+        if all(is_prefer_local_path(p) for p in unmerged):
+            print("  ⚠️ Conflictos solo en archivos generados; se intentará resolver conservando datos locales.")
+            if resolve_generated_rebase_conflicts(repo_dir):
+                code, out, err = run_git(repo_dir, "git", "rebase", "--continue", env={"GIT_EDITOR": "true"})
+                if code == 0:
+                    print("  ✅ Rebase anterior continuado después de resolver datos generados.")
+                    return
+                msg = (out + " " + err).strip()
+                if "No changes" in msg or "no changes" in msg:
+                    code, out, err = run_git(repo_dir, "git", "rebase", "--skip")
+                    if code == 0:
+                        print("  ✅ Rebase anterior saltado sin cambios aplicables.")
+                        return
+        raise RuntimeError(
+            "Existe un rebase en curso con conflictos que no son seguros de resolver automáticamente. "
+            "Abra una consola en la raíz del repositorio y ejecute: git status. "
+            "Luego use git rebase --continue si ya resolvió, o git rebase --abort para cancelar. "
+            "Archivos en conflicto: " + ", ".join(unmerged)
+        )
+
+    code, out, err = run_git(repo_dir, "git", "rebase", "--abort")
+    if code == 0:
+        print("  ✅ Rebase anterior abortado de forma segura; se continuará con la sincronización.")
+        return
+
+    msg = (out + " " + err).strip()
+    msg_low = msg.lower()
+    no_active_rebase = (
+        "no rebase in progress" in msg_low
+        or "no rebase in progress?" in msg_low
+        or "no rebase" in msg_low
+        or "fatal: no rebase" in msg_low
+    )
+
+    # `git status --porcelain` puede seguir mostrando cambios locales legítimos.
+    # Eso no debe impedir retirar una metadata de rebase rota si no hay conflictos
+    # reales sin fusionar en el índice.
+    code_status, status_out, status_err = run_git(repo_dir, "git", "status", "--porcelain")
+    working_tree_clean = code_status == 0 and not status_out.strip()
+    corrupt_rebase_metadata = is_rebase_metadata_corrupt(state_dirs, msg)
+
+    # Reconfirmación defensiva justo antes de retirar metadata interna.
+    unmerged_after_abort = git_unmerged_paths(repo_dir)
+
+    if allow_stale_cleanup and not unmerged_after_abort and (
+        no_active_rebase or working_tree_clean or corrupt_rebase_metadata
+    ):
+        remove_stale_rebase_dirs(repo_dir, state_dirs)
+        if corrupt_rebase_metadata:
+            print("  ✅ Metadata interna de rebase corrupta retirada; no se tocaron archivos locales.")
+        else:
+            print("  ✅ Carpeta interna de rebase obsoleta retirada; se continuará con la sincronización.")
+        return
+
+    raise RuntimeError(
+        "Git indica un rebase pendiente y no se pudo cancelar automáticamente. "
+        "Para proteger cambios locales, no retiré carpetas internas porque todavía hay conflictos "
+        "o el estado no es seguro para reparación automática. "
+        "Ejecute manualmente en la raíz del repositorio: git status  y luego  git rebase --abort. "
+        f"Detalle: {msg}"
+    )
+
+
 def cleanup_temp_files(repo_dir: Path) -> None:
     for pycache in repo_dir.rglob("__pycache__"):
         if ".git" not in pycache.parts:
@@ -814,8 +998,10 @@ def resolve_generated_rebase_conflicts(repo_dir: Path) -> bool:
     return True
 
 
-def pull_rebase_with_generated_resolution(repo_dir: Path, branch: str) -> None:
-    commit_auto_changes(repo_dir, f"Cambios seguros antes de pull {datetime.now():%Y-%m-%d %H:%M}")
+def pull_rebase_with_generated_resolution(repo_dir: Path, branch: str, *, precommit: bool = True) -> None:
+    repair_interrupted_rebase_state(repo_dir)
+    if precommit:
+        commit_auto_changes(repo_dir, f"Cambios seguros antes de pull {datetime.now():%Y-%m-%d %H:%M}")
 
     code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "--autostash", "origin", branch)
     if code == 0:
@@ -826,6 +1012,14 @@ def pull_rebase_with_generated_resolution(repo_dir: Path, branch: str) -> None:
         code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "origin", branch)
         if code == 0:
             return
+
+    msg_pull = (out + " " + err).strip()
+    if "rebase-merge" in msg_pull or "rebase-apply" in msg_pull or "rebase in progress" in msg_pull.lower():
+        repair_interrupted_rebase_state(repo_dir)
+        code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "--autostash", "origin", branch)
+        if code == 0:
+            return
+        msg_pull = (out + " " + err).strip()
 
     print(f"  ⚠️ pull --rebase encontró un problema:\n    {(err or out).strip()}")
     for _ in range(12):
@@ -872,6 +1066,8 @@ def ensure_default_branch(repo_dir: Path) -> str:
                 "Coloque download_data.py y actualizar.bat en la raíz del repositorio."
             )
 
+    repair_interrupted_rebase_state(repo_dir)
+
     warn_remote_credentials(repo_dir)
 
     code, out, err = run_git(repo_dir, "git", "fetch", "origin", "--prune")
@@ -910,7 +1106,7 @@ def ensure_default_branch(repo_dir: Path) -> str:
         print(f"  ✅ Cambiado a la rama {default_branch}")
 
     commit_auto_changes(repo_dir, f"Cambios seguros antes de sincronizar {datetime.now():%Y-%m-%d %H:%M}")
-    pull_rebase_with_generated_resolution(repo_dir, default_branch)
+    pull_rebase_with_generated_resolution(repo_dir, default_branch, precommit=False)
     print(f"  ✅ Rama {default_branch} sincronizada con origin/{default_branch}")
     return default_branch
 
