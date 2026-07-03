@@ -1523,6 +1523,42 @@ def scalar_to_cfs(v: float, unit: str) -> float:
     return v
 
 
+def pct_diff_obs_minus_dss(obs_cfs: float, dss_cfs: float) -> float:
+    """Diferencia porcentual firmada respecto al percentil DSS cercano.
+
+    Fórmula operativa:
+        Diferencia Obs-DSS (%) = (Observado - DSS) / |DSS| × 100
+
+    Un valor negativo indica que el observado está por debajo del percentil DSS
+    seleccionado; un valor positivo indica que está por encima.
+    """
+    try:
+        obs = float(obs_cfs)
+        dss = float(dss_cfs)
+    except Exception:
+        return float("nan")
+    if not np.isfinite(obs) or not np.isfinite(dss) or abs(dss) < 1e-9:
+        return float("nan")
+    return (obs - dss) / abs(dss) * 100.0
+
+
+def pct_diff_obs_minus_dss_vs_obs(obs_cfs: float, dss_cfs: float) -> float:
+    """Diferencia porcentual firmada respecto al observado.
+
+    Se mantiene como referencia complementaria para el semáforo operativo, pero
+    la columna solicitada se calcula contra el DSS mediante
+    `pct_diff_obs_minus_dss`.
+    """
+    try:
+        obs = float(obs_cfs)
+        dss = float(dss_cfs)
+    except Exception:
+        return float("nan")
+    if not np.isfinite(obs) or abs(obs) < 1e-9:
+        return float("nan")
+    return (obs - dss) / abs(obs) * 100.0
+
+
 def clean_evap_cfs(evap_cfs: float) -> float:
     """Evaporación operativa en p³/s, siempre no negativa.
 
@@ -2073,7 +2109,9 @@ def show_header_metrics(daily: pd.DataFrame, cfg: Dict, flow_unit: str,
             help_txt.append(f"Nivel DSS {closest_level['label']}: {closest_level['dss_value']:.3f} ft · {closest_level['date']:%d-%m-%Y}")
         if ap_nearest:
             ap_diff = convert_flow(pd.Series([ap_nearest['diff_cfs']]), flow_unit).iloc[0]
-            help_txt.append(f"AP DSS {ap_nearest['label']}: {convert_flow(pd.Series([ap_nearest['dss_total_cfs']]), flow_unit).iloc[0]:,.2f} {unit_label(flow_unit)} · Obs-DSS {ap_diff:+,.2f} {unit_label(flow_unit)}")
+            ap_pct = ap_nearest.get('diff_pct_dss', np.nan)
+            ap_pct_txt = f" ({ap_pct:+.2f}% vs DSS)" if pd.notna(ap_pct) else ""
+            help_txt.append(f"AP DSS {ap_nearest['label']}: {convert_flow(pd.Series([ap_nearest['dss_total_cfs']]), flow_unit).iloc[0]:,.2f} {unit_label(flow_unit)} · Obs-DSS {ap_diff:+,.2f} {unit_label(flow_unit)}{ap_pct_txt}")
         c6.metric("🎯 Percentil cercano", f"NP {level_txt} · AP {ap_txt}",
                   delta=delta_txt, delta_color="inverse", help=" | ".join(help_txt) if help_txt else None)
     else:
@@ -2169,13 +2207,15 @@ def show_aporte_reservoir_metrics(
     if nearest_obs:
         nearest_diff_unit = convert_flow(pd.Series([nearest_obs['diff_cfs']]), flow_unit).iloc[0]
         nearest_total_unit = convert_flow(pd.Series([nearest_obs['dss_total_cfs']]), flow_unit).iloc[0]
+        pct_dss = nearest_obs.get('diff_pct_dss', np.nan)
+        pct_txt = f" · {pct_dss:+.2f}%" if pd.notna(pct_dss) else ""
         m5.metric(
             "Indicador AP observado",
             nearest_obs["label"],
-            delta=f"Obs-DSS: {nearest_diff_unit:+,.2f} {unit_label(flow_unit)}",
+            delta=f"Obs-DSS: {nearest_diff_unit:+,.2f} {unit_label(flow_unit)}{pct_txt}",
             delta_color="inverse",
             help=f"AP total DSS indicador: {nearest_total_unit:,.2f} {unit_label(flow_unit)} "
-                 f"({nearest_obs['dss_total_cfs']:,.1f} p³/s) · Fecha DSS: {nearest_obs['date']:%d-%m-%Y}",
+                 f"({nearest_obs['dss_total_cfs']:,.1f} p³/s) · Diferencia Obs-DSS: {pct_dss:+.2f}% respecto al DSS · Fecha DSS: {nearest_obs['date']:%d-%m-%Y}",
         )
     else:
         m5.metric("Indicador AP observado", "—")
@@ -2305,10 +2345,12 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
                 obs_ap_col = None
 
         if nearest_ap_info:
+            pct_dss = nearest_ap_info.get('diff_pct_dss', np.nan)
+            pct_txt = f"; {pct_dss:+.2f}% vs DSS" if pd.notna(pct_dss) else ""
             st.caption(
                 f"🎯 Según el **aporte observado**, el indicador AP DSS ajustado corresponde a "
                 f"**{nearest_ap_info['label']}** "
-                f"(Obs-DSS: {nearest_ap_info['diff_cfs']:+,.1f} p³/s; "
+                f"(Obs-DSS: {nearest_ap_info['diff_cfs']:+,.1f} p³/s{pct_txt}; "
                 f"fecha DSS: {nearest_ap_info['date']:%d-%m-%Y})."
             )
 
@@ -2758,7 +2800,10 @@ def _nearest_ap_percentile(
     )
 
     diff = float(selected["diff_cfs"])
-    rel = abs(diff) / max(abs(obs), 1e-9) * 100
+    dss_ref = float(selected["dss_total_cfs"])
+    rel_signed_obs = pct_diff_obs_minus_dss_vs_obs(obs, dss_ref)
+    rel = abs(rel_signed_obs) if pd.notna(rel_signed_obs) else np.nan
+    diff_pct_dss = pct_diff_obs_minus_dss(obs, dss_ref)
     estado = "🟢 Muy cercano" if rel <= 10 else ("🟠 Seguimiento" if rel <= 25 else "🔴 Revisar")
     return {
         "column": selected["column"],
@@ -2769,6 +2814,8 @@ def _nearest_ap_percentile(
         "dss_cfs": float(selected["dss_total_cfs"]),  # compatibilidad
         "diff_cfs": float(diff),
         "abs_diff_cfs": float(selected.get("abs_diff_cfs", abs(diff))),
+        "diff_pct_dss": float(diff_pct_dss),
+        "diff_pct_obs": float(rel_signed_obs),
         "rel_pct": float(rel),
         "estado": estado,
         "date": pd.to_datetime(row["Fecha_dia"]),
@@ -2931,19 +2978,23 @@ def tab_aporte_obs_embalse(
         if nearest:
             nearest_total_unit = convert_flow(pd.Series([nearest['dss_total_cfs']]), flow_unit).iloc[0]
             nearest_diff_unit = convert_flow(pd.Series([nearest['diff_cfs']]), flow_unit).iloc[0]
+            nearest_pct_dss = nearest.get('diff_pct_dss', np.nan)
+            pct_delta_txt = f" · {nearest_pct_dss:+.2f}%" if pd.notna(nearest_pct_dss) else ""
             m3.metric(f"AP total DSS indicador ({unit_lbl})", f"{nearest_total_unit:,.2f}")
         else:
             nearest_diff_unit = np.nan
+            nearest_pct_dss = np.nan
+            pct_delta_txt = ""
             m3.metric(f"AP total DSS indicador ({unit_lbl})", "—")
         m4.metric("Fecha obs.", f"{last_date:%d-%m-%Y}")
         if nearest:
             m5.metric(
                 "Indicador DSS AP",
                 nearest["label"],
-                delta=f"Obs-DSS total: {nearest_diff_unit:+,.2f} {unit_lbl}",
+                delta=f"Obs-DSS total: {nearest_diff_unit:+,.2f} {unit_lbl}{pct_delta_txt}",
                 delta_color="inverse",
                 help=f"{nearest['estado']} · AP total DSS {nearest['label']}: {nearest_total_unit:,.2f} {unit_lbl} "
-                     f"({nearest['dss_total_cfs']:,.1f} p³/s) · Fecha DSS: {nearest['date']:%d-%m-%Y}",
+                     f"({nearest['dss_total_cfs']:,.1f} p³/s) · Diferencia Obs-DSS: {nearest_pct_dss:+.2f}% respecto al DSS · Fecha DSS: {nearest['date']:%d-%m-%Y}",
             )
     else:
         st.warning(
@@ -3463,6 +3514,8 @@ def tab_aporte_instantaneo(
                 f"AP total DSS ({unit_label(flow_unit)})": round(float(dss_converted), 3),
                 f"Obs-DSS ({unit_label(flow_unit)})": round(float(diff_converted), 3),
                 "Diferencia Obs-DSS (p³/s)": round(float(nearest["diff_cfs"]), 3),
+                "Diferencia Obs-DSS (%)": round(float(nearest.get("diff_pct_dss", np.nan)), 2),
+                "Diferencia abs. vs obs (%)": round(float(nearest["rel_pct"]), 2),
                 "Dif. relativa (%)": round(float(nearest["rel_pct"]), 2),
                 "Estado": nearest["estado"],
                 "Fecha DSS usada": nearest["date"].strftime("%d-%m-%Y"),
@@ -4133,13 +4186,17 @@ def _weekly_ap_obs_vs_dss_table(
             pct = int(pct_map.get(col, exceedance_pct(col)))
             diff_cfs = float(obs_cfs) - float(dss_cfs)
             abs_diff_cfs = abs(diff_cfs)
-            rel_pct = abs_diff_cfs / max(abs(float(obs_cfs)), 1e-9) * 100.0
+            rel_signed_obs = pct_diff_obs_minus_dss_vs_obs(float(obs_cfs), float(dss_cfs))
+            rel_pct = abs(rel_signed_obs) if pd.notna(rel_signed_obs) else np.nan
+            diff_pct_dss = pct_diff_obs_minus_dss(float(obs_cfs), float(dss_cfs))
             item = {
                 "column": col,
                 "percentile": pct,
                 "dss_cfs": float(dss_cfs),
                 "diff_cfs": float(diff_cfs),
                 "abs_diff_cfs": float(abs_diff_cfs),
+                "diff_pct_dss": float(diff_pct_dss),
+                "diff_pct_obs": float(rel_signed_obs),
                 "rel_pct": float(rel_pct),
             }
             candidates.append(item)
@@ -4152,6 +4209,8 @@ def _weekly_ap_obs_vs_dss_table(
                 "Aporte observado semanal prom. (p³/s)": float(obs_cfs),
                 "AP DSS semanal (p³/s)": float(dss_cfs),
                 "Obs-DSS (p³/s)": float(diff_cfs),
+                "Diferencia Obs-DSS (%)": float(diff_pct_dss),
+                "Diferencia abs. vs obs (%)": float(rel_pct),
                 "Diferencia abs. (%)": float(rel_pct),
             })
 
@@ -4189,6 +4248,8 @@ def _weekly_ap_obs_vs_dss_table(
             "Percentil AP DSS más cercano": f"P{int(nearest['percentile'])}",
             f"AP DSS semanal cercano ({unit_label(flow_unit)})": round(float(dss_unit), 3),
             f"Obs-DSS ({unit_label(flow_unit)})": round(float(diff_unit), 3),
+            "Diferencia Obs-DSS (%)": round(float(nearest.get("diff_pct_dss", np.nan)), 2),
+            "Diferencia abs. vs obs (%)": round(float(nearest["rel_pct"]), 2),
             "Diferencia abs. (%)": round(float(nearest["rel_pct"]), 2),
             "Estado": estado,
             "Días DSS": int(r.get("Días DSS", 0)) if pd.notna(r.get("Días DSS", np.nan)) else 0,
@@ -4313,10 +4374,13 @@ def tab_aportes_obs_semanal(
     obs_max_col = next((c for c in show_tbl.columns if c.startswith("Obs. máximo")), None)
     obs_dss_col = next((c for c in show_tbl.columns if c.startswith("Obs-DSS")), None)
 
+    # Orden operativo solicitado para la tabla principal:
+    # observado → DSS cercano → diferencia porcentual → percentil → mínimos/máximos → diferencia en unidad.
     preferred_cols = [
         "Embalse", "Semana", "Inicio semana", "Fin semana", "Definición semana", "Días obs. válidos",
-        obs_prom_col, dss_cercano_col, "Percentil AP DSS más cercano",
-        obs_min_col, obs_max_col, obs_dss_col, "Diferencia abs. (%)", "Estado",
+        obs_prom_col, dss_cercano_col, "Diferencia Obs-DSS (%)", "Percentil AP DSS más cercano",
+        obs_min_col, obs_max_col, obs_dss_col,
+        "Diferencia abs. vs obs (%)", "Diferencia abs. (%)", "Estado",
         "Días DSS", "Evap. sumada al DSS (p³/s)", "Modo AP DSS", "Fuente obs.",
     ]
     preferred_cols = [c for c in preferred_cols if c and c in show_tbl.columns]
@@ -4327,18 +4391,71 @@ def tab_aportes_obs_semanal(
     show_display = show_tbl[preferred_cols + remaining_cols].copy()
     st.dataframe(show_display, use_container_width=True, hide_index=True, height=520)
 
+    # Resumen inferior por embalse: muestra el promedio simple del porcentaje
+    # semanal y el porcentaje acumulado/ponderado de todo el período filtrado.
+    # La diferencia acumulada se calcula contra el AP DSS cercano:
+    #     (Σ Obs ponderado - Σ DSS ponderado) / |Σ DSS ponderado| × 100
+    # usando los días observados válidos como ponderador para no mezclar semanas incompletas.
+    if not show_tbl.empty and obs_prom_col and dss_cercano_col:
+        resumen_rows: List[Dict[str, object]] = []
+        for embalse, g in show_tbl.sort_values(["Embalse", "Semana"]).groupby("Embalse", sort=True):
+            gg = g.copy()
+            obs_vals = pd.to_numeric(gg[obs_prom_col], errors="coerce")
+            dss_vals = pd.to_numeric(gg[dss_cercano_col], errors="coerce")
+            pct_vals = pd.to_numeric(gg.get("Diferencia Obs-DSS (%)", np.nan), errors="coerce")
+            diff_vals = pd.to_numeric(gg[obs_dss_col], errors="coerce") if obs_dss_col and obs_dss_col in gg.columns else (obs_vals - dss_vals)
+            weights = pd.to_numeric(gg.get("Días obs. válidos", 1), errors="coerce").fillna(1)
+            weights = weights.where(weights > 0, 1)
+
+            valid = obs_vals.notna() & dss_vals.notna() & weights.notna()
+            if not valid.any():
+                continue
+
+            w = weights[valid].astype(float)
+            obs_weighted_sum = float((obs_vals[valid].astype(float) * w).sum())
+            dss_weighted_sum = float((dss_vals[valid].astype(float) * w).sum())
+            total_days = float(w.sum())
+            obs_prom_pond = obs_weighted_sum / total_days if total_days > 0 else np.nan
+            dss_prom_pond = dss_weighted_sum / total_days if total_days > 0 else np.nan
+            diff_prom_pond = obs_prom_pond - dss_prom_pond if pd.notna(obs_prom_pond) and pd.notna(dss_prom_pond) else np.nan
+            pct_acum = ((obs_weighted_sum - dss_weighted_sum) / abs(dss_weighted_sum) * 100.0) if abs(dss_weighted_sum) > 1e-9 else np.nan
+
+            resumen_rows.append({
+                "Embalse": embalse,
+                "Semanas incluidas": f"{int(gg['Semana'].min())}-{int(gg['Semana'].max())}",
+                "Cantidad semanas": int(valid.sum()),
+                "Días obs. acumulados": int(total_days),
+                f"Aporte observado prom. ponderado ({unit_label(flow_unit)})": round(float(obs_prom_pond), 3) if pd.notna(obs_prom_pond) else np.nan,
+                f"AP DSS prom. ponderado ({unit_label(flow_unit)})": round(float(dss_prom_pond), 3) if pd.notna(dss_prom_pond) else np.nan,
+                f"Obs-DSS prom. ponderado ({unit_label(flow_unit)})": round(float(diff_prom_pond), 3) if pd.notna(diff_prom_pond) else np.nan,
+                "Promedio semanal Diferencia Obs-DSS (%)": round(float(pct_vals.mean()), 2) if pct_vals.notna().any() else np.nan,
+                "Diferencia acumulada Obs-DSS (%)": round(float(pct_acum), 2) if pd.notna(pct_acum) else np.nan,
+                "Obs-DSS acumulado ponderado": round(float((diff_vals[valid].astype(float) * w).sum()), 3) if diff_vals.notna().any() else np.nan,
+            })
+
+        if resumen_rows:
+            st.markdown("#### Acumulado y promedio de diferencia por embalse")
+            resumen_embalse = pd.DataFrame(resumen_rows)
+            st.dataframe(resumen_embalse, use_container_width=True, hide_index=True, height=180)
+
     if not show_tbl.empty:
         latest = show_tbl.sort_values(["Embalse", "Semana"]).groupby("Embalse", as_index=False).tail(1)
         cols = st.columns(len(latest))
         for idx, (_, r) in enumerate(latest.iterrows()):
             diff_col = next((c for c in show_tbl.columns if c.startswith("Obs-DSS (")), None)
             obs_col = next((c for c in show_tbl.columns if c.startswith("Aporte observado prom.")), None)
+            pct_col = "Diferencia Obs-DSS (%)" if "Diferencia Obs-DSS (%)" in show_tbl.columns else None
+            pct_txt = f" · {r[pct_col]:+,.2f}%" if pct_col and pd.notna(r[pct_col]) else ""
             cols[idx].metric(
                 f"{r['Embalse']} · semana {int(r['Semana'])}",
                 str(r["Percentil AP DSS más cercano"]),
-                delta=f"{r[diff_col]:+,.2f} {unit_label(flow_unit)}" if diff_col else None,
+                delta=f"{r[diff_col]:+,.2f} {unit_label(flow_unit)}{pct_txt}" if diff_col else None,
                 delta_color="inverse",
-                help=f"Aporte observado prom.: {r[obs_col]:,.2f} {unit_label(flow_unit)} · Diferencia abs.: {r['Diferencia abs. (%)']:.2f}%" if obs_col else None,
+                help=(
+                    f"Aporte observado prom.: {r[obs_col]:,.2f} {unit_label(flow_unit)} · "
+                    f"Diferencia Obs-DSS: {r[pct_col]:+,.2f}% respecto al DSS · "
+                    f"Diferencia abs. vs obs.: {r['Diferencia abs. (%)']:.2f}%"
+                ) if obs_col and pct_col else None,
             )
 
     csv_source = show_display if "show_display" in locals() else show_tbl
@@ -4366,6 +4483,7 @@ def tab_aportes_obs_semanal(
                     "Serie": "Aporte observado semanal",
                     "Valor": r[obs_col],
                     "Percentil": "Observado",
+                    "Diferencia Obs-DSS (%)": r.get("Diferencia Obs-DSS (%)", np.nan),
                 })
                 plot_rows.append({
                     "Embalse": r["Embalse"],
@@ -4376,6 +4494,7 @@ def tab_aportes_obs_semanal(
                     "Serie": "AP DSS semanal más cercano",
                     "Valor": r[dss_col],
                     "Percentil": r["Percentil AP DSS más cercano"],
+                    "Diferencia Obs-DSS (%)": r.get("Diferencia Obs-DSS (%)", np.nan),
                 })
             plot_df = pd.DataFrame(plot_rows)
             fig = px.line(
@@ -4385,7 +4504,7 @@ def tab_aportes_obs_semanal(
                 color="Serie",
                 line_dash="Embalse",
                 markers=True,
-                hover_data=["Embalse", "Semana", "Inicio semana", "Fin semana", "Percentil"],
+                hover_data=["Embalse", "Semana", "Inicio semana", "Fin semana", "Percentil", "Diferencia Obs-DSS (%)"],
                 title=f"Aporte observado semanal vs AP DSS más cercano · semana {rango_txt} ({unit_label(flow_unit)})",
             )
             fig.update_layout(height=560, hovermode="x unified")
@@ -4410,7 +4529,10 @@ def tab_aportes_obs_semanal(
             detail_show[f"Obs-DSS ({unit_label(flow_unit)})"] = convert_flow(
                 detail_show["Obs-DSS (p³/s)"], flow_unit
             ).round(3)
-            for c in ["Aporte observado semanal prom. (p³/s)", "AP DSS semanal (p³/s)", "Obs-DSS (p³/s)", "Diferencia abs. (%)"]:
+            for c in [
+                "Aporte observado semanal prom. (p³/s)", "AP DSS semanal (p³/s)", "Obs-DSS (p³/s)",
+                "Diferencia Obs-DSS (%)", "Diferencia abs. vs obs (%)", "Diferencia abs. (%)",
+            ]:
                 if c in detail_show.columns:
                     detail_show[c] = pd.to_numeric(detail_show[c], errors="coerce").round(3)
             st.dataframe(detail_show, use_container_width=True, hide_index=True, height=420)
