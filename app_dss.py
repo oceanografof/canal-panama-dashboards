@@ -3720,6 +3720,7 @@ def _excel_bytes_from_sheets(sheets: Dict[str, pd.DataFrame]) -> bytes:
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         used_names: set = set()
         for raw_name, df in (sheets or {}).items():
+            df = _sanitize_export_dataframe(df)
             if df is None or not isinstance(df, pd.DataFrame) or df.empty:
                 continue
             sheet = _safe_excel_sheet_name(raw_name)
@@ -3737,16 +3738,70 @@ def _excel_bytes_from_sheets(sheets: Dict[str, pd.DataFrame]) -> bytes:
     return bio.getvalue()
 
 
+def _date_only_safe(value):
+    """Convierte valores de widgets/fechas a `datetime.date` sin tumbar la app."""
+    try:
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        if value is None:
+            return None
+        return pd.to_datetime(value, errors="coerce").date()
+    except Exception:
+        return None
+
+
 def _reset_date_input_if_outside(key: str, mn, mx, default_value) -> None:
-    """Evita que un date_input conserve una fecha vieja fuera del nuevo rango."""
+    """Evita que un date_input conserve una fecha vieja fuera del nuevo rango.
+
+    En Streamlit el estado puede quedar como `date`, `Timestamp`, `datetime`
+    o incluso como tupla si antes se usó un rango. Esta función normaliza el
+    valor antes de compararlo, para que la pestaña Exportar no se bloquee con
+    fechas viejas guardadas en sesión.
+    """
     try:
         current = st.session_state.get(key, None)
         if current is None:
             return
-        if current < mn or current > mx:
+        cur_date = _date_only_safe(current)
+        mn_date = _date_only_safe(mn)
+        mx_date = _date_only_safe(mx)
+        def_date = _date_only_safe(default_value)
+        if cur_date is None or mn_date is None or mx_date is None:
             st.session_state[key] = default_value
+            return
+        if cur_date < mn_date or cur_date > mx_date:
+            st.session_state[key] = def_date or default_value
     except Exception:
-        pass
+        try:
+            st.session_state[key] = default_value
+        except Exception:
+            pass
+
+
+def _sanitize_export_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Prepara una tabla para CSV/Excel sin alterar el cálculo original.
+
+    - Normaliza fechas a datetime sin zona horaria.
+    - Reemplaza infinitos por NaN.
+    - Convierte objetos no escalares a texto para evitar fallas de openpyxl.
+    """
+    if df is None or not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    out = df.copy()
+    out = out.replace([np.inf, -np.inf], np.nan)
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            try:
+                out[col] = pd.to_datetime(out[col], errors="coerce").dt.tz_localize(None)
+            except Exception:
+                out[col] = pd.to_datetime(out[col], errors="coerce")
+        elif out[col].dtype == "object":
+            def _safe_cell(v):
+                if isinstance(v, (list, tuple, dict, set)):
+                    return str(v)
+                return v
+            out[col] = out[col].map(_safe_cell)
+    return out
 
 
 def tab_exportar_percentil(
@@ -3761,96 +3816,113 @@ def tab_exportar_percentil(
 ) -> None:
     """Pestaña para exportar el percentil elegido por embalse.
 
-    Corrección defensiva:
-    - los filtros de fecha usan llaves únicas por embalse/percentil/rango;
-    - se limpia la columna Fecha antes de filtrar;
-    - si el filtro deja la tabla vacía, se avisa y no se rompe el tablero;
-    - CSV/Excel usan llaves únicas para evitar conflictos de Streamlit.
+    Versión blindada:
+    - recalcula la tabla cada vez que cambia embalse, percentil, unidad, modo AP,
+      evaporación o reducción;
+    - no reutiliza fechas viejas de Streamlit fuera del rango vigente;
+    - genera CSV y Excel desde la misma tabla filtrada visible;
+    - incluye hoja de metadatos para verificar exactamente qué se exportó.
     """
     st.subheader("⬇️ Exportar percentil DSS")
-    st.caption("Exporta el percentil escogido para el embalse seleccionado, incluyendo nivel, hidrogeneración, aportes, vertidos y esclusajes cuando existan en el DSS.")
+    st.caption(
+        "Exporta el percentil escogido para el embalse seleccionado. "
+        "La tabla visible, el CSV y el Excel usan exactamente los mismos datos filtrados."
+    )
 
-    embalse_op = st.selectbox("Embalse", ["Gatún", "Alhajuela / Madden"], key="exp_embalse")
+    # ── Selección principal ─────────────────────────────────────────
+    c_sel1, c_sel2 = st.columns([1.20, 1.0])
+    with c_sel1:
+        embalse_op = st.selectbox(
+            "Embalse",
+            ["Gatún", "Alhajuela / Madden"],
+            key="exp_embalse_v2",
+        )
     res_key = "gatun" if embalse_op == "Gatún" else "alhajuela"
     cfg = RESERVOIR_CONFIG[res_key]
     pct_default = int(pct_ref_gat if res_key == "gatun" else pct_ref_alh)
-    pct = st.selectbox(
-        "Percentil a exportar",
-        PERCENTILE_ORDER,
-        index=PERCENTILE_ORDER.index(pct_default) if pct_default in PERCENTILE_ORDER else PERCENTILE_ORDER.index(50),
-        format_func=lambda x: f"P{x}",
-        key=f"exp_pct_{res_key}",
-    )
-    evap = evap_gat_cfs if res_key == "gatun" else evap_alh_cfs
-    obs_ap_df = obs_gat_aporte if res_key == "gatun" else obs_alh_aporte
 
-    st.markdown("#### ⚙️ Opciones de exportación AP")
-    with st.container():
-        c1, c2, c3, c4 = st.columns([1.35, 1.20, 1.0, 1.15])
-        with c1:
-            simular_hidro_mayo = st.checkbox(
-                "🌊 Simular hidrograma observado mayo-junio",
-                value=bool(st.session_state.get("ap_hydrograph_enabled", False)),
-                key=f"exp_simular_hidro_mayo_{res_key}",
-                help=(
-                    "Redistribuye diariamente el AP DSS usando la forma observada de la última semana de mayo "
-                    "y las tres semanas siguientes de junio. Conserva la suma/promedio semanal del DSS; "
-                    "evita que el aporte exportado quede constante día tras día."
-                ),
-            )
-        with c2:
-            sumar_evap_ap = st.checkbox(
-                "➕ Sumar evaporación al AP del percentil",
-                value=True,
-                key=f"exp_sumar_evap_ap_{res_key}",
-                help="Calcula AP base = AP neto DSS del percentil seleccionado + caudal evaporado.",
-            )
-        with c3:
-            incluir_ap_neto = st.checkbox(
-                "Mostrar también AP neto",
-                value=True,
-                key=f"exp_incluir_ap_neto_{res_key}",
-                help="Incluye una columna separada con el AP neto DSS antes de sumar evaporación.",
-            )
-        with c4:
-            ap_reduction_pct = st.number_input(
-                "Restar al AP exportado (%)",
-                min_value=0.0,
-                max_value=95.0,
-                value=0.0,
-                step=5.0,
-                format="%.1f",
-                key=f"exp_ap_reduction_pct_{res_key}",
-                help=(
-                    "Descuenta el porcentaje indicado al AP que se va a exportar. "
-                    "Ejemplo: 20% exporta el 80% de AP neto + evaporación."
-                ),
-            )
-        st.caption(
-            "Estas opciones solo cambian la tabla exportada. La simulación mayo-junio mantiene el volumen semanal DSS; "
-            "la evaporación se suma como término positivo y luego se descuenta el porcentaje solicitado al AP exportable."
+    with c_sel2:
+        pct = st.selectbox(
+            "Percentil a exportar",
+            PERCENTILE_ORDER,
+            index=PERCENTILE_ORDER.index(pct_default) if pct_default in PERCENTILE_ORDER else PERCENTILE_ORDER.index(50),
+            format_func=lambda x: f"P{x}",
+            key=f"exp_pct_v2_{res_key}",
         )
 
+    evap = clean_evap_cfs(evap_gat_cfs if res_key == "gatun" else evap_alh_cfs)
+    obs_ap_df = obs_gat_aporte if res_key == "gatun" else obs_alh_aporte
+
+    # ── Opciones AP ─────────────────────────────────────────────────
+    st.markdown("#### ⚙️ Opciones de exportación AP")
+    c1, c2, c3, c4 = st.columns([1.35, 1.15, 1.05, 1.05])
+    with c1:
+        simular_hidro_mayo = st.checkbox(
+            "🌊 Simular hidrograma observado mayo-junio",
+            value=bool(st.session_state.get("ap_hydrograph_enabled", AP_HYDROGRAPH_ADJUSTMENT_ENABLED)),
+            key=f"exp_simular_hidro_mayo_v2_{res_key}",
+            help=(
+                "Redistribuye diariamente el AP DSS usando la forma observada de la última semana de mayo "
+                "y las tres semanas siguientes de junio. Conserva la suma/promedio semanal DSS."
+            ),
+        )
+    with c2:
+        sumar_evap_ap = st.checkbox(
+            "➕ Sumar evaporación al AP",
+            value=True,
+            key=f"exp_sumar_evap_ap_v2_{res_key}",
+            help="AP base exportable = AP neto DSS del percentil + evaporación.",
+        )
+    with c3:
+        incluir_ap_neto = st.checkbox(
+            "Mostrar AP neto",
+            value=True,
+            key=f"exp_incluir_ap_neto_v2_{res_key}",
+            help="Incluye una columna con AP neto DSS antes de sumar evaporación.",
+        )
+    with c4:
+        ap_reduction_pct = st.number_input(
+            "Restar al AP exportado (%)",
+            min_value=0.0,
+            max_value=95.0,
+            value=float(st.session_state.get(f"exp_ap_reduction_pct_v2_{res_key}", 0.0) or 0.0),
+            step=5.0,
+            format="%.1f",
+            key=f"exp_ap_reduction_pct_v2_{res_key}",
+            help="Ejemplo: 20% exporta el 80% del AP base.",
+        )
+
+    st.caption(
+        "Orden del cálculo exportado: AP neto DSS → sumar evaporación si está activa → aplicar reducción porcentual → AP exportable final."
+    )
+
+    # ── Carga y construcción de tabla ───────────────────────────────
     try:
         raw = load_dss_sheet(dss_bytes, cfg["sheet"])
         daily = to_daily(raw, cfg)
-        daily = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_ap_df, enabled=simular_hidro_mayo)
+        if daily is None or daily.empty:
+            st.warning("No se pudo construir el diario DSS para exportación.")
+            return
+        daily = apply_may_hydrograph_ap_adjustment(
+            daily,
+            cfg,
+            obs_ap_df,
+            enabled=bool(simular_hidro_mayo),
+        )
     except Exception as exc:
         st.error(f"Error cargando DSS para exportación: {exc}")
-        return
-    if daily is None or daily.empty:
-        st.warning("No se pudo construir el diario DSS para exportación.")
+        with st.expander("Detalle técnico de carga DSS", expanded=False):
+            st.exception(exc)
         return
 
     meta_ap = getattr(daily, "attrs", {}) or {}
-    if simular_hidro_mayo:
-        if meta_ap.get("ap_may_adjustment"):
-            _show_ap_may_adjustment_note(daily, res_key, "exportación")
-        else:
-            st.warning(
-                "No se pudo aplicar la simulación con hidrograma observado mayo-junio; "
-                f"se usa el AP DSS original. Motivo: {meta_ap.get('reason', 'sin detalle disponible')}."
-            )
+    if simular_hidro_mayo and meta_ap.get("ap_may_adjustment"):
+        _show_ap_may_adjustment_note(daily, res_key, "exportación")
+    elif simular_hidro_mayo:
+        st.warning(
+            "No se pudo aplicar la simulación con hidrograma observado mayo-junio; "
+            f"se usa el AP DSS original. Motivo: {meta_ap.get('reason', 'sin detalle disponible')}."
+        )
     else:
         st.info("Modo AP diario: se exporta el AP DSS original, sin redistribución con mayo.")
 
@@ -3858,69 +3930,111 @@ def tab_exportar_percentil(
     include_evap_column = bool(sumar_evap_ap)
     include_ap_neto = bool(incluir_ap_neto or not include_ap_total)
     if include_ap_total:
-        ap_distribution_label = "Hidrograma observado mayo-junio 4 semanas" if meta_ap.get("ap_may_adjustment") else "DSS original + evaporación"
+        ap_distribution_label = (
+            "Hidrograma observado mayo-junio 4 semanas + evaporación"
+            if meta_ap.get("ap_may_adjustment")
+            else "DSS original + evaporación"
+        )
     else:
-        ap_distribution_label = "Hidrograma observado mayo-junio 4 semanas" if meta_ap.get("ap_may_adjustment") else "DSS original"
+        ap_distribution_label = (
+            "Hidrograma observado mayo-junio 4 semanas"
+            if meta_ap.get("ap_may_adjustment")
+            else "DSS original"
+        )
 
-    table = build_percentile_export_table(
-        daily,
-        cfg,
-        int(pct),
-        flow_unit,
-        evap,
-        include_ap_neto=include_ap_neto,
-        include_ap_total=include_ap_total,
-        include_evap_column=include_evap_column,
-        ap_distribution_label=ap_distribution_label,
-        ap_reduction_pct=float(ap_reduction_pct or 0.0),
-    )
-    if table is None or table.empty:
-        st.warning("No hay datos para exportar.")
+    try:
+        table_all = build_percentile_export_table(
+            daily,
+            cfg,
+            int(pct),
+            flow_unit,
+            evap,
+            include_ap_neto=include_ap_neto,
+            include_ap_total=include_ap_total,
+            include_evap_column=include_evap_column,
+            ap_distribution_label=ap_distribution_label,
+            ap_reduction_pct=float(ap_reduction_pct or 0.0),
+        )
+        table_all = _sanitize_export_dataframe(table_all)
+    except Exception as exc:
+        st.error(f"No se pudo construir la tabla de exportación: {exc}")
+        with st.expander("Detalle técnico de construcción de tabla", expanded=False):
+            st.exception(exc)
         return
 
-    table = table.copy()
-    table["Fecha"] = pd.to_datetime(table["Fecha"], errors="coerce")
-    table = table.dropna(subset=["Fecha"]).sort_values("Fecha")
-    if table.empty:
+    if table_all is None or table_all.empty:
+        st.warning("No hay datos para exportar con la selección actual.")
+        return
+
+    table_all["Fecha"] = pd.to_datetime(table_all["Fecha"], errors="coerce")
+    table_all = table_all.dropna(subset=["Fecha"]).sort_values("Fecha")
+    try:
+        table_all["Fecha"] = table_all["Fecha"].dt.tz_localize(None)
+    except Exception:
+        pass
+    if table_all.empty:
         st.warning("La tabla de exportación no contiene fechas válidas.")
         return
 
+    # ── Filtro de fecha blindado ────────────────────────────────────
+    mn_dt = pd.to_datetime(table_all["Fecha"].min()).date()
+    mx_dt = pd.to_datetime(table_all["Fecha"].max()).date()
+    option_hash = _safe_export_filename(
+        f"{res_key}_p{int(pct)}_{flow_unit}_{int(bool(simular_hidro_mayo))}_"
+        f"{int(bool(sumar_evap_ap))}_{int(bool(incluir_ap_neto))}_{float(ap_reduction_pct or 0):g}_"
+        f"{mn_dt:%Y%m%d}_{mx_dt:%Y%m%d}"
+    )
+
     with st.expander("🗓️ Filtro de período para exportar", expanded=True):
-        mn_dt = pd.to_datetime(table["Fecha"].min()).date()
-        mx_dt = pd.to_datetime(table["Fecha"].max()).date()
-        date_suffix = f"{res_key}_p{int(pct)}_{mn_dt:%Y%m%d}_{mx_dt:%Y%m%d}"
-        s_key = f"exp_s_{date_suffix}"
-        e_key = f"exp_e_{date_suffix}"
+        s_key = f"exp_s_v2_{option_hash}"
+        e_key = f"exp_e_v2_{option_hash}"
         _reset_date_input_if_outside(s_key, mn_dt, mx_dt, mn_dt)
         _reset_date_input_if_outside(e_key, mn_dt, mx_dt, mx_dt)
-        c1, c2 = st.columns(2)
+
+        c1, c2, c3 = st.columns([1, 1, 1.1])
         s = c1.date_input("Desde", value=mn_dt, min_value=mn_dt, max_value=mx_dt, key=s_key)
         e = c2.date_input("Hasta", value=mx_dt, min_value=mn_dt, max_value=mx_dt, key=e_key)
+        usar_todo = c3.checkbox(
+            "Usar todo el período disponible",
+            value=False,
+            key=f"exp_usar_todo_v2_{option_hash}",
+        )
 
-    if s <= e:
-        table = table[(table["Fecha"].dt.date >= s) & (table["Fecha"].dt.date <= e)].copy()
-    else:
-        st.warning("Fecha inicial mayor que final. Se mantiene el período completo.")
+    s_date = _date_only_safe(s) or mn_dt
+    e_date = _date_only_safe(e) or mx_dt
+    if usar_todo:
+        s_date, e_date = mn_dt, mx_dt
+
+    if s_date > e_date:
+        st.warning("Fecha inicial mayor que final. Se intercambió el orden para mantener la exportación activa.")
+        s_date, e_date = e_date, s_date
+
+    table = table_all[
+        (table_all["Fecha"].dt.date >= s_date)
+        & (table_all["Fecha"].dt.date <= e_date)
+    ].copy()
+    table = _sanitize_export_dataframe(table)
 
     if table.empty:
-        st.warning("El filtro seleccionado no dejó datos para exportar. Ajuste el rango de fechas.")
+        st.warning("El filtro seleccionado no dejó datos para exportar. Active 'Usar todo el período disponible' o ajuste el rango.")
         return
 
-    # Resumen operativo rápido para confirmar que las opciones seleccionadas
-    # están haciendo lo esperado antes de descargar el archivo.
+    # ── Resumen de control ──────────────────────────────────────────
     unit_txt = unit_label(flow_unit)
     ap_export_cols = [c for c in table.columns if c.startswith("AP exportable") and f"({unit_txt})" in c]
     ap_total_cols = [c for c in table.columns if c.startswith("AP total DSS") and f"({unit_txt})" in c]
     ap_neto_cols = [c for c in table.columns if c.startswith("AP neto DSS") and f"({unit_txt})" in c]
     evap_cols = [c for c in table.columns if c.startswith("Evaporación sumada") and f"({unit_txt})" in c]
     reduction_cols = [c for c in table.columns if c.startswith("Descuento AP exportado") and f"({unit_txt})" in c]
+
+    st.success(f"Tabla lista para exportar: {len(table):,} días · {s_date:%d-%m-%Y} a {e_date:%d-%m-%Y}.")
     m1, m2, m3, m4 = st.columns(4)
     if ap_neto_cols:
         m1.metric(f"AP neto medio ({unit_txt})", f"{pd.to_numeric(table[ap_neto_cols[0]], errors='coerce').mean():,.3f}")
     else:
         m1.metric("AP neto medio", "—")
     if ap_export_cols:
-        m2.metric(f"AP exportable medio ({unit_txt})", f"{pd.to_numeric(table[ap_export_cols[0]], errors='coerce').mean():,.3f}")
+        m2.metric(f"AP exportable final medio ({unit_txt})", f"{pd.to_numeric(table[ap_export_cols[0]], errors='coerce').mean():,.3f}")
     elif ap_total_cols:
         m2.metric(f"AP total medio ({unit_txt})", f"{pd.to_numeric(table[ap_total_cols[0]], errors='coerce').mean():,.3f}")
     else:
@@ -3937,9 +4051,7 @@ def tab_exportar_percentil(
     if PLOTLY_OK and (ap_export_cols or ap_total_cols or ap_neto_cols):
         with st.expander("📈 Vista previa del AP exportado", expanded=False):
             fig = go.Figure()
-            preview_cols = ap_neto_cols[:1] + ap_total_cols[:1] + ap_export_cols[:1]
-            # Evitar columnas duplicadas en la vista previa.
-            preview_cols = list(dict.fromkeys(preview_cols))
+            preview_cols = list(dict.fromkeys(ap_neto_cols[:1] + ap_total_cols[:1] + ap_export_cols[:1]))
             for col in preview_cols:
                 fig.add_trace(go.Scatter(
                     x=table["Fecha"],
@@ -3949,30 +4061,77 @@ def tab_exportar_percentil(
                 ))
             fig.update_layout(**_base_layout("AP exportado del percentil seleccionado", unit_txt, height=420))
             _today_line(fig, table["Fecha"])
-            st.plotly_chart(fig, use_container_width=True, key=f"exp_ap_preview_{res_key}_{int(pct)}")
+            st.plotly_chart(fig, use_container_width=True, key=f"exp_ap_preview_v2_{option_hash}")
+
+    with st.expander("🧾 Diagnóstico de exportación", expanded=False):
+        diag = pd.DataFrame([{
+            "Embalse": cfg["name"],
+            "Hoja DSS": cfg["sheet"],
+            "Percentil solicitado": f"P{int(pct)}",
+            "Unidad": unit_txt,
+            "Fecha inicio": s_date.strftime("%d-%m-%Y"),
+            "Fecha fin": e_date.strftime("%d-%m-%Y"),
+            "Días exportados": int(len(table)),
+            "Simulación hidrograma mayo-junio": bool(simular_hidro_mayo),
+            "Hidrograma aplicado": bool(meta_ap.get("ap_may_adjustment")),
+            "Modo AP": ap_distribution_label,
+            "Evaporación cfs": round(float(evap), 3),
+            "Reducción AP exportado (%)": round(float(ap_reduction_pct or 0.0), 3),
+        }])
+        st.dataframe(diag, use_container_width=True, hide_index=True)
+        st.caption(f"Columnas exportadas: {len(table.columns)}")
 
     st.dataframe(table, use_container_width=True, hide_index=True, height=520)
+
+    # ── Descarga: la tabla visible es la misma que se descarga ───────
     try:
         reduction_tag = f"_menos{float(ap_reduction_pct):g}pct" if float(ap_reduction_pct or 0.0) > 0 else ""
     except Exception:
         reduction_tag = ""
-    fname_base = _safe_export_filename(f"export_{cfg['token']}_P{int(pct)}{reduction_tag}")
-    key_suffix = _safe_export_filename(f"{res_key}_p{int(pct)}_{flow_unit}_{float(ap_reduction_pct or 0):g}")
+    period_tag = f"_{s_date:%Y%m%d}_{e_date:%Y%m%d}"
+    fname_base = _safe_export_filename(f"export_{cfg['token']}_P{int(pct)}{reduction_tag}{period_tag}")
+    dl_key = _safe_export_filename(f"{option_hash}_{s_date:%Y%m%d}_{e_date:%Y%m%d}_{len(table)}")
 
     try:
         csv = table.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Descargar CSV", csv, f"{fname_base}.csv", "text/csv", key=f"exp_csv_{key_suffix}")
+        st.download_button(
+            "⬇️ Descargar CSV",
+            csv,
+            f"{fname_base}.csv",
+            "text/csv",
+            key=f"exp_csv_v2_{dl_key}",
+        )
     except Exception as exc:
         st.warning(f"No se pudo generar el CSV de exportación. Detalle: {exc}")
 
     try:
-        xlsx = _excel_bytes_from_sheets({f"{cfg['token']}_P{int(pct)}": table})
+        metadata = pd.DataFrame([{
+            "Archivo": f"{fname_base}.xlsx",
+            "Embalse": cfg["name"],
+            "Hoja DSS": cfg["sheet"],
+            "Percentil solicitado": f"P{int(pct)}",
+            "Unidad": unit_txt,
+            "Fecha inicio": s_date.strftime("%d-%m-%Y"),
+            "Fecha fin": e_date.strftime("%d-%m-%Y"),
+            "Días exportados": int(len(table)),
+            "AP neto incluido": bool(include_ap_neto),
+            "Evaporación sumada": bool(include_ap_total),
+            "Evaporación cfs": round(float(evap), 6),
+            "Reducción AP exportado (%)": round(float(ap_reduction_pct or 0.0), 6),
+            "Modo AP diario": ap_distribution_label,
+            "Hidrograma observado aplicado": bool(meta_ap.get("ap_may_adjustment")),
+            "Detalle hidrograma": str(meta_ap.get("reason", "ok")),
+        }])
+        xlsx = _excel_bytes_from_sheets({
+            "Exportacion": table,
+            "Metadatos": metadata,
+        })
         st.download_button(
             "⬇️ Descargar Excel",
             xlsx,
             f"{fname_base}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"exp_xlsx_{key_suffix}",
+            key=f"exp_xlsx_v2_{dl_key}",
         )
     except Exception as exc:
         st.warning(f"No se pudo generar Excel; use el CSV. Detalle: {exc}")
