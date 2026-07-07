@@ -1631,6 +1631,14 @@ def _leer_defaults_operativos_lkh(path_o_bytes, source_id, n_dias=5):
                     exact=["saving_water_neo_turnaround_hm3", "saving_water_turnaround_neo_hm3", "turnaround_neo_hm3", "turn_around_neo_hm3"],
                     required=["neo", "turn", "around"],
                 ),
+                # Columnas exactas observadas en LakeHouse para NeoPanamax:
+                # - saving_water_ac_hm3 / saving_water_cc_hm3: ahorro normal por uso de tinas/WSB
+                # - saving_water_ta_ac_hm3 / saving_water_ta_cc_hm3: ahorro de Turn Around usando tinas
+                # - total_saving_water_neo_hm3: suma oficial de los cuatro componentes anteriores
+                "ahorro_npx_ac_lkh": _find_lkh_col(header_l, exact=["saving_water_ac_hm3"]),
+                "ahorro_npx_cc_lkh": _find_lkh_col(header_l, exact=["saving_water_cc_hm3"]),
+                "ahorro_npx_ta_ac_lkh": _find_lkh_col(header_l, exact=["saving_water_ta_ac_hm3"]),
+                "ahorro_npx_ta_cc_lkh": _find_lkh_col(header_l, exact=["saving_water_ta_cc_hm3"]),
                 "cca_neo_lkh": _find_lkh_col(header_l, exact=["cca_neo"]),
             }
 
@@ -1705,6 +1713,37 @@ def _leer_defaults_operativos_lkh(path_o_bytes, source_id, n_dias=5):
                     return float(val) * MPC_TO_HM3
                 return float(val)
 
+            _ahorro_npx_ac_lkh = _saving_hm3_from_col("ahorro_npx_ac_lkh")
+            _ahorro_npx_cc_lkh = _saving_hm3_from_col("ahorro_npx_cc_lkh")
+            _ahorro_npx_ta_ac_lkh = _saving_hm3_from_col("ahorro_npx_ta_ac_lkh")
+            _ahorro_npx_ta_cc_lkh = _saving_hm3_from_col("ahorro_npx_ta_cc_lkh")
+
+            _ahorro_npx_tinas_componentes = [
+                v for v in [_ahorro_npx_ac_lkh, _ahorro_npx_cc_lkh]
+                if v is not None and np.isfinite(float(v))
+            ]
+            _ahorro_npx_turnaround_componentes = [
+                v for v in [_ahorro_npx_ta_ac_lkh, _ahorro_npx_ta_cc_lkh]
+                if v is not None and np.isfinite(float(v))
+            ]
+            _ahorro_npx_tinas_lkh = (
+                float(sum(_ahorro_npx_tinas_componentes))
+                if _ahorro_npx_tinas_componentes
+                else _saving_hm3_from_col("ahorro_npx_tinas_lkh")
+            )
+            _ahorro_npx_turnaround_lkh = (
+                float(sum(_ahorro_npx_turnaround_componentes))
+                if _ahorro_npx_turnaround_componentes
+                else _saving_hm3_from_col("ahorro_npx_turnaround_lkh")
+            )
+            _ahorro_npx_total_lkh = _saving_hm3_from_col("ahorro_npx_total_lkh")
+            if _ahorro_npx_total_lkh is None:
+                _componentes_total_npx = [
+                    v for v in [_ahorro_npx_tinas_lkh, _ahorro_npx_turnaround_lkh]
+                    if v is not None and np.isfinite(float(v))
+                ]
+                _ahorro_npx_total_lkh = float(sum(_componentes_total_npx)) if _componentes_total_npx else None
+
             out = {
                 "hoja": hoja,
                 "n_dias": int(n_dias),
@@ -1726,9 +1765,13 @@ def _leer_defaults_operativos_lkh(path_o_bytes, source_id, n_dias=5):
                 "vp_lkh": _mean([_num(r.get("pnx_unit_hm3")) for r in ult]),
                 "vn_lkh": _mean([_num(r.get("npx_unit_hm3")) for r in ult]),
                 "ahorro_pnx_lkh": _saving_hm3_from_col("ahorro_pnx_lkh"),
-                "ahorro_npx_total_lkh": _saving_hm3_from_col("ahorro_npx_total_lkh"),
-                "ahorro_npx_tinas_lkh": _saving_hm3_from_col("ahorro_npx_tinas_lkh"),
-                "ahorro_npx_turnaround_lkh": _saving_hm3_from_col("ahorro_npx_turnaround_lkh"),
+                "ahorro_npx_total_lkh": _ahorro_npx_total_lkh,
+                "ahorro_npx_tinas_lkh": _ahorro_npx_tinas_lkh,
+                "ahorro_npx_turnaround_lkh": _ahorro_npx_turnaround_lkh,
+                "ahorro_npx_ac_lkh": _ahorro_npx_ac_lkh,
+                "ahorro_npx_cc_lkh": _ahorro_npx_cc_lkh,
+                "ahorro_npx_ta_ac_lkh": _ahorro_npx_ta_ac_lkh,
+                "ahorro_npx_ta_cc_lkh": _ahorro_npx_ta_cc_lkh,
                 "cca_neo_lkh": _mean([_num(r.get("cca_neo_lkh")) for r in ult]),
             }
             return out
@@ -1889,6 +1932,12 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                     exact=["saving_water_neo_turnaround_hm3", "saving_water_turnaround_neo_hm3", "turnaround_neo_hm3", "turn_around_neo_hm3"],
                     required=["neo", "turn", "around"],
                 ),
+                # Columnas exactas observadas en LakeHouse para NeoPanamax:
+                # ahorro normal por tinas/WSB y ahorro por Turn Around con tinas, separadas por complejo.
+                "ahorro_npx_ac_lkh": _find_lkh_col(header_l, exact=["saving_water_ac_hm3"]),
+                "ahorro_npx_cc_lkh": _find_lkh_col(header_l, exact=["saving_water_cc_hm3"]),
+                "ahorro_npx_ta_ac_lkh": _find_lkh_col(header_l, exact=["saving_water_ta_ac_hm3"]),
+                "ahorro_npx_ta_cc_lkh": _find_lkh_col(header_l, exact=["saving_water_ta_cc_hm3"]),
                 "cca_neo_lkh": _find_lkh_col(header_l, exact=["cca_neo"]),
             }
 
@@ -2010,9 +2059,36 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
             _gat_mwh_prom = _mean([_num(r.get("gat_mwh")) for r in ult])
 
             _ahorro_pnx_lkh = _saving_hm3_from_col("ahorro_pnx_lkh")
+            _ahorro_npx_ac_lkh = _saving_hm3_from_col("ahorro_npx_ac_lkh")
+            _ahorro_npx_cc_lkh = _saving_hm3_from_col("ahorro_npx_cc_lkh")
+            _ahorro_npx_ta_ac_lkh = _saving_hm3_from_col("ahorro_npx_ta_ac_lkh")
+            _ahorro_npx_ta_cc_lkh = _saving_hm3_from_col("ahorro_npx_ta_cc_lkh")
+
+            _ahorro_npx_tinas_componentes = [
+                v for v in [_ahorro_npx_ac_lkh, _ahorro_npx_cc_lkh]
+                if v is not None and np.isfinite(float(v))
+            ]
+            _ahorro_npx_turnaround_componentes = [
+                v for v in [_ahorro_npx_ta_ac_lkh, _ahorro_npx_ta_cc_lkh]
+                if v is not None and np.isfinite(float(v))
+            ]
+            _ahorro_npx_tinas_lkh = (
+                float(sum(_ahorro_npx_tinas_componentes))
+                if _ahorro_npx_tinas_componentes
+                else _saving_hm3_from_col("ahorro_npx_tinas_lkh")
+            )
+            _ahorro_npx_turnaround_lkh = (
+                float(sum(_ahorro_npx_turnaround_componentes))
+                if _ahorro_npx_turnaround_componentes
+                else _saving_hm3_from_col("ahorro_npx_turnaround_lkh")
+            )
             _ahorro_npx_total_lkh = _saving_hm3_from_col("ahorro_npx_total_lkh")
-            _ahorro_npx_tinas_lkh = _saving_hm3_from_col("ahorro_npx_tinas_lkh")
-            _ahorro_npx_turnaround_lkh = _saving_hm3_from_col("ahorro_npx_turnaround_lkh")
+            if _ahorro_npx_total_lkh is None:
+                _componentes_total_npx = [
+                    v for v in [_ahorro_npx_tinas_lkh, _ahorro_npx_turnaround_lkh]
+                    if v is not None and np.isfinite(float(v))
+                ]
+                _ahorro_npx_total_lkh = float(sum(_componentes_total_npx)) if _componentes_total_npx else None
             _cca_neo_lkh = _mean([_num(r.get("cca_neo_lkh")) for r in ult])
 
             return {
@@ -2025,6 +2101,10 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                     "npx_total_hm3": _ahorro_npx_total_lkh,
                     "npx_tinas_hm3": _ahorro_npx_tinas_lkh,
                     "npx_turnaround_hm3": _ahorro_npx_turnaround_lkh,
+                    "npx_ac_hm3": _ahorro_npx_ac_lkh,
+                    "npx_cc_hm3": _ahorro_npx_cc_lkh,
+                    "npx_ta_ac_hm3": _ahorro_npx_ta_ac_lkh,
+                    "npx_ta_cc_hm3": _ahorro_npx_ta_cc_lkh,
                     "cca_neo": _cca_neo_lkh,
                 },
                 # Total oficial del LakeHouse (incluye evaporación cuando está disponible).
@@ -2651,6 +2731,24 @@ ahorro_lkh_npx_total = _lkh_num_o_none(_ahorros_lkh_dict.get("npx_total_hm3"))
 ahorro_lkh_npx_tinas = _lkh_num_o_none(_ahorros_lkh_dict.get("npx_tinas_hm3"))
 ahorro_lkh_npx_turnaround = _lkh_num_o_none(_ahorros_lkh_dict.get("npx_turnaround_hm3"))
 cca_neo_lkh = _lkh_num_o_none(_ahorros_lkh_dict.get("cca_neo"))
+ahorro_lkh_npx_ac = _lkh_num_o_none(_ahorros_lkh_dict.get("npx_ac_hm3"))
+ahorro_lkh_npx_cc = _lkh_num_o_none(_ahorros_lkh_dict.get("npx_cc_hm3"))
+ahorro_lkh_npx_ta_ac = _lkh_num_o_none(_ahorros_lkh_dict.get("npx_ta_ac_hm3"))
+ahorro_lkh_npx_ta_cc = _lkh_num_o_none(_ahorros_lkh_dict.get("npx_ta_cc_hm3"))
+
+_ahorro_lkh_npx_tinas_componentes = [
+    v for v in [ahorro_lkh_npx_ac, ahorro_lkh_npx_cc]
+    if v is not None and np.isfinite(float(v))
+]
+if _ahorro_lkh_npx_tinas_componentes:
+    ahorro_lkh_npx_tinas = float(sum(_ahorro_lkh_npx_tinas_componentes))
+
+_ahorro_lkh_npx_ta_componentes = [
+    v for v in [ahorro_lkh_npx_ta_ac, ahorro_lkh_npx_ta_cc]
+    if v is not None and np.isfinite(float(v))
+]
+if _ahorro_lkh_npx_ta_componentes:
+    ahorro_lkh_npx_turnaround = float(sum(_ahorro_lkh_npx_ta_componentes))
 
 _ahorro_lkh_npx_detalle = sum(
     v for v in [ahorro_lkh_npx_tinas, ahorro_lkh_npx_turnaround]
@@ -4076,45 +4174,79 @@ with tabs[5]:
         "Modelo físico basado en **ConsumodeAguaEsclusas.xlsb** · "
         f"Nivel de referencia: **{nivel_modelo_ft:.2f} ft** ({nivel_modelo_ft*0.3048:.3f} m)")
 
-    if ahorro_lkh_disponible:
+    _dias_ahorros_lkh_opts = [1, 5, 7, 10, 30]
+    try:
+        _dias_ahorros_lkh_default = int(st.session_state.get("dias_op", _dias_defaults_lkh))
+    except Exception:
+        _dias_ahorros_lkh_default = 5
+    _dias_ahorros_lkh_idx = _dias_ahorros_lkh_opts.index(_dias_ahorros_lkh_default) if _dias_ahorros_lkh_default in _dias_ahorros_lkh_opts else 1
+    dias_ahorros_lkh = st.radio(
+        "Promedio de ahorros LakeHouse",
+        options=_dias_ahorros_lkh_opts,
+        index=_dias_ahorros_lkh_idx,
+        horizontal=True,
+        key="dias_lkh_ahorros_tab",
+        help="Calcula los ahorros con los últimos N registros/días del LakeHouse. No cambia el balance; solo el visor de esta pestaña.",
+    )
+    _info_ahorros_tab_lkh = _obtener_balance_detallado_lkh(int(dias_ahorros_lkh)) or _info_balance_lkh
+    _ahorros_tab_dict = (_info_ahorros_tab_lkh or {}).get("ahorros", {}) if isinstance(_info_ahorros_tab_lkh, dict) else {}
+    _ah_tab_pnx = _lkh_num_o_none(_ahorros_tab_dict.get("pnx_total_hm3"))
+    _ah_tab_npx_total = _lkh_num_o_none(_ahorros_tab_dict.get("npx_total_hm3"))
+    _ah_tab_npx_tinas = _lkh_num_o_none(_ahorros_tab_dict.get("npx_tinas_hm3"))
+    _ah_tab_npx_turnaround = _lkh_num_o_none(_ahorros_tab_dict.get("npx_turnaround_hm3"))
+    _ah_tab_npx_ac = _lkh_num_o_none(_ahorros_tab_dict.get("npx_ac_hm3"))
+    _ah_tab_npx_cc = _lkh_num_o_none(_ahorros_tab_dict.get("npx_cc_hm3"))
+    _ah_tab_npx_ta_ac = _lkh_num_o_none(_ahorros_tab_dict.get("npx_ta_ac_hm3"))
+    _ah_tab_npx_ta_cc = _lkh_num_o_none(_ahorros_tab_dict.get("npx_ta_cc_hm3"))
+    _ah_tab_cca = _lkh_num_o_none(_ahorros_tab_dict.get("cca_neo"))
+
+    _ah_tab_comp_total = [v for v in [_ah_tab_pnx, _ah_tab_npx_total] if v is not None and np.isfinite(float(v))]
+    _ah_tab_total = float(sum(_ah_tab_comp_total)) if _ah_tab_comp_total else None
+    _ah_tab_disponible = _ah_tab_total is not None
+
+    if _ah_tab_disponible:
         st.info(
             f"Ahorros provenientes del LakeHouse incorporados al panel y a la exportación "
-            f"(promedio de los últimos {_dias_lkh_seguros(_dias_defaults_lkh)} días). "
+            f"(promedio de los últimos {int(dias_ahorros_lkh)} días). "
             "Se muestran separados del cálculo físico para no descontarlos dos veces del balance."
         )
         lkh_ah1, lkh_ah2, lkh_ah3, lkh_ah4, lkh_ah5 = st.columns(5)
         lkh_ah1.metric(
             "Ahorro total LakeHouse",
-            f"{ahorro_lkh_total:.3f} hm³/d",
-            delta=f"{ahorro_lkh_total/CFS2HM3:.0f} cfs",
+            f"{_ah_tab_total:.3f} hm³/d",
+            delta=f"{_ah_tab_total/CFS2HM3:.0f} cfs",
         )
         lkh_ah2.metric(
             "NPX total LakeHouse",
-            f"{ahorro_lkh_npx_total:.3f} hm³/d" if ahorro_lkh_npx_total is not None else "—",
+            f"{_ah_tab_npx_total:.3f} hm³/d" if _ah_tab_npx_total is not None else "—",
             delta="NeoPanamax",
         )
         lkh_ah3.metric(
             "Tinas/WSB NPX",
-            f"{ahorro_lkh_npx_tinas:.3f} hm³/d" if ahorro_lkh_npx_tinas is not None else "—",
-            delta="LakeHouse" if ahorro_lkh_npx_tinas is not None else "sin columna",
+            f"{_ah_tab_npx_tinas:.3f} hm³/d" if _ah_tab_npx_tinas is not None else "—",
+            delta="LakeHouse" if _ah_tab_npx_tinas is not None else "sin columna",
         )
         lkh_ah4.metric(
             "Turn Around NPX",
-            f"{ahorro_lkh_npx_turnaround:.3f} hm³/d" if ahorro_lkh_npx_turnaround is not None else "—",
-            delta="LakeHouse" if ahorro_lkh_npx_turnaround is not None else "sin columna",
+            f"{_ah_tab_npx_turnaround:.3f} hm³/d" if _ah_tab_npx_turnaround is not None else "—",
+            delta="LakeHouse" if _ah_tab_npx_turnaround is not None else "sin columna",
         )
         lkh_ah5.metric(
             "PNX LakeHouse",
-            f"{ahorro_lkh_pnx:.3f} hm³/d" if ahorro_lkh_pnx is not None else "—",
-            delta="saving_water_panamax" if ahorro_lkh_pnx is not None else "sin columna",
+            f"{_ah_tab_pnx:.3f} hm³/d" if _ah_tab_pnx is not None else "—",
+            delta="saving_water_panamax" if _ah_tab_pnx is not None else "sin columna",
         )
         _rows_ah_lkh = []
         for _mec, _val, _es_volumen in [
-            ("PNX · ahorro total LakeHouse", ahorro_lkh_pnx, True),
-            ("NPX · ahorro total LakeHouse", ahorro_lkh_npx_total, True),
-            ("NPX · tinas/WSB LakeHouse", ahorro_lkh_npx_tinas, True),
-            ("NPX · Turn Around LakeHouse", ahorro_lkh_npx_turnaround, True),
-            ("NPX · CCA Neo", cca_neo_lkh, False),
+            ("PNX · ahorro total LakeHouse", _ah_tab_pnx, True),
+            ("NPX · ahorro total LakeHouse", _ah_tab_npx_total, True),
+            ("NPX · tinas/WSB LakeHouse", _ah_tab_npx_tinas, True),
+            ("NPX · Turn Around LakeHouse", _ah_tab_npx_turnaround, True),
+            ("NPX · tinas Agua Clara", _ah_tab_npx_ac, True),
+            ("NPX · tinas Cocolí", _ah_tab_npx_cc, True),
+            ("NPX · TA Agua Clara", _ah_tab_npx_ta_ac, True),
+            ("NPX · TA Cocolí", _ah_tab_npx_ta_cc, True),
+            ("NPX · CCA Neo", _ah_tab_cca, False),
         ]:
             if _val is not None:
                 if _es_volumen:
@@ -4712,6 +4844,10 @@ with tabs[8]:
                 {"Parámetro":"Ahorro LakeHouse NPX total","Valor":round(ahorro_lkh_npx_total,4) if ahorro_lkh_npx_total is not None else "N/D","Unidad":"hm³/día"},
                 {"Parámetro":"Ahorro LakeHouse NPX tinas/WSB","Valor":round(ahorro_lkh_npx_tinas,4) if ahorro_lkh_npx_tinas is not None else "N/D","Unidad":"hm³/día"},
                 {"Parámetro":"Ahorro LakeHouse NPX Turn Around","Valor":round(ahorro_lkh_npx_turnaround,4) if ahorro_lkh_npx_turnaround is not None else "N/D","Unidad":"hm³/día"},
+                {"Parámetro":"Ahorro LakeHouse NPX tinas Agua Clara","Valor":round(ahorro_lkh_npx_ac,4) if ahorro_lkh_npx_ac is not None else "N/D","Unidad":"hm³/día"},
+                {"Parámetro":"Ahorro LakeHouse NPX tinas Cocolí","Valor":round(ahorro_lkh_npx_cc,4) if ahorro_lkh_npx_cc is not None else "N/D","Unidad":"hm³/día"},
+                {"Parámetro":"Ahorro LakeHouse NPX TA Agua Clara","Valor":round(ahorro_lkh_npx_ta_ac,4) if ahorro_lkh_npx_ta_ac is not None else "N/D","Unidad":"hm³/día"},
+                {"Parámetro":"Ahorro LakeHouse NPX TA Cocolí","Valor":round(ahorro_lkh_npx_ta_cc,4) if ahorro_lkh_npx_ta_cc is not None else "N/D","Unidad":"hm³/día"},
                 {"Parámetro":"CCA Neo LakeHouse","Valor":round(cca_neo_lkh,4) if cca_neo_lkh is not None else "N/D","Unidad":"valor LakeHouse"},
                 {"Parámetro":"Vol PNX usado en balance","Valor":round(vp_balance,4),"Unidad":"hm³/escl"},
                 {"Parámetro":"Vol NPX usado en balance","Valor":round(vn_balance,4),"Unidad":"hm³/escl"},
@@ -4895,6 +5031,10 @@ with tabs[9]:
             elif cl=="vol_evap_ala_hm3":    rn[c]="evap_alh_hm3"
             elif cl=="saving_water_panamax":rn[c]="ahorro_pnx"
             elif cl=="total_saving_water_neo_hm3": rn[c]="ahorro_npx"
+            elif cl=="saving_water_ac_hm3":  rn[c]="ahorro_npx_ac"
+            elif cl=="saving_water_cc_hm3":  rn[c]="ahorro_npx_cc"
+            elif cl=="saving_water_ta_ac_hm3": rn[c]="ahorro_npx_ta_ac"
+            elif cl=="saving_water_ta_cc_hm3": rn[c]="ahorro_npx_ta_cc"
             elif cl=="cca_neo":              rn[c]="cca_neo_val"
             elif ("saving" in _norm_lkh_col(cl) and "water" in _norm_lkh_col(cl)
                   and ("neo" in _norm_lkh_col(cl) or "npx" in _norm_lkh_col(cl))
@@ -4915,6 +5055,21 @@ with tabs[9]:
         for c in set(rn.values()):
             if c in df and isinstance(df[c], pd.Series):
                 df[c]=pd.to_numeric(df[c],errors="coerce")
+        # Componentes de ahorro NeoPanamax provenientes del LakeHouse.
+        # Se agregan para que la pestaña 📂 Datos Lake House pueda promediar
+        # tinas normales y Turn Around por separado aunque el archivo también traiga el total consolidado.
+        if "ahorro_npx_ac" in df or "ahorro_npx_cc" in df:
+            df["ahorro_npx_tinas"] = sum(
+                df[c].fillna(0) for c in ["ahorro_npx_ac", "ahorro_npx_cc"] if c in df
+            )
+        if "ahorro_npx_ta_ac" in df or "ahorro_npx_ta_cc" in df:
+            df["ahorro_npx_turnaround"] = sum(
+                df[c].fillna(0) for c in ["ahorro_npx_ta_ac", "ahorro_npx_ta_cc"] if c in df
+            )
+        if "ahorro_npx" not in df and ("ahorro_npx_tinas" in df or "ahorro_npx_turnaround" in df):
+            df["ahorro_npx"] = sum(
+                df[c].fillna(0) for c in ["ahorro_npx_tinas", "ahorro_npx_turnaround"] if c in df
+            )
         if "gat_hm3" in df and "pm_hm3" in df:
             df["pnx_hm3"]=df["gat_hm3"].fillna(0)+df["pm_hm3"].fillna(0)
         if "acl_hm3" in df and "ccl_hm3" in df:
@@ -5207,6 +5362,10 @@ with tabs[9]:
             ("NPX · ahorro total", "ahorro_npx"),
             ("NPX · tinas/WSB", "ahorro_npx_tinas"),
             ("NPX · Turn Around", "ahorro_npx_turnaround"),
+            ("NPX · tinas Agua Clara", "ahorro_npx_ac"),
+            ("NPX · tinas Cocolí", "ahorro_npx_cc"),
+            ("NPX · TA Agua Clara", "ahorro_npx_ta_ac"),
+            ("NPX · TA Cocolí", "ahorro_npx_ta_cc"),
         ]
         _ah_lkh_rows = []
         for _label_ah, _col_ah in _ah_lkh_cols:
