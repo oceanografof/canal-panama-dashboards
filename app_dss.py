@@ -4438,7 +4438,74 @@ def tab_aportes_obs_semanal(
             resumen_embalse = pd.DataFrame(resumen_rows)
             st.dataframe(resumen_embalse, use_container_width=True, hide_index=True, height=180)
 
+    # Tarjetas adicionales solicitadas: promedio de las semanas que van.
+    # Se calcula con las semanas actualmente filtradas y pondera por días
+    # observados válidos para no mezclar una semana incompleta con una completa.
+    if not show_tbl.empty and obs_prom_col and dss_cercano_col:
+        promedio_cards: List[Dict[str, object]] = []
+        for embalse, g in show_tbl.sort_values(["Embalse", "Semana"]).groupby("Embalse", sort=True):
+            gg = g.copy()
+            obs_vals = pd.to_numeric(gg[obs_prom_col], errors="coerce")
+            dss_vals = pd.to_numeric(gg[dss_cercano_col], errors="coerce")
+            weights = pd.to_numeric(gg.get("Días obs. válidos", 1), errors="coerce").fillna(1)
+            weights = weights.where(weights > 0, 1)
+            valid = obs_vals.notna() & dss_vals.notna() & weights.notna()
+            if not valid.any():
+                continue
+
+            w = weights[valid].astype(float)
+            obs_weighted_sum = float((obs_vals[valid].astype(float) * w).sum())
+            dss_weighted_sum = float((dss_vals[valid].astype(float) * w).sum())
+            total_days = float(w.sum())
+            obs_prom_pond = obs_weighted_sum / total_days if total_days > 0 else np.nan
+            dss_prom_pond = dss_weighted_sum / total_days if total_days > 0 else np.nan
+            diff_prom_pond = obs_prom_pond - dss_prom_pond if pd.notna(obs_prom_pond) and pd.notna(dss_prom_pond) else np.nan
+            pct_acum = ((obs_weighted_sum - dss_weighted_sum) / abs(dss_weighted_sum) * 100.0) if abs(dss_weighted_sum) > 1e-9 else np.nan
+            semanas_validas = sorted(pd.to_numeric(gg.loc[valid, "Semana"], errors="coerce").dropna().astype(int).unique().tolist())
+            if not semanas_validas:
+                continue
+            semanas_txt = f"{semanas_validas[0]}-{semanas_validas[-1]}" if len(semanas_validas) > 1 else str(semanas_validas[0])
+
+            promedio_cards.append({
+                "Embalse": embalse,
+                "Semanas texto": semanas_txt,
+                "Cantidad semanas": int(len(semanas_validas)),
+                "Días obs. acumulados": int(total_days),
+                "Obs prom. ponderado": obs_prom_pond,
+                "DSS prom. ponderado": dss_prom_pond,
+                "Obs-DSS prom. ponderado": diff_prom_pond,
+                "Diferencia acumulada Obs-DSS (%)": pct_acum,
+            })
+
+        if promedio_cards:
+            st.markdown("#### Promedio de las semanas que van")
+            avg_cols = st.columns(len(promedio_cards))
+            for idx, item in enumerate(promedio_cards):
+                obs_txt = (
+                    f"{float(item['Obs prom. ponderado']):,.2f} {unit_label(flow_unit)}"
+                    if pd.notna(item.get("Obs prom. ponderado")) else "—"
+                )
+                delta_parts: List[str] = []
+                if pd.notna(item.get("Obs-DSS prom. ponderado")):
+                    delta_parts.append(f"Obs-DSS {float(item['Obs-DSS prom. ponderado']):+,.2f} {unit_label(flow_unit)}")
+                if pd.notna(item.get("Diferencia acumulada Obs-DSS (%)")):
+                    delta_parts.append(f"{float(item['Diferencia acumulada Obs-DSS (%)']):+,.2f}%")
+                delta_txt = " · ".join(delta_parts) if delta_parts else None
+                avg_cols[idx].metric(
+                    f"{item['Embalse']} · sem. {item['Semanas texto']} ({int(item['Cantidad semanas'])} sem.)",
+                    obs_txt,
+                    delta=delta_txt,
+                    delta_color="inverse",
+                    help=(
+                        "Promedio ponderado por los días observados válidos de las semanas filtradas. "
+                        f"Cantidad de semanas promediadas: {int(item['Cantidad semanas'])}. "
+                        f"Días observados acumulados: {int(item['Días obs. acumulados'])}. "
+                        f"AP DSS promedio ponderado: {float(item['DSS prom. ponderado']):,.2f} {unit_label(flow_unit)}."
+                    ) if pd.notna(item.get("DSS prom. ponderado")) else None,
+                )
+
     if not show_tbl.empty:
+        st.markdown("#### Última semana observada")
         latest = show_tbl.sort_values(["Embalse", "Semana"]).groupby("Embalse", as_index=False).tail(1)
         cols = st.columns(len(latest))
         for idx, (_, r) in enumerate(latest.iterrows()):
