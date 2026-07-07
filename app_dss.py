@@ -3692,6 +3692,63 @@ def build_percentile_export_table(
     return out
 
 
+def _safe_excel_sheet_name(name: object, fallback: str = "Hoja") -> str:
+    """Nombre de hoja Excel seguro: máximo 31 caracteres y sin caracteres inválidos."""
+    raw = str(name or fallback).strip() or fallback
+    raw = re.sub(r"[\[\]\:\*\?\/\\]", "_", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return (raw[:31] or fallback)
+
+
+def _safe_export_filename(text_value: object, fallback: str = "export") -> str:
+    """Nombre de archivo seguro para descargas desde Streamlit."""
+    raw = str(text_value or fallback).strip() or fallback
+    raw = raw.replace("³", "3").replace("ú", "u").replace("Ú", "U")
+    raw = re.sub(r"[^A-Za-z0-9_\-\.]+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip("._")
+    return raw or fallback
+
+
+def _excel_bytes_from_sheets(sheets: Dict[str, pd.DataFrame]) -> bytes:
+    """Genera un XLSX en memoria con una o varias hojas.
+
+    Se usa para evitar fallas de exportación cuando el usuario necesita bajar
+    resumen + promedios en un solo archivo. Si una hoja viene vacía, se omite.
+    """
+    bio = BytesIO()
+    wrote = False
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        used_names: set = set()
+        for raw_name, df in (sheets or {}).items():
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            sheet = _safe_excel_sheet_name(raw_name)
+            base = sheet
+            n = 2
+            while sheet in used_names:
+                suffix = f"_{n}"
+                sheet = _safe_excel_sheet_name(base[: max(1, 31 - len(suffix))] + suffix)
+                n += 1
+            used_names.add(sheet)
+            df.to_excel(writer, index=False, sheet_name=sheet)
+            wrote = True
+        if not wrote:
+            pd.DataFrame({"Mensaje": ["Sin datos para exportar"]}).to_excel(writer, index=False, sheet_name="Sin datos")
+    return bio.getvalue()
+
+
+def _reset_date_input_if_outside(key: str, mn, mx, default_value) -> None:
+    """Evita que un date_input conserve una fecha vieja fuera del nuevo rango."""
+    try:
+        current = st.session_state.get(key, None)
+        if current is None:
+            return
+        if current < mn or current > mx:
+            st.session_state[key] = default_value
+    except Exception:
+        pass
+
+
 def tab_exportar_percentil(
     dss_bytes: bytes,
     flow_unit: str,
@@ -3702,7 +3759,14 @@ def tab_exportar_percentil(
     obs_gat_aporte: Optional[pd.DataFrame] = None,
     obs_alh_aporte: Optional[pd.DataFrame] = None,
 ) -> None:
-    """Pestaña para exportar el percentil elegido por embalse."""
+    """Pestaña para exportar el percentil elegido por embalse.
+
+    Corrección defensiva:
+    - los filtros de fecha usan llaves únicas por embalse/percentil/rango;
+    - se limpia la columna Fecha antes de filtrar;
+    - si el filtro deja la tabla vacía, se avisa y no se rompe el tablero;
+    - CSV/Excel usan llaves únicas para evitar conflictos de Streamlit.
+    """
     st.subheader("⬇️ Exportar percentil DSS")
     st.caption("Exporta el percentil escogido para el embalse seleccionado, incluyendo nivel, hidrogeneración, aportes, vertidos y esclusajes cuando existan en el DSS.")
 
@@ -3715,7 +3779,7 @@ def tab_exportar_percentil(
         PERCENTILE_ORDER,
         index=PERCENTILE_ORDER.index(pct_default) if pct_default in PERCENTILE_ORDER else PERCENTILE_ORDER.index(50),
         format_func=lambda x: f"P{x}",
-        key="exp_pct",
+        key=f"exp_pct_{res_key}",
     )
     evap = evap_gat_cfs if res_key == "gatun" else evap_alh_cfs
     obs_ap_df = obs_gat_aporte if res_key == "gatun" else obs_alh_aporte
@@ -3727,7 +3791,7 @@ def tab_exportar_percentil(
             simular_hidro_mayo = st.checkbox(
                 "🌊 Simular hidrograma observado mayo-junio",
                 value=bool(st.session_state.get("ap_hydrograph_enabled", False)),
-                key="exp_simular_hidro_mayo",
+                key=f"exp_simular_hidro_mayo_{res_key}",
                 help=(
                     "Redistribuye diariamente el AP DSS usando la forma observada de la última semana de mayo "
                     "y las tres semanas siguientes de junio. Conserva la suma/promedio semanal del DSS; "
@@ -3738,14 +3802,14 @@ def tab_exportar_percentil(
             sumar_evap_ap = st.checkbox(
                 "➕ Sumar evaporación al AP del percentil",
                 value=True,
-                key="exp_sumar_evap_ap",
+                key=f"exp_sumar_evap_ap_{res_key}",
                 help="Calcula AP base = AP neto DSS del percentil seleccionado + caudal evaporado.",
             )
         with c3:
             incluir_ap_neto = st.checkbox(
                 "Mostrar también AP neto",
                 value=True,
-                key="exp_incluir_ap_neto",
+                key=f"exp_incluir_ap_neto_{res_key}",
                 help="Incluye una columna separada con el AP neto DSS antes de sumar evaporación.",
             )
         with c4:
@@ -3756,7 +3820,7 @@ def tab_exportar_percentil(
                 value=0.0,
                 step=5.0,
                 format="%.1f",
-                key="exp_ap_reduction_pct",
+                key=f"exp_ap_reduction_pct_{res_key}",
                 help=(
                     "Descuenta el porcentaje indicado al AP que se va a exportar. "
                     "Ejemplo: 20% exporta el 80% de AP neto + evaporación."
@@ -3772,9 +3836,9 @@ def tab_exportar_percentil(
         daily = to_daily(raw, cfg)
         daily = apply_may_hydrograph_ap_adjustment(daily, cfg, obs_ap_df, enabled=simular_hidro_mayo)
     except Exception as exc:
-        st.error(f"Error cargando DSS: {exc}")
+        st.error(f"Error cargando DSS para exportación: {exc}")
         return
-    if daily.empty:
+    if daily is None or daily.empty:
         st.warning("No se pudo construir el diario DSS para exportación.")
         return
 
@@ -3810,44 +3874,63 @@ def tab_exportar_percentil(
         ap_distribution_label=ap_distribution_label,
         ap_reduction_pct=float(ap_reduction_pct or 0.0),
     )
-    if table.empty:
+    if table is None or table.empty:
         st.warning("No hay datos para exportar.")
         return
 
+    table = table.copy()
+    table["Fecha"] = pd.to_datetime(table["Fecha"], errors="coerce")
+    table = table.dropna(subset=["Fecha"]).sort_values("Fecha")
+    if table.empty:
+        st.warning("La tabla de exportación no contiene fechas válidas.")
+        return
+
     with st.expander("🗓️ Filtro de período para exportar", expanded=True):
-        mn, mx = table["Fecha"].min().date(), table["Fecha"].max().date()
+        mn_dt = pd.to_datetime(table["Fecha"].min()).date()
+        mx_dt = pd.to_datetime(table["Fecha"].max()).date()
+        date_suffix = f"{res_key}_p{int(pct)}_{mn_dt:%Y%m%d}_{mx_dt:%Y%m%d}"
+        s_key = f"exp_s_{date_suffix}"
+        e_key = f"exp_e_{date_suffix}"
+        _reset_date_input_if_outside(s_key, mn_dt, mx_dt, mn_dt)
+        _reset_date_input_if_outside(e_key, mn_dt, mx_dt, mx_dt)
         c1, c2 = st.columns(2)
-        s = c1.date_input("Desde", value=mn, min_value=mn, max_value=mx, key="exp_s")
-        e = c2.date_input("Hasta", value=mx, min_value=mn, max_value=mx, key="exp_e")
+        s = c1.date_input("Desde", value=mn_dt, min_value=mn_dt, max_value=mx_dt, key=s_key)
+        e = c2.date_input("Hasta", value=mx_dt, min_value=mn_dt, max_value=mx_dt, key=e_key)
+
     if s <= e:
         table = table[(table["Fecha"].dt.date >= s) & (table["Fecha"].dt.date <= e)].copy()
     else:
-        st.warning("Fecha inicial mayor que final. Se exporta el período completo.")
+        st.warning("Fecha inicial mayor que final. Se mantiene el período completo.")
+
+    if table.empty:
+        st.warning("El filtro seleccionado no dejó datos para exportar. Ajuste el rango de fechas.")
+        return
 
     # Resumen operativo rápido para confirmar que las opciones seleccionadas
     # están haciendo lo esperado antes de descargar el archivo.
-    ap_export_cols = [c for c in table.columns if c.startswith("AP exportable") and f"({unit_label(flow_unit)})" in c]
-    ap_total_cols = [c for c in table.columns if c.startswith("AP total DSS") and f"({unit_label(flow_unit)})" in c]
-    ap_neto_cols = [c for c in table.columns if c.startswith("AP neto DSS") and f"({unit_label(flow_unit)})" in c]
-    evap_cols = [c for c in table.columns if c.startswith("Evaporación sumada") and f"({unit_label(flow_unit)})" in c]
-    reduction_cols = [c for c in table.columns if c.startswith("Descuento AP exportado") and f"({unit_label(flow_unit)})" in c]
+    unit_txt = unit_label(flow_unit)
+    ap_export_cols = [c for c in table.columns if c.startswith("AP exportable") and f"({unit_txt})" in c]
+    ap_total_cols = [c for c in table.columns if c.startswith("AP total DSS") and f"({unit_txt})" in c]
+    ap_neto_cols = [c for c in table.columns if c.startswith("AP neto DSS") and f"({unit_txt})" in c]
+    evap_cols = [c for c in table.columns if c.startswith("Evaporación sumada") and f"({unit_txt})" in c]
+    reduction_cols = [c for c in table.columns if c.startswith("Descuento AP exportado") and f"({unit_txt})" in c]
     m1, m2, m3, m4 = st.columns(4)
     if ap_neto_cols:
-        m1.metric(f"AP neto medio ({unit_label(flow_unit)})", f"{pd.to_numeric(table[ap_neto_cols[0]], errors='coerce').mean():,.3f}")
+        m1.metric(f"AP neto medio ({unit_txt})", f"{pd.to_numeric(table[ap_neto_cols[0]], errors='coerce').mean():,.3f}")
     else:
         m1.metric("AP neto medio", "—")
     if ap_export_cols:
-        m2.metric(f"AP exportable medio ({unit_label(flow_unit)})", f"{pd.to_numeric(table[ap_export_cols[0]], errors='coerce').mean():,.3f}")
+        m2.metric(f"AP exportable medio ({unit_txt})", f"{pd.to_numeric(table[ap_export_cols[0]], errors='coerce').mean():,.3f}")
     elif ap_total_cols:
-        m2.metric(f"AP total medio ({unit_label(flow_unit)})", f"{pd.to_numeric(table[ap_total_cols[0]], errors='coerce').mean():,.3f}")
+        m2.metric(f"AP total medio ({unit_txt})", f"{pd.to_numeric(table[ap_total_cols[0]], errors='coerce').mean():,.3f}")
     else:
         m2.metric("AP exportable medio", "—")
     if reduction_cols:
-        m3.metric(f"Reducción media ({unit_label(flow_unit)})", f"{pd.to_numeric(table[reduction_cols[0]], errors='coerce').mean():,.3f}")
+        m3.metric(f"Reducción media ({unit_txt})", f"{pd.to_numeric(table[reduction_cols[0]], errors='coerce').mean():,.3f}")
     else:
         m3.metric("Reducción media", "0.000")
     if evap_cols:
-        m4.metric(f"Evaporación sumada ({unit_label(flow_unit)})", f"{pd.to_numeric(table[evap_cols[0]], errors='coerce').mean():,.3f}")
+        m4.metric(f"Evaporación sumada ({unit_txt})", f"{pd.to_numeric(table[evap_cols[0]], errors='coerce').mean():,.3f}")
     else:
         m4.metric("Evaporación sumada", "—")
 
@@ -3864,29 +3947,32 @@ def tab_exportar_percentil(
                     mode="lines+markers",
                     name=col,
                 ))
-            fig.update_layout(**_base_layout("AP exportado del percentil seleccionado", unit_label(flow_unit), height=420))
+            fig.update_layout(**_base_layout("AP exportado del percentil seleccionado", unit_txt, height=420))
             _today_line(fig, table["Fecha"])
-            st.plotly_chart(fig, use_container_width=True, key="exp_ap_preview")
+            st.plotly_chart(fig, use_container_width=True, key=f"exp_ap_preview_{res_key}_{int(pct)}")
 
     st.dataframe(table, use_container_width=True, hide_index=True, height=520)
     try:
         reduction_tag = f"_menos{float(ap_reduction_pct):g}pct" if float(ap_reduction_pct or 0.0) > 0 else ""
     except Exception:
         reduction_tag = ""
-    fname_base = f"export_{cfg['token']}_P{int(pct)}{reduction_tag}".replace(" ", "_").replace(".", "p")
-    csv = table.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ Descargar CSV", csv, f"{fname_base}.csv", "text/csv", key="exp_csv")
+    fname_base = _safe_export_filename(f"export_{cfg['token']}_P{int(pct)}{reduction_tag}")
+    key_suffix = _safe_export_filename(f"{res_key}_p{int(pct)}_{flow_unit}_{float(ap_reduction_pct or 0):g}")
 
     try:
-        bio = BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            table.to_excel(writer, index=False, sheet_name=f"{cfg['token']}_P{int(pct)}"[:31])
+        csv = table.to_csv(index=False).encode("utf-8-sig")
+        st.download_button("⬇️ Descargar CSV", csv, f"{fname_base}.csv", "text/csv", key=f"exp_csv_{key_suffix}")
+    except Exception as exc:
+        st.warning(f"No se pudo generar el CSV de exportación. Detalle: {exc}")
+
+    try:
+        xlsx = _excel_bytes_from_sheets({f"{cfg['token']}_P{int(pct)}": table})
         st.download_button(
             "⬇️ Descargar Excel",
-            bio.getvalue(),
+            xlsx,
             f"{fname_base}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="exp_xlsx",
+            key=f"exp_xlsx_{key_suffix}",
         )
     except Exception as exc:
         st.warning(f"No se pudo generar Excel; use el CSV. Detalle: {exc}")
@@ -4344,6 +4430,8 @@ def tab_aportes_obs_semanal(
         + " a " + table["Fin semana"].astype(str)
     )
     detail_table = pd.concat(details, ignore_index=True) if details else pd.DataFrame()
+    resumen_embalse = pd.DataFrame()
+    promedio_cards_df = pd.DataFrame()
 
     min_week = int(table["Semana"].min())
     max_week = int(table["Semana"].max())
@@ -4478,6 +4566,10 @@ def tab_aportes_obs_semanal(
             })
 
         if promedio_cards:
+            promedio_cards_df = pd.DataFrame(promedio_cards)
+            for _c in ["Obs prom. ponderado", "DSS prom. ponderado", "Obs-DSS prom. ponderado", "Diferencia acumulada Obs-DSS (%)"]:
+                if _c in promedio_cards_df.columns:
+                    promedio_cards_df[_c] = pd.to_numeric(promedio_cards_df[_c], errors="coerce").round(3)
             st.markdown("#### Promedio de las semanas que van")
             avg_cols = st.columns(len(promedio_cards))
             for idx, item in enumerate(promedio_cards):
@@ -4526,14 +4618,36 @@ def tab_aportes_obs_semanal(
             )
 
     csv_source = show_display if "show_display" in locals() else show_tbl
-    csv = csv_source.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "⬇️ Descargar resumen semanal observado vs DSS",
-        csv,
-        "aporte_observado_semanal_vs_dss.csv",
-        "text/csv",
-        key="apw_dl",
-    )
+    try:
+        csv = csv_source.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ Descargar resumen semanal observado vs DSS",
+            csv,
+            "aporte_observado_semanal_vs_dss.csv",
+            "text/csv",
+            key=f"apw_dl_{week_start}",
+        )
+    except Exception as exc:
+        st.warning(f"No se pudo generar el CSV del resumen semanal. Detalle: {exc}")
+
+    # Exportación completa del resumen semanal: incluye la tabla semanal,
+    # el acumulado por embalse y el promedio de las semanas que van.
+    try:
+        sheets_export = {
+            "Resumen semanal": csv_source,
+            "Promedio semanas": promedio_cards_df,
+            "Acumulado embalse": resumen_embalse,
+        }
+        xlsx_week = _excel_bytes_from_sheets(sheets_export)
+        st.download_button(
+            "⬇️ Descargar Excel resumen + promedios",
+            xlsx_week,
+            "aporte_observado_semanal_vs_dss_promedios.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"apw_xlsx_{week_start}",
+        )
+    except Exception as exc:
+        st.warning(f"No se pudo generar el Excel semanal; use el CSV. Detalle: {exc}")
 
     if PLOTLY_OK and not show_tbl.empty:
         obs_col = next((c for c in show_tbl.columns if c.startswith("Aporte observado prom.")), None)
