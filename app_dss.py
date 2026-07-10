@@ -3646,7 +3646,10 @@ def _build_9798_entity_daily(
     for df in (wide, dss_daily, obs_daily):
         if isinstance(df, pd.DataFrame) and not df.empty:
             base = base.merge(df, on="Fecha_dia", how="left")
-    for c in ["Hist_1997_cfs", "Hist_1998_cfs", "DSS_cfs", "Obs_cfs"]:
+    for c in [
+        "Hist_1997_cfs", "Hist_1998_cfs", "DSS_cfs", "DSS_base_cfs",
+        "DSS_reduction_cfs", "DSS_reduction_pct", "Obs_cfs",
+    ]:
         if c not in base.columns:
             base[c] = np.nan
         base[c] = pd.to_numeric(base[c], errors="coerce")
@@ -3656,7 +3659,10 @@ def _build_9798_entity_daily(
 
 def _sum_chcp_9798(gat: pd.DataFrame, alh: pd.DataFrame) -> pd.DataFrame:
     """Suma GAT + ALHA por fecha; exige ambos componentes para reportar CHCP."""
-    cols = ["Hist_1997_cfs", "Hist_1998_cfs", "Hist_prom_9798_cfs", "Obs_cfs", "DSS_cfs"]
+    cols = [
+        "Hist_1997_cfs", "Hist_1998_cfs", "Hist_prom_9798_cfs",
+        "Obs_cfs", "DSS_cfs", "DSS_base_cfs", "DSS_reduction_cfs",
+    ]
     g = gat[["Fecha_dia"] + cols].copy() if isinstance(gat, pd.DataFrame) and not gat.empty else pd.DataFrame()
     a = alh[["Fecha_dia"] + cols].copy() if isinstance(alh, pd.DataFrame) and not alh.empty else pd.DataFrame()
     if g.empty and a.empty:
@@ -3808,7 +3814,8 @@ def _nearest_ap_dss_daily_9798(
     AP neto DSS + evaporación.
     """
     columns = [
-        "Fecha_dia", "DSS_cfs", "DSS_percentil", "DSS_label",
+        "Fecha_dia", "DSS_cfs", "DSS_base_cfs", "DSS_reduction_cfs",
+        "DSS_reduction_pct", "DSS_percentil", "DSS_label",
         "DSS_fecha_usada", "DSS_fecha_exacta",
     ]
     if daily is None or daily.empty:
@@ -3833,9 +3840,13 @@ def _nearest_ap_dss_daily_9798(
         )
         if not nearest:
             continue
+        dss_base_cfs = float(nearest["dss_total_cfs"])
         rows.append({
             "Fecha_dia": fecha.normalize(),
-            "DSS_cfs": float(nearest["dss_total_cfs"]),
+            "DSS_cfs": dss_base_cfs,
+            "DSS_base_cfs": dss_base_cfs,
+            "DSS_reduction_cfs": 0.0,
+            "DSS_reduction_pct": 0.0,
             "DSS_percentil": int(nearest["percentile"]),
             "DSS_label": str(nearest["label"]),
             "DSS_fecha_usada": pd.to_datetime(nearest["date"]).normalize(),
@@ -3861,13 +3872,84 @@ def _fixed_ap_dss_daily_9798(
     """Devuelve un percentil AP DSS fijo y añade su etiqueta por fecha."""
     out, pct_used = _selected_ap_dss_9798(daily, cfg, pct_ref, evap_cfs)
     if out is None or out.empty:
-        return pd.DataFrame(columns=["Fecha_dia", "DSS_cfs", "DSS_percentil", "DSS_label"]), pct_used
+        return pd.DataFrame(columns=[
+            "Fecha_dia", "DSS_cfs", "DSS_base_cfs", "DSS_reduction_cfs",
+            "DSS_reduction_pct", "DSS_percentil", "DSS_label",
+        ]), pct_used
     result = out.copy()
+    result["DSS_base_cfs"] = pd.to_numeric(result["DSS_cfs"], errors="coerce")
+    result["DSS_reduction_cfs"] = 0.0
+    result["DSS_reduction_pct"] = 0.0
     result["DSS_percentil"] = int(pct_used) if pct_used is not None else np.nan
     result["DSS_label"] = f"P{int(pct_used)}" if pct_used is not None else "—"
     result["DSS_fecha_usada"] = result["Fecha_dia"]
     result["DSS_fecha_exacta"] = True
     return result, pct_used
+
+
+def _clean_dss_reduction_pct_9798(value: object) -> float:
+    """Normaliza la reducción manual del aporte DSS entre 0% y 95%."""
+    try:
+        pct = float(value or 0.0)
+    except Exception:
+        pct = 0.0
+    if not np.isfinite(pct):
+        pct = 0.0
+    return max(0.0, min(95.0, pct))
+
+
+def _apply_dss_reduction_daily_9798(
+    dss_daily: pd.DataFrame,
+    reduction_pct: float,
+) -> pd.DataFrame:
+    """Aplica la reducción después de elegir el percentil DSS de referencia.
+
+    Fórmula exacta:
+        DSS ajustado = DSS base × (1 - reducción / 100)
+
+    La selección del percentil no cambia: primero se identifica la curva DSS
+    más cercana al observado (o P95 fijo) y luego se descuenta el porcentaje.
+    """
+    if dss_daily is None or dss_daily.empty:
+        return dss_daily
+    out = dss_daily.copy()
+    pct = _clean_dss_reduction_pct_9798(reduction_pct)
+    base = pd.to_numeric(
+        out["DSS_base_cfs"] if "DSS_base_cfs" in out.columns else out.get("DSS_cfs"),
+        errors="coerce",
+    )
+    out["DSS_base_cfs"] = base
+    out["DSS_reduction_pct"] = pct
+    out["DSS_reduction_cfs"] = base * (pct / 100.0)
+    out["DSS_cfs"] = base * (1.0 - pct / 100.0)
+    return out
+
+
+def _suggest_dss_reduction_pct_9798(
+    daily: pd.DataFrame,
+    hist_year: int,
+    target: str = "observado",
+) -> Optional[float]:
+    """Sugiere cuánto restar al DSS base para acercarlo al observado o histórico."""
+    if daily is None or daily.empty:
+        return None
+    hist_col = f"Hist_{int(hist_year)}_cfs"
+    base = pd.to_numeric(
+        daily.get("DSS_base_cfs", daily.get("DSS_cfs")), errors="coerce"
+    )
+    if str(target).lower().startswith("hist") or str(target).startswith(str(hist_year)):
+        ref = pd.to_numeric(daily.get(hist_col), errors="coerce")
+    else:
+        ref = pd.to_numeric(daily.get("Obs_cfs"), errors="coerce")
+    valid = base.notna() & ref.notna() & (base > 0)
+    if not valid.any():
+        return None
+    base_mean = float(base.loc[valid].mean())
+    ref_mean = float(ref.loc[valid].mean())
+    if not np.isfinite(base_mean) or base_mean <= 0 or not np.isfinite(ref_mean):
+        return None
+    # Solo se permite restar. Si el DSS ya está por debajo, la sugerencia es 0%.
+    return _clean_dss_reduction_pct_9798(max(0.0, (1.0 - ref_mean / base_mean) * 100.0))
 
 
 def _sum_chcp_9798_enhanced(gat: pd.DataFrame, alh: pd.DataFrame) -> pd.DataFrame:
@@ -3970,6 +4052,7 @@ def _aggregate_selected_history_9798(
     for period, group in base.groupby("Periodo", sort=True):
         obs = pd.to_numeric(group.get("Obs_cfs"), errors="coerce")
         dss = pd.to_numeric(group.get("DSS_cfs"), errors="coerce")
+        dss_base = pd.to_numeric(group.get("DSS_base_cfs", group.get("DSS_cfs")), errors="coerce")
         hist = pd.to_numeric(group.get(hist_col), errors="coerce")
         triple = obs.notna() & dss.notna() & hist.notna()
 
@@ -3981,6 +4064,7 @@ def _aggregate_selected_history_9798(
 
         obs_used = pd.to_numeric(used.get("Obs_cfs"), errors="coerce")
         dss_used = pd.to_numeric(used.get("DSS_cfs"), errors="coerce")
+        dss_base_used = pd.to_numeric(used.get("DSS_base_cfs", used.get("DSS_cfs")), errors="coerce")
         hist_used = pd.to_numeric(used.get(hist_col), errors="coerce")
 
         row: Dict[str, object] = {
@@ -3989,6 +4073,7 @@ def _aggregate_selected_history_9798(
             "Dias_comunes": int(triple.sum()),
             "DSS_label": _representative_dss_label_9798(group.get("DSS_label", pd.Series(dtype=str))),
             "Obs_cfs": float(obs_used.mean()) if obs_used.notna().any() else np.nan,
+            "DSS_base_cfs": float(dss_base_used.mean()) if dss_base_used.notna().any() else np.nan,
             "DSS_cfs": float(dss_used.mean()) if dss_used.notna().any() else np.nan,
             "Hist_ref_cfs": float(hist_used.mean()) if hist_used.notna().any() else np.nan,
         }
@@ -3999,7 +4084,9 @@ def _aggregate_selected_history_9798(
         return out
     out["Deficit_Obs_vs_Hist_pct"] = _deficit_pct_9798(out["Obs_cfs"], out["Hist_ref_cfs"])
     out["Deficit_DSS_vs_Hist_pct"] = _deficit_pct_9798(out["DSS_cfs"], out["Hist_ref_cfs"])
+    out["Deficit_Obs_vs_DSS_pct"] = _deficit_pct_9798(out["Obs_cfs"], out["DSS_cfs"])
     out["Dif_Obs_vs_DSS_pct"] = _pct_series_9798(out["Obs_cfs"], out["DSS_cfs"])
+    out["Reduccion_DSS_pct"] = _deficit_pct_9798(out["DSS_cfs"], out["DSS_base_cfs"])
     return out.sort_values("Periodo").reset_index(drop=True)
 
 
@@ -4009,6 +4096,7 @@ def _detail_selected_history_9798(
     hist_year: int,
     flow_unit: str,
     mode: str,
+    reduction_label: str = "0%",
 ) -> pd.DataFrame:
     """Tabla legible por sistema para pantalla y exportación."""
     if agg is None or agg.empty:
@@ -4018,15 +4106,19 @@ def _detail_selected_history_9798(
         "Período": agg["Periodo"].map(lambda v: _period_label_9798(v, mode)),
         "Sistema": entity_label,
         "P DSS cercano": agg["DSS_label"],
-        f"DSS cercano ({unit})": convert_flow(agg["DSS_cfs"], flow_unit),
+        "Reducción DSS aplicada": reduction_label,
+        f"DSS base ({unit})": convert_flow(agg.get("DSS_base_cfs", agg["DSS_cfs"]), flow_unit),
+        f"DSS ajustado ({unit})": convert_flow(agg["DSS_cfs"], flow_unit),
         f"Observado ({unit})": convert_flow(agg["Obs_cfs"], flow_unit),
         f"Aporte {hist_year} ({unit})": convert_flow(agg["Hist_ref_cfs"], flow_unit),
         f"Déficit observado vs {hist_year} (%)": agg["Deficit_Obs_vs_Hist_pct"],
-        f"Déficit DSS vs {hist_year} (%)": agg["Deficit_DSS_vs_Hist_pct"],
-        "Diferencia observado vs DSS (%)": agg["Dif_Obs_vs_DSS_pct"],
+        f"Déficit DSS ajustado vs {hist_year} (%)": agg["Deficit_DSS_vs_Hist_pct"],
+        "Déficit observado vs DSS ajustado (%)": agg["Deficit_Obs_vs_DSS_pct"],
         "Días comunes": agg["Dias_comunes"],
     })
-    numeric_cols = [c for c in out.columns if c not in {"Período", "Sistema", "P DSS cercano"}]
+    numeric_cols = [c for c in out.columns if c not in {
+        "Período", "Sistema", "P DSS cercano", "Reducción DSS aplicada"
+    }]
     for c in numeric_cols:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
     return out
@@ -4081,6 +4173,7 @@ def _plot_selected_history_hydrograph_9798(
     flow_unit: str,
     mode: str,
     key: str,
+    reduction_label: str = "0%",
 ) -> None:
     """Hidrograma independiente: histórico, observado y DSS más cercano."""
     if agg is None or agg.empty:
@@ -4103,7 +4196,7 @@ def _plot_selected_history_hydrograph_9798(
         ))
         fig.add_trace(go.Scatter(
             x=plot["Periodo"], y=plot["DSS"], mode=marker_mode,
-            name="DSS más cercano",
+            name=f"DSS más cercano ajustado ({reduction_label})",
             text=plot["DSS_label"],
             line={"color": "#f59e0b", "width": 3, "dash": "dash"},
             hovertemplate=(
@@ -4118,7 +4211,7 @@ def _plot_selected_history_hydrograph_9798(
             connectgaps=False,
         ))
         fig.update_layout(**_base_layout(
-            f"{entity_label} · Observado vs DSS más cercano vs {hist_year}",
+            f"{entity_label} · Observado vs DSS ajustado vs {hist_year}",
             unit,
             height=455,
         ))
@@ -4209,15 +4302,21 @@ def _exact_summary_row_9798(
     used = work.loc[mask].copy()
     obs_mean = float(pd.to_numeric(used["Obs_cfs"], errors="coerce").mean())
     dss_mean = float(pd.to_numeric(used["DSS_cfs"], errors="coerce").mean())
+    dss_base_mean = float(pd.to_numeric(
+        used.get("DSS_base_cfs", used["DSS_cfs"]), errors="coerce"
+    ).mean())
     hist_mean = float(pd.to_numeric(used[hist_col], errors="coerce").mean())
     return {
         "DSS_label": _representative_dss_label_9798(used.get("DSS_label", pd.Series(dtype=str))),
         "Obs_cfs": obs_mean,
+        "DSS_base_cfs": dss_base_mean,
         "DSS_cfs": dss_mean,
         "Hist_ref_cfs": hist_mean,
         "Deficit_Obs_vs_Hist_pct": float(_deficit_pct_9798(pd.Series([obs_mean]), pd.Series([hist_mean])).iloc[0]),
         "Deficit_DSS_vs_Hist_pct": float(_deficit_pct_9798(pd.Series([dss_mean]), pd.Series([hist_mean])).iloc[0]),
+        "Deficit_Obs_vs_DSS_pct": float(_deficit_pct_9798(pd.Series([obs_mean]), pd.Series([dss_mean])).iloc[0]),
         "Dif_Obs_vs_DSS_pct": float(_pct_series_9798(pd.Series([obs_mean]), pd.Series([dss_mean])).iloc[0]),
+        "Reduccion_DSS_pct": float(_deficit_pct_9798(pd.Series([dss_mean]), pd.Series([dss_base_mean])).iloc[0]),
         "Dias_comunes": int(mask.sum()),
     }
 
@@ -4372,6 +4471,249 @@ def _summary_cards_tracking_9798(
         )
 
 
+
+def _reduction_label_9798(entity: str, reduction_gat_pct: float, reduction_alh_pct: float) -> str:
+    """Etiqueta legible del descuento aplicado a cada sistema."""
+    rg = _clean_dss_reduction_pct_9798(reduction_gat_pct)
+    ra = _clean_dss_reduction_pct_9798(reduction_alh_pct)
+    if entity == "Gatún":
+        return f"-{rg:g}%"
+    if entity == "Alhajuela / Madden":
+        return f"-{ra:g}%"
+    return f"GAT -{rg:g}% + ALHA -{ra:g}%"
+
+
+def _three_series_table_9798(
+    aggs: Dict[str, pd.DataFrame],
+    hist_year: int,
+    flow_unit: str,
+    mode: str,
+    reduction_gat_pct: float,
+    reduction_alh_pct: float,
+) -> pd.DataFrame:
+    """Tabla ordenada para comparar observado, DSS ajustado e histórico."""
+    unit = unit_label(flow_unit)
+    entity_order = {
+        "Gatún": 0,
+        "Alhajuela / Madden": 1,
+        "CHCP · GAT + ALHA": 2,
+    }
+    rows: List[Dict[str, object]] = []
+    for entity, order in entity_order.items():
+        agg = aggs.get(entity, pd.DataFrame())
+        if agg is None or agg.empty:
+            continue
+        for row in agg.itertuples(index=False):
+            rows.append({
+                "_periodo_dt": pd.to_datetime(getattr(row, "Periodo"), errors="coerce"),
+                "_orden": order,
+                "Período": _period_label_9798(getattr(row, "Periodo"), mode),
+                "Sistema": entity.replace("CHCP · GAT + ALHA", "CHCP"),
+                "P DSS cercano": getattr(row, "DSS_label", "—"),
+                "Reducción DSS": _reduction_label_9798(
+                    entity, reduction_gat_pct, reduction_alh_pct
+                ),
+                f"Observado ({unit})": convert_flow(
+                    pd.Series([getattr(row, "Obs_cfs", np.nan)]), flow_unit
+                ).iloc[0],
+                f"DSS ajustado ({unit})": convert_flow(
+                    pd.Series([getattr(row, "DSS_cfs", np.nan)]), flow_unit
+                ).iloc[0],
+                f"Aporte {hist_year} ({unit})": convert_flow(
+                    pd.Series([getattr(row, "Hist_ref_cfs", np.nan)]), flow_unit
+                ).iloc[0],
+                "Déficit Obs vs DSS ajustado (%)": getattr(
+                    row, "Deficit_Obs_vs_DSS_pct", np.nan
+                ),
+                f"Déficit Obs vs {hist_year} (%)": getattr(
+                    row, "Deficit_Obs_vs_Hist_pct", np.nan
+                ),
+                f"Déficit DSS ajustado vs {hist_year} (%)": getattr(
+                    row, "Deficit_DSS_vs_Hist_pct", np.nan
+                ),
+                "Días exactos comparados": getattr(row, "Dias_comunes", np.nan),
+            })
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows).sort_values(["_periodo_dt", "_orden"]).drop(
+        columns=["_periodo_dt", "_orden"]
+    ).reset_index(drop=True)
+    for col in out.columns:
+        if col in {"Período", "Sistema", "P DSS cercano", "Reducción DSS"}:
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+        if "Días" in col:
+            out[col] = out[col].round(0).astype("Int64")
+        else:
+            out[col] = out[col].round(2)
+    return out
+
+
+def _exact_three_series_summary_9798(
+    filtered_daily: Dict[str, pd.DataFrame],
+    hist_year: int,
+    flow_unit: str,
+    reduction_gat_pct: float,
+    reduction_alh_pct: float,
+) -> pd.DataFrame:
+    """Resumen exacto ponderado por cada día común del período completo."""
+    unit = unit_label(flow_unit)
+    rows: List[Dict[str, object]] = []
+    for entity in ["Gatún", "Alhajuela / Madden", "CHCP · GAT + ALHA"]:
+        summary = _exact_summary_row_9798(filtered_daily.get(entity, pd.DataFrame()), hist_year)
+        if not summary:
+            continue
+        rows.append({
+            "Sistema": entity.replace("CHCP · GAT + ALHA", "CHCP"),
+            "P DSS cercano": summary["DSS_label"],
+            "Reducción DSS": _reduction_label_9798(
+                entity, reduction_gat_pct, reduction_alh_pct
+            ),
+            f"Observado ({unit})": convert_flow(
+                pd.Series([summary["Obs_cfs"]]), flow_unit
+            ).iloc[0],
+            f"DSS ajustado ({unit})": convert_flow(
+                pd.Series([summary["DSS_cfs"]]), flow_unit
+            ).iloc[0],
+            f"Aporte {hist_year} ({unit})": convert_flow(
+                pd.Series([summary["Hist_ref_cfs"]]), flow_unit
+            ).iloc[0],
+            "Déficit Obs vs DSS ajustado (%)": summary["Deficit_Obs_vs_DSS_pct"],
+            f"Déficit Obs vs {hist_year} (%)": summary["Deficit_Obs_vs_Hist_pct"],
+            f"Déficit DSS ajustado vs {hist_year} (%)": summary["Deficit_DSS_vs_Hist_pct"],
+            "Días exactos comparados": summary["Dias_comunes"],
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    for col in out.columns:
+        if col in {"Sistema", "P DSS cercano", "Reducción DSS"}:
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+        if "Días" in col:
+            out[col] = out[col].round(0).astype("Int64")
+        else:
+            out[col] = out[col].round(2)
+    return out
+
+
+def _style_three_series_table_9798(table: pd.DataFrame):
+    """Distingue visualmente las tres series y los déficits."""
+    if table is None or table.empty:
+        return table
+    formats: Dict[str, str] = {}
+    for col in table.columns:
+        if "Días" in col:
+            formats[col] = "{:.0f}"
+        elif "(%)" in col:
+            formats[col] = "{:+.2f}"
+        elif col not in {"Período", "Sistema", "P DSS cercano", "Reducción DSS"}:
+            formats[col] = "{:,.2f}"
+    styler = table.style.format(formats, na_rep="—")
+    obs_cols = [c for c in table.columns if c.startswith("Observado")]
+    dss_cols = [c for c in table.columns if c.startswith("DSS ajustado") or c in {"P DSS cercano", "Reducción DSS"}]
+    hist_cols = [c for c in table.columns if c.startswith("Aporte ")]
+    deficit_cols = [c for c in table.columns if c.startswith("Déficit")]
+    if obs_cols:
+        styler = styler.set_properties(subset=obs_cols, **{"background-color": "#dbeafe", "font-weight": "700"})
+    if dss_cols:
+        styler = styler.set_properties(subset=dss_cols, **{"background-color": "#fef3c7", "font-weight": "700"})
+    if hist_cols:
+        styler = styler.set_properties(subset=hist_cols, **{"background-color": "#dcfce7", "font-weight": "700"})
+    if deficit_cols:
+        styler = styler.set_properties(subset=deficit_cols, **{"background-color": "#f1f5f9"})
+    return styler
+
+
+def _aggregate_full_reference_9798(
+    daily: pd.DataFrame,
+    hist_year: int,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """Promedios de meses completos usando solo histórico y DSS P95 fijo."""
+    hist_col = f"Hist_{int(hist_year)}_cfs"
+    if daily is None or daily.empty or hist_col not in daily.columns:
+        return pd.DataFrame()
+    base = daily.copy()
+    base["Fecha_dia"] = pd.to_datetime(base["Fecha_dia"], errors="coerce").dt.normalize()
+    base = base[
+        base["Fecha_dia"].between(pd.to_datetime(start_date), pd.to_datetime(end_date), inclusive="both")
+    ].copy()
+    base["Periodo"] = base["Fecha_dia"].dt.to_period("M").dt.to_timestamp()
+    rows: List[Dict[str, object]] = []
+    for period, group in base.groupby("Periodo", sort=True):
+        dss = pd.to_numeric(group.get("DSS_cfs"), errors="coerce")
+        hist = pd.to_numeric(group.get(hist_col), errors="coerce")
+        valid = dss.notna() & hist.notna()
+        expected = int(pd.to_datetime(period).days_in_month)
+        days = int(valid.sum())
+        if days != expected:
+            continue
+        rows.append({
+            "Periodo": pd.to_datetime(period),
+            "DSS_label": _representative_dss_label_9798(group.get("DSS_label", pd.Series(dtype=str))),
+            "DSS_cfs": float(dss.loc[valid].mean()),
+            "Hist_ref_cfs": float(hist.loc[valid].mean()),
+            "Deficit_DSS_vs_Hist_pct": float(_deficit_pct_9798(
+                pd.Series([dss.loc[valid].mean()]), pd.Series([hist.loc[valid].mean()])
+            ).iloc[0]),
+            "Dias_referencia": days,
+        })
+    return pd.DataFrame(rows)
+
+
+def _full_p95_reference_table_9798(
+    aggs: Dict[str, pd.DataFrame],
+    hist_year: int,
+    flow_unit: str,
+    reduction_gat_pct: float,
+    reduction_alh_pct: float,
+) -> pd.DataFrame:
+    """Tabla junio-diciembre de períodos completos para 1997/1998 y DSS P95."""
+    unit = unit_label(flow_unit)
+    rows: List[Dict[str, object]] = []
+    for entity in ["Gatún", "Alhajuela / Madden", "CHCP · GAT + ALHA"]:
+        agg = aggs.get(entity, pd.DataFrame())
+        if agg is None or agg.empty:
+            continue
+        for row in agg.itertuples(index=False):
+            rows.append({
+                "Período completo": _period_label_9798(getattr(row, "Periodo"), "Mensual"),
+                "Sistema": entity.replace("CHCP · GAT + ALHA", "CHCP"),
+                "P DSS fijo": getattr(row, "DSS_label", "P95"),
+                "Reducción DSS": _reduction_label_9798(
+                    entity, reduction_gat_pct, reduction_alh_pct
+                ),
+                f"DSS P95 ajustado ({unit})": convert_flow(
+                    pd.Series([getattr(row, "DSS_cfs", np.nan)]), flow_unit
+                ).iloc[0],
+                f"Aporte {hist_year} ({unit})": convert_flow(
+                    pd.Series([getattr(row, "Hist_ref_cfs", np.nan)]), flow_unit
+                ).iloc[0],
+                f"Déficit DSS P95 vs {hist_year} (%)": getattr(
+                    row, "Deficit_DSS_vs_Hist_pct", np.nan
+                ),
+                "Días del período completo": getattr(row, "Dias_referencia", np.nan),
+                "_periodo_dt": pd.to_datetime(getattr(row, "Periodo"), errors="coerce"),
+                "_orden": {"Gatún": 0, "Alhajuela / Madden": 1, "CHCP · GAT + ALHA": 2}[entity],
+            })
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows).sort_values(["_periodo_dt", "_orden"]).drop(
+        columns=["_periodo_dt", "_orden"]
+    ).reset_index(drop=True)
+    for col in out.columns:
+        if col in {"Período completo", "Sistema", "P DSS fijo", "Reducción DSS"}:
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+        if "Días" in col:
+            out[col] = out[col].round(0).astype("Int64")
+        else:
+            out[col] = out[col].round(2)
+    return out
+
+
 def tab_comparacion_9798(
     dss_bytes: bytes,
     hist_bytes: Optional[bytes],
@@ -4384,10 +4726,11 @@ def tab_comparacion_9798(
     evap_gat_cfs: float = 0.0,
     evap_alh_cfs: float = 0.0,
 ) -> None:
-    st.subheader("📚 Seguimiento junio–fecha actual · 1997/1998 vs observado y DSS")
+    st.subheader("📚 Comparación exacta de aportes · observado vs DSS vs histórico")
     st.caption(
-        "Resumen operativo desde el 1 de junio hasta el último día exacto disponible. "
-        "El mes en curso utiliza únicamente los días transcurridos y comunes; no se incluyen días futuros."
+        "Compara tres series con la misma cobertura diaria: aporte observado del Web Portal, "
+        "percentil DSS diario más cercano y aporte histórico. Además, muestra los meses completos "
+        "de junio a diciembre para el histórico y el DSS P95 fijo."
     )
     if not hist_bytes:
         st.warning(
@@ -4427,33 +4770,33 @@ def tab_comparacion_9798(
     year_candidates = pd.to_datetime(year_candidates, errors="coerce").dropna().dt.year
     target_year = int(year_candidates.mode().iloc[0]) if not year_candidates.empty else int(today_panama().year)
 
-    # La tabla solicitada se presenta siempre en m³/s, igual que la referencia,
-    # sin cambiar la unidad seleccionada para las demás pestañas del app.
+    # Esta pestaña se mantiene en m³/s para facilitar la lectura operativa.
     comparison_unit = "m³/s"
     hist_year = int(st.selectbox(
         "Año histórico de comparación",
         [1997, 1998],
         index=0,
         key="hist9798_selected_year_june_tracking",
-        help="Puede alternar entre 1997 y 1998; todos los cálculos se actualizan con los mismos días.",
+        help="El seguimiento principal usa los mismos días del observado; la tabla P95 usa meses completos.",
     ))
 
     gat_obs = _observed_ap_9798(obs_gat_aporte)
     alh_obs = _observed_ap_9798(obs_alh_aporte)
-    gat_dss = _nearest_ap_dss_daily_9798(
+
+    # Primero se identifica el percentil DSS más cercano SIN reducción.
+    # El descuento manual se aplica después, de modo que no cambie el percentil seleccionado.
+    gat_dss_base = _nearest_ap_dss_daily_9798(
         gat_daily, RESERVOIR_CONFIG["gatun"], obs_gat_aporte, evap_gat_cfs
     )
-    alh_dss = _nearest_ap_dss_daily_9798(
+    alh_dss_base = _nearest_ap_dss_daily_9798(
         alh_daily, RESERVOIR_CONFIG["alhajuela"], obs_alh_aporte, evap_alh_cfs
     )
 
-    gat = _build_9798_entity_daily(hist, target_year, "Gatun_cfs", gat_dss, gat_obs)
-    alh = _build_9798_entity_daily(hist, target_year, "Alhajuela_cfs", alh_dss, alh_obs)
-    chcp = _sum_chcp_9798_enhanced(gat, alh)
+    gat_base = _build_9798_entity_daily(hist, target_year, "Gatun_cfs", gat_dss_base, gat_obs)
+    alh_base = _build_9798_entity_daily(hist, target_year, "Alhajuela_cfs", alh_dss_base, alh_obs)
 
     today = today_panama()
     tracking_start = pd.Timestamp(year=target_year, month=6, day=1)
-    # Alinea la fecha actual con el año de la simulación y evita desbordes de fin de mes.
     current_month_start = pd.Timestamp(year=target_year, month=int(today.month), day=1)
     current_day = min(int(today.day), int(current_month_start.days_in_month))
     calendar_cutoff = pd.Timestamp(year=target_year, month=int(today.month), day=current_day)
@@ -4462,18 +4805,74 @@ def tab_comparacion_9798(
         return
 
     common_dates = _tracking_common_dates_9798(
-        gat, alh, hist_year, tracking_start, calendar_cutoff
+        gat_base, alh_base, hist_year, tracking_start, calendar_cutoff
     )
     if common_dates.empty:
         st.warning(
             "No existen días comunes con observado, DSS más cercano e histórico desde junio. "
-            "Verifique los CSV de aportes observados."
+            "Verifique los CSV de aportes observados del Web Portal."
         )
         return
 
     exact_end = min(pd.to_datetime(common_dates.max()).normalize(), calendar_cutoff)
     exact_dates = common_dates[(common_dates >= tracking_start) & (common_dates <= exact_end)]
     exact_date_set = set(pd.to_datetime(exact_dates).normalize())
+
+    base_for_suggestion = {
+        "Gatún": gat_base[gat_base["Fecha_dia"].isin(exact_date_set)].copy(),
+        "Alhajuela / Madden": alh_base[alh_base["Fecha_dia"].isin(exact_date_set)].copy(),
+    }
+    suggested = {
+        "gat_obs": _suggest_dss_reduction_pct_9798(base_for_suggestion["Gatún"], hist_year, "observado"),
+        "gat_hist": _suggest_dss_reduction_pct_9798(base_for_suggestion["Gatún"], hist_year, "historico"),
+        "alh_obs": _suggest_dss_reduction_pct_9798(base_for_suggestion["Alhajuela / Madden"], hist_year, "observado"),
+        "alh_hist": _suggest_dss_reduction_pct_9798(base_for_suggestion["Alhajuela / Madden"], hist_year, "historico"),
+    }
+
+    st.markdown("### Ajuste porcentual del aporte DSS")
+    st.caption(
+        "La reducción se aplica al AP total DSS después de sumar evaporación: "
+        "**DSS ajustado = DSS base × (1 − porcentaje/100)**. "
+        "El percentil cercano se selecciona antes de aplicar el descuento."
+    )
+    r1, r2 = st.columns(2)
+    reduction_gat_pct = r1.number_input(
+        "Restar al aporte DSS de Gatún (%)",
+        min_value=0.0,
+        max_value=95.0,
+        value=0.0,
+        step=1.0,
+        format="%.1f",
+        key="hist9798_dss_reduction_gat_pct",
+        help="Se aplica al DSS cercano y también al DSS P95 de la referencia completa.",
+    )
+    reduction_alh_pct = r2.number_input(
+        "Restar al aporte DSS de Alhajuela (%)",
+        min_value=0.0,
+        max_value=95.0,
+        value=0.0,
+        step=1.0,
+        format="%.1f",
+        key="hist9798_dss_reduction_alh_pct",
+        help="Se aplica al DSS cercano y también al DSS P95 de la referencia completa.",
+    )
+
+    def _s(v: Optional[float]) -> str:
+        return f"{v:.1f}%" if v is not None and np.isfinite(v) else "—"
+
+    st.info(
+        "**Porcentaje orientativo para igualar promedios del período exacto:** "
+        f"Gatún → observado {_s(suggested['gat_obs'])}, {hist_year} {_s(suggested['gat_hist'])}; "
+        f"Alhajuela → observado {_s(suggested['alh_obs'])}, {hist_year} {_s(suggested['alh_hist'])}. "
+        "La entrada manual permite usar cualquier porcentaje entre 0% y 95%."
+    )
+
+    gat_dss = _apply_dss_reduction_daily_9798(gat_dss_base, reduction_gat_pct)
+    alh_dss = _apply_dss_reduction_daily_9798(alh_dss_base, reduction_alh_pct)
+
+    gat = _build_9798_entity_daily(hist, target_year, "Gatun_cfs", gat_dss, gat_obs)
+    alh = _build_9798_entity_daily(hist, target_year, "Alhajuela_cfs", alh_dss, alh_obs)
+    chcp = _sum_chcp_9798_enhanced(gat, alh)
 
     entities = {
         "Gatún": gat,
@@ -4493,40 +4892,60 @@ def tab_comparacion_9798(
 
     exact_days = int(len(exact_dates))
     st.info(
-        f"**Período exacto:** {tracking_start:%d-%m-%Y} al {exact_end:%d-%m-%Y} · "
-        f"**{exact_days} días comunes** · comparación en **m³/s** · DSS: "
-        "percentil diario más cercano al observado."
+        f"**Período exacto común:** {tracking_start:%d-%m-%Y} al {exact_end:%d-%m-%Y} · "
+        f"**{exact_days} días** · unidad **m³/s** · DSS: percentil diario más cercano al observado."
     )
     st.caption(
         f"Archivo histórico: {hist_name or 'serie 1997-1998'} · "
         f"1997: {hist_meta.get('dias_1997', 0)} días · "
         f"1998: {hist_meta.get('dias_1998', 0)} días. "
-        f"El mes en curso se calcula únicamente hasta el {exact_end:%d-%m-%Y}."
+        "Déficit positivo significa que la primera serie está por debajo de la referencia."
     )
 
-    _summary_cards_tracking_9798(filtered, hist_year, comparison_unit)
-
-    st.markdown("### Tabla mensual resumida")
-    st.caption(
-        "Déficit positivo = el DSS está por debajo del año histórico. "
-        "Cada promedio mensual utiliza exactamente los mismos días en Gatún, Alhajuela y CHCP."
+    st.markdown("### Resumen exacto junio–fecha disponible")
+    exact_summary = _exact_three_series_summary_9798(
+        filtered,
+        hist_year,
+        comparison_unit,
+        reduction_gat_pct,
+        reduction_alh_pct,
     )
-    compact = _compact_tracking_table_9798(
-        monthly, filtered, hist_year, comparison_unit, tracking_start, exact_end
-    )
-    if compact.empty:
-        st.warning("No se pudo construir la tabla resumida.")
+    if exact_summary.empty:
+        st.warning("No se pudo construir el resumen exacto.")
         return
     st.dataframe(
-        _style_compact_tracking_9798(compact),
+        _style_three_series_table_9798(exact_summary),
         use_container_width=True,
         hide_index=True,
-        height=min(420, 105 + 36 * len(compact)),
+        height=min(270, 85 + 42 * len(exact_summary)),
+    )
+
+    st.markdown("### Seguimiento mensual con los mismos días observados")
+    st.caption(
+        "Cada fila compara exactamente los mismos días para observado, DSS ajustado e histórico. "
+        "El mes actual queda cortado en la última fecha común disponible."
+    )
+    monthly_table = _three_series_table_9798(
+        monthly,
+        hist_year,
+        comparison_unit,
+        "Mensual",
+        reduction_gat_pct,
+        reduction_alh_pct,
+    )
+    if monthly_table.empty:
+        st.warning("No se pudo construir la comparación mensual.")
+        return
+    st.dataframe(
+        _style_three_series_table_9798(monthly_table),
+        use_container_width=True,
+        hide_index=True,
+        height=min(560, 95 + 35 * len(monthly_table)),
     )
 
     st.markdown("### Hidrogramas diarios comparativos")
     st.caption(
-        "Seguimiento diario desde junio: aporte observado, DSS más cercano y el año histórico seleccionado."
+        "Azul: observado del Web Portal · amarillo: DSS cercano con reducción aplicada · verde: histórico."
     )
     st.markdown("#### Gatún")
     _plot_selected_history_hydrograph_9798(
@@ -4536,6 +4955,7 @@ def tab_comparacion_9798(
         comparison_unit,
         "Diario",
         key=f"hist9798_june_hydro_gat_{hist_year}_{exact_end:%Y%m%d}",
+        reduction_label=_reduction_label_9798("Gatún", reduction_gat_pct, reduction_alh_pct),
     )
     st.markdown("#### Alhajuela / Madden")
     _plot_selected_history_hydrograph_9798(
@@ -4545,39 +4965,101 @@ def tab_comparacion_9798(
         comparison_unit,
         "Diario",
         key=f"hist9798_june_hydro_alh_{hist_year}_{exact_end:%Y%m%d}",
+        reduction_label=_reduction_label_9798("Alhajuela / Madden", reduction_gat_pct, reduction_alh_pct),
     )
 
-    # Descargas compactas; el Excel conserva además el detalle diario exacto.
+    # Referencia adicional solicitada: meses completos 1997/1998 vs DSS P95 fijo.
+    gat_p95_base, gat_p95_used = _fixed_ap_dss_daily_9798(
+        gat_daily, RESERVOIR_CONFIG["gatun"], 95, evap_gat_cfs
+    )
+    alh_p95_base, alh_p95_used = _fixed_ap_dss_daily_9798(
+        alh_daily, RESERVOIR_CONFIG["alhajuela"], 95, evap_alh_cfs
+    )
+    gat_p95 = _apply_dss_reduction_daily_9798(gat_p95_base, reduction_gat_pct)
+    alh_p95 = _apply_dss_reduction_daily_9798(alh_p95_base, reduction_alh_pct)
+    empty_obs = pd.DataFrame(columns=["Fecha_dia", "Obs_cfs"])
+    gat_full = _build_9798_entity_daily(hist, target_year, "Gatun_cfs", gat_p95, empty_obs)
+    alh_full = _build_9798_entity_daily(hist, target_year, "Alhajuela_cfs", alh_p95, empty_obs)
+    chcp_full = _sum_chcp_9798_enhanced(gat_full, alh_full)
+    full_start = pd.Timestamp(year=target_year, month=6, day=1)
+    full_end = pd.Timestamp(year=target_year, month=12, day=31)
+    full_aggs = {
+        "Gatún": _aggregate_full_reference_9798(gat_full, hist_year, full_start, full_end),
+        "Alhajuela / Madden": _aggregate_full_reference_9798(alh_full, hist_year, full_start, full_end),
+        "CHCP · GAT + ALHA": _aggregate_full_reference_9798(chcp_full, hist_year, full_start, full_end),
+    }
+    full_table = _full_p95_reference_table_9798(
+        full_aggs,
+        hist_year,
+        comparison_unit,
+        reduction_gat_pct,
+        reduction_alh_pct,
+    )
+
+    st.markdown("### Referencia de períodos completos · histórico vs DSS P95")
+    st.caption(
+        f"Promedios mensuales completos de junio a diciembre. No dependen de la disponibilidad del observado. "
+        f"Percentiles utilizados: Gatún P{gat_p95_used if gat_p95_used is not None else '—'} y "
+        f"Alhajuela P{alh_p95_used if alh_p95_used is not None else '—'}."
+    )
+    if full_table.empty:
+        st.info("No hay meses completos simultáneos entre el histórico y el DSS P95.")
+    else:
+        st.dataframe(
+            _style_three_series_table_9798(full_table),
+            use_container_width=True,
+            hide_index=True,
+            height=min(650, 95 + 35 * len(full_table)),
+        )
+
+    # Descargas: resumen, seguimiento mensual, referencia P95 y detalle diario exacto.
     dl1, dl2 = st.columns(2)
     dl1.download_button(
-        "⬇️ Descargar tabla resumida (CSV)",
-        compact.to_csv(index=False).encode("utf-8-sig"),
-        f"seguimiento_junio_{exact_end:%Y%m%d}_{hist_year}.csv",
+        "⬇️ Descargar comparación mensual (CSV)",
+        monthly_table.to_csv(index=False).encode("utf-8-sig"),
+        f"comparacion_aportes_junio_{exact_end:%Y%m%d}_{hist_year}.csv",
         "text/csv",
         key=f"hist9798_june_csv_{hist_year}_{exact_end:%Y%m%d}",
         use_container_width=True,
     )
 
     detail_gat = _detail_selected_history_9798(
-        daily_agg.get("Gatún", pd.DataFrame()), "Gatún", hist_year, comparison_unit, "Diario"
+        daily_agg.get("Gatún", pd.DataFrame()),
+        "Gatún",
+        hist_year,
+        comparison_unit,
+        "Diario",
+        _reduction_label_9798("Gatún", reduction_gat_pct, reduction_alh_pct),
     )
     detail_alh = _detail_selected_history_9798(
-        daily_agg.get("Alhajuela / Madden", pd.DataFrame()), "Alhajuela / Madden", hist_year, comparison_unit, "Diario"
+        daily_agg.get("Alhajuela / Madden", pd.DataFrame()),
+        "Alhajuela / Madden",
+        hist_year,
+        comparison_unit,
+        "Diario",
+        _reduction_label_9798("Alhajuela / Madden", reduction_gat_pct, reduction_alh_pct),
     )
     detail_chcp = _detail_selected_history_9798(
-        daily_agg.get("CHCP · GAT + ALHA", pd.DataFrame()), "CHCP", hist_year, comparison_unit, "Diario"
+        daily_agg.get("CHCP · GAT + ALHA", pd.DataFrame()),
+        "CHCP",
+        hist_year,
+        comparison_unit,
+        "Diario",
+        _reduction_label_9798("CHCP · GAT + ALHA", reduction_gat_pct, reduction_alh_pct),
     )
     try:
         xlsx = _excel_bytes_from_sheets({
-            "Resumen mensual": compact,
+            "Resumen exacto": exact_summary,
+            "Seguimiento mensual": monthly_table,
+            "Referencia P95 completa": full_table,
             "Gatun diario": detail_gat,
             "Alhajuela diario": detail_alh,
             "CHCP diario": detail_chcp,
         })
         dl2.download_button(
-            "⬇️ Descargar seguimiento exacto (Excel)",
+            "⬇️ Descargar comparación completa (Excel)",
             xlsx,
-            f"seguimiento_junio_fecha_actual_{hist_year}.xlsx",
+            f"comparacion_aportes_exacta_{hist_year}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"hist9798_june_xlsx_{hist_year}_{exact_end:%Y%m%d}",
             use_container_width=True,
