@@ -90,6 +90,7 @@ CFS_TO_HM3_DAY = CFS_TO_M3S * 86400 / 1_000_000
 # La lámina diaria de cada estación se corrige con el coeficiente 0.85.
 # El área del espejo se calcula con el último nivel observado del embalse.
 EVAP_COEFFICIENT = 0.85
+EVAP_ROLLING_DAYS = 5  # promedio móvil de los últimos 5 días observados válidos
 
 # Áreas de respaldo si no hay nivel observado disponible.
 EVAP_AREA_GAT_KM2 = 425.0   # Gatún
@@ -470,14 +471,16 @@ def _normalizar_columna(nombre: object) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def read_evap_rate_csv(file_bytes: bytes, filename: str = "") -> Tuple[Optional[pd.Timestamp], Optional[float]]:
-    """Lee una serie diaria de evaporación y devuelve su último valor válido en mm/día.
+def read_evap_rate_series(file_bytes: bytes, filename: str = "") -> pd.DataFrame:
+    """Lee la serie diaria de evaporación y devuelve Fecha y mm_dia válidos.
 
-    Formato esperado: fecha_inicio, fecha_fin, valor_raw. También acepta nombres
-    equivalentes de fecha/valor y separadores coma o punto y coma.
+    Acepta columnas equivalentes a fecha_inicio/fecha/ timestamp y
+    valor_raw/valor/value/evapo. Si hay más de un registro por día, conserva
+    el último valor observado válido de ese día.
     """
+    empty = pd.DataFrame(columns=["Fecha", "mm_dia"])
     if not file_bytes:
-        return None, None
+        return empty
     try:
         text_csv = file_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -487,15 +490,15 @@ def read_evap_rate_csv(file_bytes: bytes, filename: str = "") -> Tuple[Optional[
         sep = ";" if text_csv[:4000].count(";") > text_csv[:4000].count(",") else ","
         df = pd.read_csv(StringIO(text_csv), sep=sep)
     except Exception:
-        return None, None
+        return empty
     if df.empty:
-        return None, None
+        return empty
 
     cols = list(df.columns)
     norm = {_normalizar_columna(c): c for c in cols}
 
     date_col = None
-    for wanted in ("fecha_inicio", "fecha", "timestamp", "date", "time"):
+    for wanted in ("fecha_inicio", "fecha_fin", "fecha", "timestamp", "date", "time"):
         for n, original in norm.items():
             if wanted in n:
                 parsed = pd.to_datetime(df[original], errors="coerce")
@@ -522,7 +525,7 @@ def read_evap_rate_csv(file_bytes: bytes, filename: str = "") -> Tuple[Optional[
             break
 
     if date_col is None or value_col is None:
-        return None, None
+        return empty
 
     out = pd.DataFrame({
         "Fecha": pd.to_datetime(df[date_col], errors="coerce"),
@@ -531,16 +534,36 @@ def read_evap_rate_csv(file_bytes: bytes, filename: str = "") -> Tuple[Optional[
             errors="coerce",
         ),
     }).dropna(subset=["Fecha", "mm_dia"])
-    out = out[out["mm_dia"] >= 0].sort_values("Fecha")
+    out = out[np.isfinite(out["mm_dia"]) & (out["mm_dia"] >= 0)].copy()
+    if out.empty:
+        return empty
+
+    out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce").dt.normalize()
+    out = out.dropna(subset=["Fecha"]).sort_values("Fecha")
+    out = out.groupby("Fecha", as_index=False).agg(mm_dia=("mm_dia", "last"))
+    return out.sort_values("Fecha").reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def read_evap_rate_csv(file_bytes: bytes, filename: str = "") -> Tuple[Optional[pd.Timestamp], Optional[float]]:
+    """Compatibilidad: devuelve el último valor diario válido de evaporación."""
+    out = read_evap_rate_series(file_bytes, filename)
     if out.empty:
         return None, None
     last = out.iloc[-1]
     return pd.to_datetime(last["Fecha"]), float(last["mm_dia"])
 
 
-def latest_evap_series(station: str) -> Dict[str, object]:
-    """Busca la serie local más actualizada y devuelve fecha, mm/día y archivo."""
+def latest_evap_series(station: str, rolling_days: int = EVAP_ROLLING_DAYS) -> Dict[str, object]:
+    """Obtiene el promedio móvil de los últimos N días observados de evaporación.
+
+    Selecciona el archivo local cuya observación final sea la más reciente. El
+    promedio se calcula sobre los últimos N días válidos disponibles, no sobre
+    días calendario inventados. También devuelve el último valor individual y
+    las fechas de la ventana para trazabilidad.
+    """
     station = station.upper().strip()
+    rolling_days = max(int(rolling_days or EVAP_ROLLING_DAYS), 1)
     patterns = EVAP_SERIES_PATTERNS.get(station, [f"*{station}*.csv"])
     files: Dict[Path, Path] = {}
     for base in local_search_dirs():
@@ -555,15 +578,31 @@ def latest_evap_series(station: str) -> Dict[str, object]:
     best: Optional[Dict[str, object]] = None
     for fp in files.values():
         try:
-            date_value, mm_day = read_evap_rate_csv(fp.read_bytes(), fp.name)
+            series = read_evap_rate_series(fp.read_bytes(), fp.name)
         except Exception:
             continue
-        if date_value is None or mm_day is None:
+        if series.empty:
             continue
-        item = {"date": date_value, "mm_day": float(mm_day), "file": fp.name}
+        window = series.tail(rolling_days).copy()
+        if window.empty:
+            continue
+        item = {
+            "date": pd.to_datetime(window["Fecha"].max()),
+            "window_start": pd.to_datetime(window["Fecha"].min()),
+            "window_end": pd.to_datetime(window["Fecha"].max()),
+            "mm_day": float(window["mm_dia"].mean()),
+            "latest_mm_day": float(window.iloc[-1]["mm_dia"]),
+            "n_obs": int(len(window)),
+            "rolling_days": rolling_days,
+            "file": fp.name,
+        }
         if best is None or pd.to_datetime(item["date"]) > pd.to_datetime(best["date"]):
             best = item
-    return best or {"date": None, "mm_day": None, "file": None}
+    return best or {
+        "date": None, "window_start": None, "window_end": None,
+        "mm_day": None, "latest_mm_day": None, "n_obs": 0,
+        "rolling_days": rolling_days, "file": None,
+    }
 
 
 def evap_mm_to_flows(mm_day: float, area_km2: float, coefficient: float = EVAP_COEFFICIENT) -> Dict[str, float]:
@@ -1868,12 +1907,13 @@ def sidebar() -> Dict:
     st.sidebar.header("🌫️ Caudal evaporado para ajuste AP DSS")
     evap_mode = st.sidebar.radio(
         "Fuente de evaporación",
-        ["Automática · último valor CZL/PMG", "Manual · p³/s"],
+        ["Automática · promedio móvil 5 días CZL/PMG", "Manual · p³/s"],
         index=0,
         key="evap_source_mode",
         help=(
-            "Automática: usa el último valor válido de Corozal (CZL) para Gatún y "
-            "Pedro Miguel (PMG) para Alhajuela. Manual: permite ingresar el caudal en p³/s."
+            "Automática: usa el promedio móvil de los últimos 5 días observados válidos de "
+            "Corozal (CZL) para Gatún y Pedro Miguel (PMG) para Alhajuela. "
+            "Manual: permite ingresar el caudal en p³/s."
         ),
     )
 
@@ -1894,18 +1934,21 @@ def sidebar() -> Dict:
             evap_gat_meta.update({"level_info": gat_level, "area_status": gat_area_status})
             st.sidebar.markdown(
                 f"**Gatún · Corozal (CZL)**  \n"
-                f"{gat_calc['mm_day']:.3f} mm/día · {gat_calc['hm3_day']:.4f} hm³/día · "
+                f"Prom. móvil {gat_series.get('n_obs', 0)}/5 días: {gat_calc['mm_day']:.3f} mm/día · "
+                f"{gat_calc['hm3_day']:.4f} hm³/día · "
                 f"**{gat_calc['cfs']:.3f} p³/s**"
             )
             if gat_level.get("level_ft") is not None:
                 st.sidebar.caption(
-                    f"Evap: {pd.to_datetime(gat_series['date']):%d-%m-%Y} · "
+                    f"Ventana evap.: {pd.to_datetime(gat_series['window_start']):%d-%m-%Y} a "
+                    f"{pd.to_datetime(gat_series['window_end']):%d-%m-%Y} · "
                     f"Nivel obs: {gat_level['level_ft']:.2f} ft · Área por nivel: {gat_area:.1f} km² · "
                     f"Archivo nivel: {gat_level.get('source') or '—'}"
                 )
             else:
                 st.sidebar.caption(
-                    f"Evap: {pd.to_datetime(gat_series['date']):%d-%m-%Y} · "
+                    f"Ventana evap.: {pd.to_datetime(gat_series['window_start']):%d-%m-%Y} a "
+                    f"{pd.to_datetime(gat_series['window_end']):%d-%m-%Y} · "
                     f"Sin nivel observado local; usa área respaldo: {gat_area:.1f} km² · Archivo: {gat_series['file']}"
                 )
         else:
@@ -1922,18 +1965,21 @@ def sidebar() -> Dict:
             evap_alh_meta.update({"level_info": alh_level, "area_status": alh_area_status})
             st.sidebar.markdown(
                 f"**Alhajuela · Pedro Miguel (PMG)**  \n"
-                f"{alh_calc['mm_day']:.3f} mm/día · {alh_calc['hm3_day']:.4f} hm³/día · "
+                f"Prom. móvil {alh_series.get('n_obs', 0)}/5 días: {alh_calc['mm_day']:.3f} mm/día · "
+                f"{alh_calc['hm3_day']:.4f} hm³/día · "
                 f"**{alh_calc['cfs']:.3f} p³/s**"
             )
             if alh_level.get("level_ft") is not None:
                 st.sidebar.caption(
-                    f"Evap: {pd.to_datetime(alh_series['date']):%d-%m-%Y} · "
+                    f"Ventana evap.: {pd.to_datetime(alh_series['window_start']):%d-%m-%Y} a "
+                    f"{pd.to_datetime(alh_series['window_end']):%d-%m-%Y} · "
                     f"Nivel obs: {alh_level['level_ft']:.2f} ft · Área por nivel: {alh_area:.1f} km² · "
                     f"Archivo nivel: {alh_level.get('source') or '—'}"
                 )
             else:
                 st.sidebar.caption(
-                    f"Evap: {pd.to_datetime(alh_series['date']):%d-%m-%Y} · "
+                    f"Ventana evap.: {pd.to_datetime(alh_series['window_start']):%d-%m-%Y} a "
+                    f"{pd.to_datetime(alh_series['window_end']):%d-%m-%Y} · "
                     f"Sin nivel observado local; usa área respaldo: {alh_area:.1f} km² · Archivo: {alh_series['file']}"
                 )
         else:
@@ -1941,7 +1987,8 @@ def sidebar() -> Dict:
             st.sidebar.warning("No se encontró una serie válida de evaporación PMG para Alhajuela.")
 
         st.sidebar.caption(
-            "Fórmula automática: hm³/día = mm/día × área (km²) × 0.85 × 0.001. "
+            "Promedio móvil: media de los últimos 5 días observados válidos. "
+            "Fórmula automática: hm³/día = promedio mm/día × área (km²) × 0.85 × 0.001. "
             "Luego se convierte a p³/s."
         )
     else:
