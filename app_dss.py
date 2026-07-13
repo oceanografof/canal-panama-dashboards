@@ -1428,8 +1428,8 @@ def to_daily(df: pd.DataFrame, cfg: Dict) -> pd.DataFrame:
     agg: Dict[str, str] = {}
     for c in cols_by_prefix(data, "NP", token):
         agg[c] = "last"
-    for px in ["HP", "AP", "V", "EG", "EP", "E"]:
-        for c in cols_by_prefix(data, px, token):
+    for prefix in ["HP", "AP", "V", "EG", "EP", "E"]:
+        for c in cols_by_prefix(data, prefix, token):
             agg[c] = "mean"
     if "Observado" in data.columns:
         data["Obs_DSS"] = data["Observado"]
@@ -1887,7 +1887,7 @@ def fan_chart(df: pd.DataFrame, cols: List[str], title: str, y_label: str, key: 
 
     _today_line(fig, plot_df["Fecha_dia"])
     fig.update_layout(**_base_layout(title, y_label))
-    st.plotly_chart(fig, use_container_width=True, key=key)
+    st.plotly_chart(fig, width="stretch", key=key)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1935,7 +1935,6 @@ def date_filter(df: pd.DataFrame, key: str,
         return df
     mn, mx = valid.min().date(), valid.max().date()
     if default_days > 0:
-        import datetime
         default_start = max(mn, (pd.Timestamp(mx) - pd.Timedelta(days=default_days)).date())
     else:
         default_start = mn
@@ -1958,7 +1957,7 @@ def sidebar() -> Dict:
 
     dss_up = st.sidebar.file_uploader("DSS (SimulacionDSS…xlsx)", type=["xlsx", "xlsm"], key="dss_up")
 
-    if st.sidebar.button("🔄 Recargar archivos", use_container_width=True):
+    if st.sidebar.button("🔄 Recargar archivos", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
@@ -2602,7 +2601,7 @@ def tab_reservoir(res_key: str, dss_bytes: bytes, flow_unit: str, pct_ref: int,
                 table_df[f"AP total DSS P{pct} (p³/s)"] = total_cfs
                 table_df[f"AP total DSS P{pct} ({unit_label(flow_unit)})"] = convert_flow(total_cfs, flow_unit)
             table_df["Evaporación sumada AP DSS (p³/s)"] = clean_evap_cfs(evap_cfs)
-        st.dataframe(table_df, use_container_width=True, height=420)
+        st.dataframe(table_df, width="stretch", height=420)
         csv = table_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(f"⬇️ Descargar CSV — {cfg['name']}",
                            csv, f"{res_key}_dss_diario.csv", "text/csv", key=f"{res_key}_dl")
@@ -2786,16 +2785,16 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
             f"AP total prom. {horizon}d ({unit_label(flow_unit)})": _fmt(ap_prom, 2),
             f"V prom. {horizon}d ({unit_label(flow_unit)})":  _fmt(v_prom, 2),
             f"HP prom. {horizon}d (MW)": _fmt(hp_prom, 2),
-            f"NP inicio horiz. (ft)":    _fmt(np_start, 3),
-            f"NP fin horiz. (ft)":       _fmt(np_end, 3),
-            f"Δ NP horiz. (ft)":         _fmt(np_end - np_start, 3) if pd.notna(np_start) and pd.notna(np_end) else "—",
+            "NP inicio horiz. (ft)":     _fmt(np_start, 3),
+            "NP fin horiz. (ft)":        _fmt(np_end, 3),
+            "Δ NP horiz. (ft)":          _fmt(np_end - np_start, 3) if pd.notna(np_start) and pd.notna(np_end) else "—",
         })
         ts_map[cfg["name"]] = (daily, obs_df, cfg)
         _show_ap_may_adjustment_note(daily, res_key, "manejo/decisión")
 
     if rows:
         st.markdown("#### Estado ejecutivo")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     # Gráficas individuales
     st.markdown("---")
@@ -2880,7 +2879,7 @@ def tab_manejo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_alh: 
             f"{name} · Nivel proyectado P{_np_pct_plot if _np_pct_plot is not None else pct_ref} vs observado (ft PLD)",
             "ft PLD", height=580,
         ))
-        st.plotly_chart(fig, use_container_width=True, key=f"mj_np_{cfg['token']}")
+        st.plotly_chart(fig, width="stretch", key=f"mj_np_{cfg['token']}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3255,7 +3254,7 @@ def tab_aporte_obs_embalse(
         height=650,
     ))
     _unit_key = str(flow_unit).replace("³", "3").replace("/", "_").replace(" ", "")
-    st.plotly_chart(fig, use_container_width=True, key=f"ao_{res_key}_plot_{_unit_key}")
+    st.plotly_chart(fig, width="stretch", key=f"ao_{res_key}_plot_{_unit_key}")
 
     with st.expander("📋 Tabla de aporte observado y AP total DSS estimado", expanded=False):
         rows = []
@@ -3281,7 +3280,7 @@ def tab_aporte_obs_embalse(
             for c in out.columns:
                 if c not in ("Fecha", "Fuente"):
                     out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
-            st.dataframe(out, use_container_width=True, hide_index=True, height=420)
+            st.dataframe(out, width="stretch", hide_index=True, height=420)
             csv = out.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 f"⬇️ Descargar CSV aporte {token}",
@@ -3401,7 +3400,7 @@ def tab_niveles_obs(obs_gat: Optional[pd.DataFrame], obs_alh: Optional[pd.DataFr
         plot_bgcolor="rgba(250,252,255,1)", paper_bgcolor="rgba(250,252,255,0)",
         margin=dict(l=10, r=10, t=80, b=10),
     )
-    st.plotly_chart(fig, use_container_width=True, key="nobs_two")
+    st.plotly_chart(fig, width="stretch", key="nobs_two")
 
     # Tabla
     with st.expander("📋 Tabla de niveles observados", expanded=False):
@@ -3417,7 +3416,7 @@ def tab_niveles_obs(obs_gat: Optional[pd.DataFrame], obs_alh: Optional[pd.DataFr
             t = pd.concat(frames, ignore_index=True).sort_values("Fecha")
             for col in ["Nivel obs. (ft)", "Cambio (ft/día)"]:
                 t[col] = pd.to_numeric(t[col], errors="coerce").round(3)
-            st.dataframe(t, use_container_width=True, hide_index=True, height=420)
+            st.dataframe(t, width="stretch", hide_index=True, height=420)
             csv = t.to_csv(index=False).encode("utf-8-sig")
             st.download_button("⬇️ CSV niveles observados", csv,
                                "niveles_observados.csv", "text/csv", key="nobs_dl")
@@ -3531,7 +3530,7 @@ def tab_comparativo(dss_bytes: bytes, flow_unit: str, pct_ref_gat: int, pct_ref_
                     })
         if obs_rows:
             st.markdown("#### Valores de aportes observados")
-            st.dataframe(pd.DataFrame(obs_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(obs_rows), width="stretch", hide_index=True)
 
         if _valid_df(obs_gat_aporte):
             om = clamp_observed_future_dates(obs_gat_aporte, "Fecha_dia")[["Fecha_dia", "Valor"]].copy()
@@ -3990,16 +3989,23 @@ def _deficit_pct_9798(current: pd.Series, reference: pd.Series) -> pd.Series:
 
 
 def _representative_dss_label_9798(values: pd.Series) -> str:
-    """Resume el percentil DSS dominante dentro de un período."""
-    clean = values.dropna().astype(str)
+    """Resume el percentil DSS dominante dentro de un período.
+
+    Cuando hubo más de un percentil diario, el rótulo explica de forma directa
+    cuántos días correspondieron al percentil predominante. Ejemplo:
+    ``P95 · 38 días de 43``.
+    """
+    clean = values.dropna().astype(str).str.strip()
     clean = clean[~clean.isin(["", "<NA>", "nan", "None", "—"])]
     if clean.empty:
         return "—"
     counts = clean.value_counts()
     label = str(counts.index[0])
+    dominant_days = int(counts.iloc[0])
+    total_days = int(len(clean))
     if len(counts) == 1:
         return label
-    return f"{label} ({int(counts.iloc[0])}/{int(len(clean))} días)"
+    return f"{label} · {dominant_days} días de {total_days}"
 
 
 def _period_label_9798(value: object, mode: str) -> str:
@@ -4052,7 +4058,6 @@ def _aggregate_selected_history_9798(
     for period, group in base.groupby("Periodo", sort=True):
         obs = pd.to_numeric(group.get("Obs_cfs"), errors="coerce")
         dss = pd.to_numeric(group.get("DSS_cfs"), errors="coerce")
-        dss_base = pd.to_numeric(group.get("DSS_base_cfs", group.get("DSS_cfs")), errors="coerce")
         hist = pd.to_numeric(group.get(hist_col), errors="coerce")
         triple = obs.notna() & dss.notna() & hist.notna()
 
@@ -4175,7 +4180,7 @@ def _plot_selected_history_hydrograph_9798(
     key: str,
     reduction_label: str = "0%",
 ) -> None:
-    """Hidrograma independiente: histórico, observado y DSS más cercano."""
+    """Hidrograma independiente con leyenda legible y sin rótulos superpuestos."""
     if agg is None or agg.empty:
         st.info(f"No hay datos para el hidrograma de {entity_label}.")
         return
@@ -4186,41 +4191,72 @@ def _plot_selected_history_hydrograph_9798(
     plot["Obs"] = convert_flow(plot["Obs_cfs"], flow_unit)
     marker_mode = "lines" if mode == "Diario" else "lines+markers"
 
+    reduction_text = str(reduction_label or "0%").strip()
+    dss_legend = f"DSS ajustado {reduction_text}"
+
     if PLOTLY_OK:
         fig = go.Figure()
+        # Orden de lectura: observado, DSS ajustado e histórico. Así la
+        # leyenda coincide con el propósito principal de la comparación.
         fig.add_trace(go.Scatter(
-            x=plot["Periodo"], y=plot["Hist"], mode=marker_mode,
-            name=f"Aporte {hist_year}",
-            line={"color": "#2e7d32", "width": 2},
+            x=plot["Periodo"], y=plot["Obs"], mode=marker_mode,
+            name="Observado Web Portal",
+            line={"color": "#0077b6", "width": 4},
+            hovertemplate=f"Observado: %{{y:,.2f}} {unit}<extra></extra>",
             connectgaps=False,
         ))
         fig.add_trace(go.Scatter(
             x=plot["Periodo"], y=plot["DSS"], mode=marker_mode,
-            name=f"DSS más cercano ajustado ({reduction_label})",
+            name=dss_legend,
             text=plot["DSS_label"],
             line={"color": "#f59e0b", "width": 3, "dash": "dash"},
             hovertemplate=(
-                "%{x|%d-%m-%Y}<br>DSS: %{y:,.2f}<br>Percentil: %{text}<extra></extra>"
+                f"DSS ajustado: %{{y:,.2f}} {unit}"
+                "<br>Percentil diario más cercano: %{text}<extra></extra>"
             ),
             connectgaps=False,
         ))
         fig.add_trace(go.Scatter(
-            x=plot["Periodo"], y=plot["Obs"], mode=marker_mode,
-            name="Observado",
-            line={"color": "#0077b6", "width": 4},
+            x=plot["Periodo"], y=plot["Hist"], mode=marker_mode,
+            name=f"Histórico {hist_year}",
+            line={"color": "#2e7d32", "width": 2},
+            hovertemplate=f"Histórico {hist_year}: %{{y:,.2f}} {unit}<extra></extra>",
             connectgaps=False,
         ))
-        fig.update_layout(**_base_layout(
-            f"{entity_label} · Observado vs DSS ajustado vs {hist_year}",
-            unit,
-            height=455,
-        ))
+
+        # El encabezado externo ya muestra el sistema. Se elimina el título
+        # interno que antes se montaba sobre la leyenda y hacía ilegible el texto.
+        fig.update_layout(**_base_layout("", unit, height=455))
         fig.update_layout(
+            title=None,
             hovermode="x unified",
-            legend={"orientation": "h", "y": 1.08, "x": 0.0},
-            margin={"l": 35, "r": 20, "t": 70, "b": 45},
+            hoverlabel={"align": "left"},
+            legend={
+                "orientation": "h",
+                "yanchor": "bottom",
+                "y": 1.02,
+                "xanchor": "left",
+                "x": 0.0,
+                "font": {"size": 12},
+                "traceorder": "normal",
+                "bgcolor": "rgba(255,255,255,0.88)",
+                "bordercolor": "rgba(0,62,105,0.18)",
+                "borderwidth": 1,
+            },
+            margin={"l": 55, "r": 20, "t": 82, "b": 55},
+            xaxis={
+                "title": "Fecha",
+                "gridcolor": "rgba(0,0,0,0.07)",
+                "tickformat": "%d-%b",
+                "hoverformat": "%d-%m-%Y",
+            },
+            yaxis={
+                "title": unit,
+                "gridcolor": "rgba(0,0,0,0.07)",
+                "rangemode": "tozero",
+            },
         )
-        st.plotly_chart(fig, use_container_width=True, key=key)
+        st.plotly_chart(fig, width="stretch", key=key)
     else:
         st.line_chart(plot.set_index("Periodo")[["Hist", "DSS", "Obs"]])
 
@@ -4598,30 +4634,80 @@ def _exact_three_series_summary_9798(
 
 
 def _style_three_series_table_9798(table: pd.DataFrame):
-    """Distingue visualmente las tres series y los déficits."""
+    """Distingue visualmente las tres series y formatea sin fallar con textos.
+
+    El formateo anterior intentaba aplicar ``{:,.2f}`` a columnas de texto como
+    ``P DSS fijo`` y ``Período completo``. Pandas generaba entonces:
+    ``ValueError: Unknown format code 'f' for object of type 'str'``.
+    Aquí solo se formatean columnas numéricas y, además, cada formateador es
+    tolerante a valores de texto inesperados.
+    """
     if table is None or table.empty:
         return table
-    formats: Dict[str, str] = {}
+
+    def _is_missing(value: object) -> bool:
+        try:
+            missing = pd.isna(value)
+            return bool(missing) if np.isscalar(missing) else False
+        except Exception:
+            return False
+
+    def _fmt_number(value: object, decimals: int = 2, signed: bool = False) -> str:
+        if _is_missing(value):
+            return "—"
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if not np.isfinite(number):
+            return "—"
+        if signed:
+            return f"{number:+,.{decimals}f}"
+        return f"{number:,.{decimals}f}"
+
+    formats: Dict[str, object] = {}
     for col in table.columns:
+        # Solo las columnas realmente numéricas reciben formato numérico.
+        # Esto blinda tanto las tablas actuales como futuras columnas de texto.
+        if not pd.api.types.is_numeric_dtype(table[col].dtype):
+            continue
         if "Días" in col:
-            formats[col] = "{:.0f}"
+            formats[col] = lambda value: _fmt_number(value, decimals=0, signed=False)
         elif "(%)" in col:
-            formats[col] = "{:+.2f}"
-        elif col not in {"Período", "Sistema", "P DSS cercano", "Reducción DSS"}:
-            formats[col] = "{:,.2f}"
+            formats[col] = lambda value: _fmt_number(value, decimals=2, signed=True)
+        else:
+            formats[col] = lambda value: _fmt_number(value, decimals=2, signed=False)
+
     styler = table.style.format(formats, na_rep="—")
     obs_cols = [c for c in table.columns if c.startswith("Observado")]
-    dss_cols = [c for c in table.columns if c.startswith("DSS ajustado") or c in {"P DSS cercano", "Reducción DSS"}]
+    dss_cols = [
+        c for c in table.columns
+        if c.startswith("DSS ajustado")
+        or c.startswith("DSS P95 ajustado")
+        or c in {"P DSS cercano", "P DSS fijo", "Reducción DSS"}
+    ]
     hist_cols = [c for c in table.columns if c.startswith("Aporte ")]
     deficit_cols = [c for c in table.columns if c.startswith("Déficit")]
     if obs_cols:
-        styler = styler.set_properties(subset=obs_cols, **{"background-color": "#dbeafe", "font-weight": "700"})
+        styler = styler.set_properties(
+            subset=obs_cols,
+            **{"background-color": "#dbeafe", "font-weight": "700"},
+        )
     if dss_cols:
-        styler = styler.set_properties(subset=dss_cols, **{"background-color": "#fef3c7", "font-weight": "700"})
+        styler = styler.set_properties(
+            subset=dss_cols,
+            **{"background-color": "#fef3c7", "font-weight": "700"},
+        )
     if hist_cols:
-        styler = styler.set_properties(subset=hist_cols, **{"background-color": "#dcfce7", "font-weight": "700"})
+        styler = styler.set_properties(
+            subset=hist_cols,
+            **{"background-color": "#dcfce7", "font-weight": "700"},
+        )
     if deficit_cols:
-        styler = styler.set_properties(subset=deficit_cols, **{"background-color": "#f1f5f9"})
+        styler = styler.set_properties(
+            subset=deficit_cols,
+            **{"background-color": "#f1f5f9"},
+        )
     return styler
 
 
@@ -4903,6 +4989,10 @@ def tab_comparacion_9798(
     )
 
     st.markdown("### Resumen exacto junio–fecha disponible")
+    st.caption(
+        "Lectura del rótulo DSS: **P95 · X días de Y** significa que P95 fue el "
+        "percentil diario más cercano al observado durante X de los Y días comparados."
+    )
     exact_summary = _exact_three_series_summary_9798(
         filtered,
         hist_year,
@@ -4915,7 +5005,7 @@ def tab_comparacion_9798(
         return
     st.dataframe(
         _style_three_series_table_9798(exact_summary),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(270, 85 + 42 * len(exact_summary)),
     )
@@ -4938,14 +5028,15 @@ def tab_comparacion_9798(
         return
     st.dataframe(
         _style_three_series_table_9798(monthly_table),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(560, 95 + 35 * len(monthly_table)),
     )
 
     st.markdown("### Hidrogramas diarios comparativos")
     st.caption(
-        "Azul: observado del Web Portal · amarillo: DSS cercano con reducción aplicada · verde: histórico."
+        "Azul: observado del Web Portal · amarillo discontinuo: DSS diario más cercano con la reducción aplicada "
+        "· verde: aporte histórico. Al colocar el cursor se muestra el percentil DSS seleccionado en cada día."
     )
     st.markdown("#### Gatún")
     _plot_selected_history_hydrograph_9798(
@@ -5007,7 +5098,7 @@ def tab_comparacion_9798(
     else:
         st.dataframe(
             _style_three_series_table_9798(full_table),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=min(650, 95 + 35 * len(full_table)),
         )
@@ -5020,7 +5111,7 @@ def tab_comparacion_9798(
         f"comparacion_aportes_junio_{exact_end:%Y%m%d}_{hist_year}.csv",
         "text/csv",
         key=f"hist9798_june_csv_{hist_year}_{exact_end:%Y%m%d}",
-        use_container_width=True,
+        width="stretch",
     )
 
     detail_gat = _detail_selected_history_9798(
@@ -5062,7 +5153,7 @@ def tab_comparacion_9798(
             f"comparacion_aportes_exacta_{hist_year}.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"hist9798_june_xlsx_{hist_year}_{exact_end:%Y%m%d}",
-            use_container_width=True,
+            width="stretch",
         )
     except Exception as exc:
         dl2.warning(f"No se pudo generar el Excel: {exc}")
@@ -5111,13 +5202,14 @@ def tab_aporte_instantaneo(
         st.markdown("#### Visor — aporte instantáneo")
         try:
             ts = pd.Timestamp.utcnow().strftime("%Y%m%d%H%M%S")
-            components.html(f"""
-            <div style="border:1px solid rgba(0,62,105,.18);border-radius:14px;padding:10px;background:#f8fafc">
-                <img src="{RADAR_URL}?t={ts}" style="width:100%;border-radius:10px;" />
-                <div style="font-size:12px;color:#667085;margin-top:6px;">
-                    Aporte instantáneo · Radar meteorológico Canal · {pd.Timestamp.now():%d-%m-%Y %H:%M}
-                </div>
-            </div>""", height=560)
+            st.image(
+                f"{RADAR_URL}?t={ts}",
+                caption=(
+                    "Aporte instantáneo · Radar meteorológico Canal · "
+                    f"{pd.Timestamp.now():%d-%m-%Y %H:%M}"
+                ),
+                width="stretch",
+            )
             if st.checkbox("Auto-recargar cada 5 min", key="ap_inst_auto"):
                 components.html("<script>setTimeout(()=>window.parent.location.reload(),300000);</script>", height=0)
         except Exception as exc:
@@ -5205,7 +5297,7 @@ def tab_aporte_instantaneo(
     st.markdown("#### Resultado comparativo")
     if comparisons:
         out = pd.DataFrame(comparisons)
-        st.dataframe(out, use_container_width=True, hide_index=True)
+        st.dataframe(out, width="stretch", hide_index=True)
         csv = out.to_csv(index=False).encode("utf-8-sig")
         st.download_button("⬇️ Descargar comparación de aporte instantáneo", csv,
                            "aporte_instantaneo_aquarius_dss.csv", "text/csv", key="apinst_dl")
@@ -5221,7 +5313,7 @@ def tab_aporte_instantaneo(
                 fig = px.bar(long, x="Embalse", y=unit_label(flow_unit), color="Serie", barmode="group",
                              facet_col="Fuente", title="Aporte observado vs AP total DSS estimado")
                 fig.update_layout(height=420, hovermode="x unified")
-                st.plotly_chart(fig, use_container_width=True, key="apinst_bar")
+                st.plotly_chart(fig, width="stretch", key="apinst_bar")
     else:
         st.caption("No hay aporte Aquarius/BulkExport disponible y no se ingresó aporte manual mayor que cero.")
 
@@ -5319,7 +5411,7 @@ def build_percentile_export_table(
                 out[f"AP neto DSS {ap_label} ({unit_label(flow_unit)})"] = convert_flow(ap_neto_cfs, flow_unit)
         if include_evap_column and include_ap_total:
             evap_series_cfs = pd.Series([clean_evap_cfs(evap_cfs)] * len(base), index=base.index)
-            out[f"Evaporación sumada al AP DSS (p³/s)"] = evap_series_cfs
+            out["Evaporación sumada al AP DSS (p³/s)"] = evap_series_cfs
             if flow_unit != "cfs":
                 out[f"Evaporación sumada al AP DSS ({unit_label(flow_unit)})"] = convert_flow(evap_series_cfs, flow_unit)
         if include_ap_total:
@@ -5739,7 +5831,7 @@ def tab_exportar_percentil(
                 ))
             fig.update_layout(**_base_layout("AP exportado del percentil seleccionado", unit_txt, height=420))
             _today_line(fig, table["Fecha"])
-            st.plotly_chart(fig, use_container_width=True, key=f"exp_ap_preview_v2_{option_hash}")
+            st.plotly_chart(fig, width="stretch", key=f"exp_ap_preview_v2_{option_hash}")
 
     with st.expander("🧾 Diagnóstico de exportación", expanded=False):
         diag = pd.DataFrame([{
@@ -5756,10 +5848,10 @@ def tab_exportar_percentil(
             "Evaporación cfs": round(float(evap), 3),
             "Reducción AP exportado (%)": round(float(ap_reduction_pct or 0.0), 3),
         }])
-        st.dataframe(diag, use_container_width=True, hide_index=True)
+        st.dataframe(diag, width="stretch", hide_index=True)
         st.caption(f"Columnas exportadas: {len(table.columns)}")
 
-    st.dataframe(table, use_container_width=True, hide_index=True, height=520)
+    st.dataframe(table, width="stretch", hide_index=True, height=520)
 
     # ── Descarga: la tabla visible es la misma que se descarga ───────
     try:
@@ -5927,7 +6019,7 @@ def load_observed_data() -> Tuple[
 
     if file_info:
         with st.sidebar.expander("📋 Archivos BulkExport leídos", expanded=False):
-            st.dataframe(pd.DataFrame(file_info), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(file_info), width="stretch", hide_index=True)
 
     def _concat(lst: List[pd.DataFrame], variable: str) -> Optional[pd.DataFrame]:
         if not lst:
@@ -6314,7 +6406,7 @@ def tab_aportes_obs_semanal(
         if c not in preferred_cols and c not in {"Fecha gráfica", "Etiqueta semana"}
     ]
     show_display = show_tbl[preferred_cols + remaining_cols].copy()
-    st.dataframe(show_display, use_container_width=True, hide_index=True, height=520)
+    st.dataframe(show_display, width="stretch", hide_index=True, height=520)
 
     # Resumen inferior por embalse: muestra el promedio simple del porcentaje
     # semanal y el porcentaje acumulado/ponderado de todo el período filtrado.
@@ -6361,7 +6453,7 @@ def tab_aportes_obs_semanal(
         if resumen_rows:
             st.markdown("#### Acumulado y promedio de diferencia por embalse")
             resumen_embalse = pd.DataFrame(resumen_rows)
-            st.dataframe(resumen_embalse, use_container_width=True, hide_index=True, height=180)
+            st.dataframe(resumen_embalse, width="stretch", hide_index=True, height=180)
 
     # Tarjetas adicionales solicitadas: promedio de las semanas que van.
     # Se calcula con las semanas actualmente filtradas y pondera por días
@@ -6528,7 +6620,7 @@ def tab_aportes_obs_semanal(
             fig.update_layout(height=560, hovermode="x unified")
             fig.update_xaxes(title="Inicio de semana")
             fig.update_yaxes(title=unit_label(flow_unit))
-            st.plotly_chart(fig, use_container_width=True, key="apw_plot")
+            st.plotly_chart(fig, width="stretch", key="apw_plot")
 
     if not detail_table.empty:
         with st.expander("🔎 Detalle: comparación contra todos los percentiles DSS", expanded=False):
@@ -6553,7 +6645,7 @@ def tab_aportes_obs_semanal(
             ]:
                 if c in detail_show.columns:
                     detail_show[c] = pd.to_numeric(detail_show[c], errors="coerce").round(3)
-            st.dataframe(detail_show, use_container_width=True, hide_index=True, height=420)
+            st.dataframe(detail_show, width="stretch", hide_index=True, height=420)
             st.download_button(
                 "⬇️ Descargar detalle de todos los percentiles",
                 detail_show.to_csv(index=False).encode("utf-8-sig"),
@@ -6755,7 +6847,7 @@ def tab_ap_semanal_grafico(
             numeric_cols = [c for c in show.columns if c not in ["Fecha_dia", "Etiqueta semana", "Inicio semana", "Fin semana"]]
             for c in numeric_cols:
                 show[c] = pd.to_numeric(show[c], errors="coerce").round(3)
-            st.dataframe(show.drop(columns=["Fecha_dia"], errors="ignore"), use_container_width=True, hide_index=True, height=430)
+            st.dataframe(show.drop(columns=["Fecha_dia"], errors="ignore"), width="stretch", hide_index=True, height=430)
             st.download_button(
                 f"⬇️ Descargar AP semanal gráfico — {cfg['token']}",
                 show.to_csv(index=False).encode("utf-8-sig"),
@@ -6988,7 +7080,7 @@ def tab_esclusajes_gatun(
                 f"Prom. P{pct} (p³/s)",
             ]
         keep_cols = [c for c in keep_cols if c in weekly.columns]
-        st.dataframe(weekly[keep_cols], use_container_width=True, hide_index=True, height=430)
+        st.dataframe(weekly[keep_cols], width="stretch", hide_index=True, height=430)
         st.download_button(
             "⬇️ Descargar resumen semanal de esclusajes",
             weekly.to_csv(index=False).encode("utf-8-sig"),
@@ -7014,7 +7106,7 @@ def tab_esclusajes_gatun(
         for c in cols:
             if c != "Fecha":
                 daily_show[c] = pd.to_numeric(daily_show[c], errors="coerce").round(3)
-        st.dataframe(daily_show[cols], use_container_width=True, hide_index=True, height=430)
+        st.dataframe(daily_show[cols], width="stretch", hide_index=True, height=430)
         st.download_button(
             "⬇️ Descargar detalle diario de esclusajes",
             daily_show[cols].to_csv(index=False).encode("utf-8-sig"),
@@ -7087,7 +7179,7 @@ def tab_hp_semanal(dss_bytes: bytes) -> None:
         f"La variable **Hidrogeneración DSS** inicia en la semana 23. "
         f"Agrupación activa: **{rango_txt}**."
     )
-    st.dataframe(show, use_container_width=True, hide_index=True, height=520)
+    st.dataframe(show, width="stretch", hide_index=True, height=520)
     csv = show.to_csv(index=False).encode("utf-8-sig")
     st.download_button("⬇️ Descargar CSV HP semanal", csv, "hidrogeneracion_dss_semanal.csv", "text/csv", key=f"hpw_dl_{week_start}")
 
@@ -7113,7 +7205,7 @@ def tab_hp_semanal(dss_bytes: bytes) -> None:
             )
             fig.update_layout(height=520, hovermode="x unified")
             fig.update_xaxes(title="Inicio de semana")
-            st.plotly_chart(fig, use_container_width=True, key=f"hpw_plot_{week_start}")
+            st.plotly_chart(fig, width="stretch", key=f"hpw_plot_{week_start}")
 
 def tab_instructivo() -> None:
     st.subheader("📘 Instructivo operativo del dashboard DSS")
