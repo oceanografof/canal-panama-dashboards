@@ -12,7 +12,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
-from scipy import stats as sp_stats
+# SciPy es opcional en Streamlit Cloud. Si no está instalado, el app
+# utiliza una regresión lineal con NumPy y continúa funcionando.
+try:
+    from scipy import stats as sp_stats
+except ImportError:
+    sp_stats = None
 
 # ============================================================
 # CONFIG GENERAL
@@ -1589,8 +1594,31 @@ with tabs[tab_i]:
             fig_y = go.Figure()
             fig_y.add_trace(go.Bar(x=by_year["anio"], y=by_year["duracion_h"], marker_color=C["turquesa"]))
             if len(by_year) >= 3:
-                slope, intercept, r, p, _ = sp_stats.linregress(by_year["anio"], by_year["duracion_h"])
-                fig_y.add_trace(go.Scatter(x=by_year["anio"], y=slope * by_year["anio"] + intercept, mode="lines", line=dict(color=C["rojo"], dash="dash"), name=f"Tendencia p={p:.3f}"))
+                x_year = by_year["anio"].to_numpy(dtype=float)
+                y_hours = by_year["duracion_h"].to_numpy(dtype=float)
+
+                if sp_stats is not None:
+                    slope, intercept, r, p, _ = sp_stats.linregress(x_year, y_hours)
+                    trend_name = f"Tendencia p={p:.3f}"
+                else:
+                    # Alternativa sin SciPy: pendiente/intercepto y R² con NumPy.
+                    slope, intercept = np.polyfit(x_year, y_hours, 1)
+                    if np.std(x_year) > 0 and np.std(y_hours) > 0:
+                        r = float(np.corrcoef(x_year, y_hours)[0, 1])
+                        r2 = r ** 2 if np.isfinite(r) else np.nan
+                    else:
+                        r2 = np.nan
+                    trend_name = f"Tendencia R²={r2:.3f}" if np.isfinite(r2) else "Tendencia lineal"
+
+                fig_y.add_trace(
+                    go.Scatter(
+                        x=by_year["anio"],
+                        y=slope * x_year + intercept,
+                        mode="lines",
+                        line=dict(color=C["rojo"], dash="dash"),
+                        name=trend_name,
+                    )
+                )
             fig_y.update_layout(template="plotly_white", height=320, yaxis_title="Horas de surgencia", margin=dict(l=45, r=20, t=20, b=40))
             st.plotly_chart(fig_y, use_container_width=True)
         else:
