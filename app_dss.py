@@ -7902,7 +7902,7 @@ def tab_calados_npx(
             height=470,
             margin=dict(l=20, r=20, t=60, b=20),
         )
-        fig.update_yaxes(autorange="reversed", showgrid=True)
+        fig.update_yaxes(autorange=True, showgrid=True)
         fig.update_xaxes(showgrid=True)
         st.plotly_chart(fig, width="stretch", key="p95_calado_npx_timeline")
     else:
@@ -7969,7 +7969,7 @@ def tab_calados_npx(
                 title="Calado NPX (pies)",
                 overlaying="y",
                 side="right",
-                autorange="reversed",
+                autorange=True,
                 showgrid=False,
             ),
             hovermode="x unified",
@@ -7979,11 +7979,192 @@ def tab_calados_npx(
         )
         st.plotly_chart(fig2, width="stretch", key="p95_calado_vs_nivel_gatun")
 
-    with st.expander("Ver serie diaria completa de calado", expanded=False):
-        daily_show = daily[["Fecha_dia", "Calado_NPX_ft", "Nivel_Gatun_ft"]].rename(columns={
+    st.markdown("#### 💧 Consumo total y ahorros PMX/NPX")
+    water_required = {
+        "Fecha_dia", "Cantidad_PMX", "Ahorro_PMX",
+        "Cantidad_NPX", "Ahorro_NPX", "Volumen_Transito_hm3_d",
+    }
+    if water_required.issubset(daily.columns):
+        water = daily[list(water_required)].copy()
+        water["Fecha_dia"] = pd.to_datetime(water["Fecha_dia"], errors="coerce").dt.normalize()
+        for col in ("Cantidad_PMX", "Cantidad_NPX", "Volumen_Transito_hm3_d"):
+            water[col] = pd.to_numeric(water[col], errors="coerce")
+        water["Ahorro_PMX"] = water["Ahorro_PMX"].fillna("—").astype(str).str.strip().replace("", "—")
+        water["Ahorro_NPX"] = water["Ahorro_NPX"].fillna("—").astype(str).str.strip().replace("", "—")
+        water = water.dropna(subset=["Fecha_dia", "Volumen_Transito_hm3_d"]).sort_values("Fecha_dia")
+
+        if not water.empty:
+            min_water_date = pd.to_datetime(water["Fecha_dia"].min()).date()
+            max_water_date = pd.to_datetime(water["Fecha_dia"].max()).date()
+            d1, d2 = st.columns(2)
+            selected_start = d1.date_input(
+                "Inicio del análisis de consumo",
+                value=min_water_date,
+                min_value=min_water_date,
+                max_value=max_water_date,
+                key="calado_consumo_inicio",
+            )
+            selected_end = d2.date_input(
+                "Fin del análisis de consumo",
+                value=max_water_date,
+                min_value=min_water_date,
+                max_value=max_water_date,
+                key="calado_consumo_fin",
+            )
+
+            if selected_start > selected_end:
+                st.warning("La fecha inicial del consumo debe ser menor o igual que la fecha final.")
+            else:
+                start_water = pd.Timestamp(selected_start).normalize()
+                end_water = pd.Timestamp(selected_end).normalize()
+                period = water.loc[
+                    (water["Fecha_dia"] >= start_water)
+                    & (water["Fecha_dia"] <= end_water)
+                ].copy()
+
+                if period.empty:
+                    st.warning("No hay datos de consumo para el período seleccionado.")
+                else:
+                    total_volume = float(period["Volumen_Transito_hm3_d"].sum())
+                    avg_volume = float(period["Volumen_Transito_hm3_d"].mean())
+                    total_pmx = int(round(float(period["Cantidad_PMX"].fillna(0).sum())))
+                    total_npx = int(round(float(period["Cantidad_NPX"].fillna(0).sum())))
+                    total_transits = total_pmx + total_npx
+
+                    w1, w2, w3, w4, w5 = st.columns(5)
+                    w1.metric("Consumo acumulado", f"{total_volume:,.2f} hm³")
+                    w2.metric("Consumo promedio", f"{avg_volume:,.3f} hm³/día")
+                    w3.metric("Tránsitos PMX", f"{total_pmx:,}")
+                    w4.metric("Tránsitos NPX", f"{total_npx:,}")
+                    w5.metric("Tránsitos totales", f"{total_transits:,}")
+
+                    period["Configuración de ahorro"] = (
+                        "PMX: " + period["Ahorro_PMX"].astype(str)
+                        + " · NPX: " + period["Ahorro_NPX"].astype(str)
+                    )
+
+                    if PLOTLY_OK:
+                        fig_water = go.Figure()
+                        for saving_name, grp in period.groupby("Configuración de ahorro", sort=False):
+                            fig_water.add_trace(go.Bar(
+                                x=grp["Fecha_dia"],
+                                y=grp["Volumen_Transito_hm3_d"],
+                                name=str(saving_name),
+                                customdata=np.column_stack([
+                                    grp["Cantidad_PMX"].fillna(0),
+                                    grp["Cantidad_NPX"].fillna(0),
+                                ]),
+                                hovertemplate=(
+                                    "%{x|%d-%m-%Y}<br>Consumo total: %{y:.3f} hm³/día"
+                                    "<br>PMX: %{customdata[0]:.0f}"
+                                    "<br>NPX: %{customdata[1]:.0f}<extra>%{fullData.name}</extra>"
+                                ),
+                            ))
+                        fig_water.update_layout(
+                            title="Consumo total diario según la configuración de ahorro PMX/NPX",
+                            xaxis_title="Fecha",
+                            yaxis_title="Consumo total por tránsitos (hm³/día)",
+                            barmode="stack",
+                            hovermode="x unified",
+                            height=470,
+                            margin=dict(l=20, r=20, t=60, b=20),
+                            legend_title_text="Ahorro aplicado",
+                        )
+                        st.plotly_chart(
+                            fig_water,
+                            width="stretch",
+                            key="p95_calado_consumo_ahorros",
+                        )
+
+                    def _saving_summary(method_col: str, count_col: str, transit_label: str) -> pd.DataFrame:
+                        summary = (
+                            period.groupby(method_col, dropna=False)
+                            .agg(
+                                **{
+                                    "Días": ("Fecha_dia", "count"),
+                                    transit_label: (count_col, "sum"),
+                                    "Consumo total en esos días (hm³)": ("Volumen_Transito_hm3_d", "sum"),
+                                    "Consumo promedio (hm³/día)": ("Volumen_Transito_hm3_d", "mean"),
+                                }
+                            )
+                            .reset_index()
+                            .rename(columns={method_col: "Ahorro aplicado"})
+                        )
+                        summary["% del consumo total"] = np.where(
+                            total_volume > 0,
+                            summary["Consumo total en esos días (hm³)"] / total_volume * 100.0,
+                            np.nan,
+                        )
+                        summary[transit_label] = pd.to_numeric(
+                            summary[transit_label], errors="coerce"
+                        ).round().astype("Int64")
+                        return summary.sort_values(
+                            "Consumo total en esos días (hm³)", ascending=False
+                        ).reset_index(drop=True)
+
+                    pmx_summary = _saving_summary("Ahorro_PMX", "Cantidad_PMX", "Tránsitos PMX")
+                    npx_summary = _saving_summary("Ahorro_NPX", "Cantidad_NPX", "Tránsitos NPX")
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        st.markdown("##### PMX — ahorro y participación en el consumo total")
+                        st.dataframe(
+                            pmx_summary,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                                "Días": st.column_config.NumberColumn(format="%d"),
+                                "Tránsitos PMX": st.column_config.NumberColumn(format="%d"),
+                                "Consumo total en esos días (hm³)": st.column_config.NumberColumn(format="%.2f"),
+                                "Consumo promedio (hm³/día)": st.column_config.NumberColumn(format="%.3f"),
+                                "% del consumo total": st.column_config.NumberColumn(format="%.1f %%"),
+                            },
+                        )
+                    with sc2:
+                        st.markdown("##### NPX — ahorro y participación en el consumo total")
+                        st.dataframe(
+                            npx_summary,
+                            width="stretch",
+                            hide_index=True,
+                            column_config={
+                                "Días": st.column_config.NumberColumn(format="%d"),
+                                "Tránsitos NPX": st.column_config.NumberColumn(format="%d"),
+                                "Consumo total en esos días (hm³)": st.column_config.NumberColumn(format="%.2f"),
+                                "Consumo promedio (hm³/día)": st.column_config.NumberColumn(format="%.3f"),
+                                "% del consumo total": st.column_config.NumberColumn(format="%.1f %%"),
+                            },
+                        )
+
+                    st.caption(
+                        "El Excel P95 entrega el volumen total diario por tránsitos y el método de ahorro "
+                        "aplicado a PMX y NPX. No entrega un volumen numérico separado por clase; por eso "
+                        "las tablas muestran qué proporción del consumo total ocurrió bajo cada método, "
+                        "sin inventar una distribución de agua entre PMX y NPX."
+                    )
+        else:
+            st.info("La simulación no contiene valores válidos de consumo por tránsitos.")
+    else:
+        st.info(
+            "El archivo P95 cargado no incluye todas las columnas de cantidad, ahorro y consumo total "
+            "necesarias para este análisis."
+        )
+
+    with st.expander("Ver serie diaria completa de calado y consumo", expanded=False):
+        daily_cols = ["Fecha_dia", "Calado_NPX_ft", "Nivel_Gatun_ft"]
+        for optional_col in (
+            "Cantidad_PMX", "Ahorro_PMX", "Cantidad_NPX", "Ahorro_NPX",
+            "Volumen_Transito_hm3_d",
+        ):
+            if optional_col in daily.columns:
+                daily_cols.append(optional_col)
+        daily_show = daily[daily_cols].rename(columns={
             "Fecha_dia": "Fecha",
             "Calado_NPX_ft": "Calado NPX (pies)",
             "Nivel_Gatun_ft": "Nivel Gatún simulado (ft)",
+            "Cantidad_PMX": "PMX",
+            "Ahorro_PMX": "Ahorro PMX",
+            "Cantidad_NPX": "NPX",
+            "Ahorro_NPX": "Ahorro NPX",
+            "Volumen_Transito_hm3_d": "Consumo total (hm³/día)",
         })
         daily_show = daily_show.merge(
             obs[["Fecha_dia", "Nivel_observado_ft", "Fuente_observada"]].rename(columns={
@@ -8003,6 +8184,9 @@ def tab_calados_npx(
                 "Calado NPX (pies)": st.column_config.NumberColumn(format="%.1f"),
                 "Nivel Gatún simulado (ft)": st.column_config.NumberColumn(format="%.3f"),
                 "Nivel Gatún observado (ft)": st.column_config.NumberColumn(format="%.3f"),
+                "PMX": st.column_config.NumberColumn(format="%d"),
+                "NPX": st.column_config.NumberColumn(format="%d"),
+                "Consumo total (hm³/día)": st.column_config.NumberColumn(format="%.3f"),
             },
             height=520,
         )
