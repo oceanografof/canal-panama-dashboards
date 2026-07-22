@@ -657,6 +657,11 @@ def load_p95_simulation(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, obje
             "Evaporacion_Gatun_m3s": find_col("evap", "gatun"),
             "Salida_Neta_Alhajuela_m3s": find_col("sn", "alha"),
             "Salida_Neta_Gatun_m3s": find_col("sn", "gat"),
+            # Programa operativo de calados NPX incluido en el mismo resumen.
+            "Calado_NPX_ft": find_col("calado", "npx"),
+            "Cambio_Calado": find_col("cambio", "calado", "dia", "exacto"),
+            "Primer_dia_cambio": find_col("primer", "dia", "del", "cambio"),
+            "Numero_cambio": find_col("no", "cambio"),
         }
 
         required = [
@@ -702,15 +707,25 @@ def load_p95_simulation(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, obje
             raise ValueError("La hoja resumen P95 no contiene valores diarios calculados.")
 
         df = pd.DataFrame(rows)
+        text_cols = {"Ahorro_PMX", "Ahorro_NPX", "Cambio_Calado"}
+        date_cols = {"Primer_dia_cambio"}
         numeric_cols = [
             c for c in df.columns
-            if c not in {"Fecha_dia", "Ahorro_PMX", "Ahorro_NPX"}
+            if c not in ({"Fecha_dia"} | text_cols | date_cols)
         ]
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         for col in ("Ahorro_PMX", "Ahorro_NPX"):
             if col in df.columns:
                 df[col] = df[col].fillna("—").astype(str).str.strip().replace("", "—")
+        if "Cambio_Calado" in df.columns:
+            df["Cambio_Calado"] = (
+                df["Cambio_Calado"].fillna("").astype(str).str.strip()
+            )
+        if "Primer_dia_cambio" in df.columns:
+            df["Primer_dia_cambio"] = pd.to_datetime(
+                df["Primer_dia_cambio"], errors="coerce"
+            ).dt.normalize()
 
         df = (
             df.dropna(subset=["Fecha_dia", "Nivel_Alhajuela_ft", "Nivel_Gatun_ft"])
@@ -2145,7 +2160,7 @@ def sidebar() -> Dict:
         key="p95_sim_up",
         help=(
             "Archivo independiente con niveles, aportes y usos diarios del escenario. "
-            "Se mostrará en dos pestañas nuevas al final del dashboard."
+            "Se mostrará en tres pestañas nuevas al final del dashboard: Gatún, Alhajuela y Calados NPX."
         ),
     )
     if p95_sim_up:
@@ -7416,8 +7431,13 @@ def _p95_observed_level(
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Normaliza el nivel observado y restringe el seguimiento al período visible."""
-    empty = pd.DataFrame(columns=["Fecha_dia", "Nivel_observado_ft"])
+    """Normaliza el nivel observado y restringe el seguimiento al período visible.
+
+    Conserva la fuente del último valor diario para que las pestañas P95 puedan
+    mostrar con claridad si el seguimiento proviene de un CSV local, una carga
+    manual o la serie remota de Aquarius.
+    """
+    empty = pd.DataFrame(columns=["Fecha_dia", "Nivel_observado_ft", "Fuente_observada"])
     if obs_level is None or not isinstance(obs_level, pd.DataFrame) or obs_level.empty:
         return empty
     if "Fecha_dia" not in obs_level.columns or "Valor" not in obs_level.columns:
@@ -7425,13 +7445,19 @@ def _p95_observed_level(
     obs = clamp_observed_future_dates(obs_level, "Fecha_dia").copy()
     obs["Fecha_dia"] = pd.to_datetime(obs["Fecha_dia"], errors="coerce").dt.normalize()
     obs["Nivel_observado_ft"] = pd.to_numeric(obs["Valor"], errors="coerce")
+    if "Fuente" not in obs.columns:
+        obs["Fuente"] = "Nivel observado"
+    obs["Fuente_observada"] = obs["Fuente"].fillna("Nivel observado").astype(str)
     obs = obs.dropna(subset=["Fecha_dia", "Nivel_observado_ft"])
     obs = obs.loc[(obs["Fecha_dia"] >= start) & (obs["Fecha_dia"] <= end)]
     if obs.empty:
         return empty
     return (
         obs.groupby("Fecha_dia", as_index=False)
-        .agg(Nivel_observado_ft=("Nivel_observado_ft", "last"))
+        .agg(
+            Nivel_observado_ft=("Nivel_observado_ft", "last"),
+            Fuente_observada=("Fuente_observada", "last"),
+        )
         .sort_values("Fecha_dia")
     )
 
@@ -7553,8 +7579,10 @@ def tab_simulacion_p95_embalse(
         obs_value = float(latest_obs_row.iloc[0]["Nivel_observado_ft"])
         sim_same_date = float(latest_obs_row.iloc[0]["Nivel_simulado_ft"])
         diff_value = float(latest_obs_row.iloc[0]["Diferencia_obs_menos_sim_ft"])
+        obs_source = str(latest_obs_row.iloc[0].get("Fuente_observada", "Nivel observado"))
     else:
         obs_date = None
+        obs_source = "—"
         obs_value = sim_same_date = diff_value = np.nan
 
     inflow_selected = _p95_flow_from_m3s(filtered[inflow_col], flow_unit)
@@ -7590,6 +7618,28 @@ def tab_simulacion_p95_embalse(
         f"Salida neta promedio ({unit_label(flow_unit)})",
         f"{float(net_selected.mean()):,.2f}" if net_selected.notna().any() else "—",
     )
+
+    # Diagnóstico explícito de actualización del nivel observado.
+    if obs_date is None:
+        st.warning(
+            "⚠️ Seguimiento observado no disponible en el período seleccionado. "
+            "Verifique los CSV de nivel en `data/`, la carga manual o la conexión Aquarius."
+        )
+    else:
+        age_days = max(int((today_panama() - obs_date.normalize()).days), 0)
+        status_txt = (
+            "actualizado hoy" if age_days == 0
+            else f"último dato hace {age_days} día{'s' if age_days != 1 else ''}"
+        )
+        message = (
+            f"**Seguimiento observado activo:** {obs_date:%d-%m-%Y} · "
+            f"{obs_value:,.3f} ft · fuente: `{obs_source}` · {status_txt}. "
+            "La serie se vuelve a consolidar en cada ejecución; la URL Aquarius usa caché máxima de 15 minutos."
+        )
+        if age_days <= 2:
+            st.success(message)
+        else:
+            st.warning(message)
 
     _p95_plot_lines(
         level_follow,
@@ -7675,11 +7725,14 @@ def tab_simulacion_p95_embalse(
         "Salida neta": net_selected,
     })
     table = table.merge(
-        level_follow[["Fecha_dia", "Nivel_observado_ft", "Diferencia_obs_menos_sim_ft"]]
+        level_follow[[
+            "Fecha_dia", "Nivel_observado_ft", "Diferencia_obs_menos_sim_ft", "Fuente_observada"
+        ]]
         .rename(columns={
             "Fecha_dia": "Fecha",
             "Nivel_observado_ft": "Nivel observado (ft)",
             "Diferencia_obs_menos_sim_ft": "Obs. − sim. (ft)",
+            "Fuente_observada": "Fuente observada",
         }),
         on="Fecha",
         how="left",
@@ -7718,6 +7771,241 @@ def tab_simulacion_p95_embalse(
         column_config=table_config,
         height=min(720, 115 + 31 * len(table)),
     )
+
+
+def tab_calados_npx(
+    p95_sim_bytes: Optional[bytes],
+    p95_sim_name: str,
+    obs_gat_nivel: Optional[pd.DataFrame],
+) -> None:
+    """Programa de calados NPX y seguimiento conjunto con el nivel de Gatún."""
+    st.subheader("🚢 Programa de calados NPX")
+    st.caption(
+        "La tabla se obtiene directamente de las columnas de calado del archivo P95. "
+        "El calado es una premisa programada del escenario; el nivel observado se muestra "
+        "como seguimiento y no modifica automáticamente las fechas de cambio."
+    )
+
+    if not p95_sim_bytes:
+        st.warning(
+            "No se cargó `P95_DSS.xlsx`. Cárguelo en la barra lateral o colóquelo en la carpeta `data/`."
+        )
+        return
+
+    sim, meta = load_p95_simulation(p95_sim_bytes)
+    required = {"Fecha_dia", "Calado_NPX_ft"}
+    if sim.empty or not required.issubset(sim.columns):
+        st.warning("El resumen P95 no contiene una serie utilizable de calado NPX.")
+        return
+
+    daily = sim.copy().sort_values("Fecha_dia").reset_index(drop=True)
+    daily["Calado_NPX_ft"] = pd.to_numeric(daily["Calado_NPX_ft"], errors="coerce")
+    daily = daily.dropna(subset=["Fecha_dia", "Calado_NPX_ft"]).copy()
+    if daily.empty:
+        st.warning("No se encontraron valores válidos de calado NPX.")
+        return
+
+    # Detecta cada cambio aun cuando la columna textual venga vacía o no recalculada.
+    changed = daily["Calado_NPX_ft"].ne(daily["Calado_NPX_ft"].shift(1))
+    if "Cambio_Calado" in daily.columns:
+        changed = changed | daily["Cambio_Calado"].fillna("").astype(str).str.strip().ne("")
+    if "Primer_dia_cambio" in daily.columns:
+        changed = changed | pd.to_datetime(daily["Primer_dia_cambio"], errors="coerce").notna()
+
+    changes = daily.loc[changed].copy()
+    changes["Fecha del cambio"] = pd.to_datetime(changes["Fecha_dia"], errors="coerce")
+    changes["Calado NPX (pies)"] = pd.to_numeric(changes["Calado_NPX_ft"], errors="coerce")
+    if "Numero_cambio" in changes.columns:
+        num = pd.to_numeric(changes["Numero_cambio"], errors="coerce")
+        fallback_num = pd.Series(range(1, len(changes) + 1), index=changes.index, dtype=float)
+        changes["N.º de cambio"] = num.where(num.notna(), fallback_num).astype("Int64")
+    else:
+        changes["N.º de cambio"] = pd.Series(range(1, len(changes) + 1), index=changes.index, dtype="Int64")
+
+    changes = changes[["N.º de cambio", "Fecha del cambio", "Calado NPX (pies)"]]
+    changes = changes.drop_duplicates("Fecha del cambio", keep="last").sort_values("Fecha del cambio")
+
+    today = today_panama()
+    current_rows = daily.loc[pd.to_datetime(daily["Fecha_dia"]) <= today]
+    current_row = current_rows.iloc[-1] if not current_rows.empty else daily.iloc[0]
+    current_date = pd.to_datetime(current_row["Fecha_dia"])
+    current_draft = float(current_row["Calado_NPX_ft"])
+
+    future_changes = changes.loc[changes["Fecha del cambio"] > today]
+    next_change = future_changes.iloc[0] if not future_changes.empty else None
+    first_change = changes.iloc[0]
+    last_change = changes.iloc[-1]
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric(
+        "Calado vigente",
+        f"{current_draft:,.1f} pies",
+        help=f"Premisa aplicable al {current_date:%d-%m-%Y} según el escenario.",
+    )
+    m2.metric(
+        "Próximo cambio",
+        f"{float(next_change['Calado NPX (pies)']):,.1f} pies" if next_change is not None else "—",
+        help=(
+            f"Fecha: {pd.to_datetime(next_change['Fecha del cambio']):%d-%m-%Y}"
+            if next_change is not None else "No quedan cambios posteriores en el escenario."
+        ),
+    )
+    m3.metric("Calado inicial", f"{float(first_change['Calado NPX (pies)']):,.1f} pies")
+    m4.metric("Calado final", f"{float(last_change['Calado NPX (pies)']):,.1f} pies")
+    m5.metric("Cantidad de cambios", f"{len(changes):,}")
+
+    st.caption(
+        f"Archivo: {p95_sim_name or 'P95_DSS.xlsx'} · Hoja: {meta.get('sheet', '—')} · "
+        f"Programa: {pd.to_datetime(first_change['Fecha del cambio']):%d-%m-%Y} a "
+        f"{pd.to_datetime(last_change['Fecha del cambio']):%d-%m-%Y}."
+    )
+
+    st.markdown("#### 📋 Tabla de cambios de calado")
+    st.dataframe(
+        changes,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "N.º de cambio": st.column_config.NumberColumn(format="%d"),
+            "Fecha del cambio": st.column_config.DateColumn(format="DD-MM-YYYY"),
+            "Calado NPX (pies)": st.column_config.NumberColumn(format="%.1f"),
+        },
+        height=min(620, 105 + 35 * len(changes)),
+    )
+
+    if PLOTLY_OK:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=daily["Fecha_dia"],
+            y=daily["Calado_NPX_ft"],
+            mode="lines",
+            line_shape="hv",
+            line=dict(width=3),
+            name="Calado NPX programado",
+            hovertemplate="%{x|%d-%m-%Y}<br>Calado: %{y:.1f} pies<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=changes["Fecha del cambio"],
+            y=changes["Calado NPX (pies)"],
+            mode="markers+text",
+            text=[f"{v:.1f}" for v in changes["Calado NPX (pies)"]],
+            textposition="top center",
+            marker=dict(size=8),
+            name="Fecha de cambio",
+            hovertemplate="%{x|%d-%m-%Y}<br>Nuevo calado: %{y:.1f} pies<extra></extra>",
+        ))
+        fig.update_layout(
+            title="Evolución programada del calado NPX",
+            xaxis_title="Fecha",
+            yaxis_title="Calado NPX (pies)",
+            hovermode="x unified",
+            height=470,
+            margin=dict(l=20, r=20, t=60, b=20),
+        )
+        fig.update_yaxes(autorange="reversed", showgrid=True)
+        fig.update_xaxes(showgrid=True)
+        st.plotly_chart(fig, width="stretch", key="p95_calado_npx_timeline")
+    else:
+        st.line_chart(daily.set_index("Fecha_dia")[["Calado_NPX_ft"]])
+
+    st.markdown("#### 📈 Seguimiento con el nivel de Gatún")
+    start = pd.to_datetime(daily["Fecha_dia"].min()).normalize()
+    end = min(pd.to_datetime(daily["Fecha_dia"].max()).normalize(), today)
+    obs = _p95_observed_level(obs_gat_nivel, start, end)
+    level_daily = daily[["Fecha_dia", "Nivel_Gatun_ft", "Calado_NPX_ft"]].copy()
+    level_daily = level_daily.merge(obs, on="Fecha_dia", how="left")
+
+    latest_obs = level_daily.dropna(subset=["Nivel_observado_ft"]).tail(1)
+    if latest_obs.empty:
+        st.warning(
+            "No hay nivel observado de Gatún disponible para el período. "
+            "El programa de calados sigue visible, pero no puede contrastarse con el nivel real."
+        )
+    else:
+        r = latest_obs.iloc[0]
+        obs_date = pd.to_datetime(r["Fecha_dia"])
+        source = str(r.get("Fuente_observada", "Nivel observado"))
+        age_days = max(int((today - obs_date.normalize()).days), 0)
+        status = "actualizado hoy" if age_days == 0 else f"hace {age_days} día{'s' if age_days != 1 else ''}"
+        st.success(
+            f"Nivel observado de Gatún activo: **{float(r['Nivel_observado_ft']):,.3f} ft** "
+            f"al **{obs_date:%d-%m-%Y}** · fuente: `{source}` · {status}."
+        )
+
+    if PLOTLY_OK:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=level_daily["Fecha_dia"],
+            y=level_daily["Nivel_Gatun_ft"],
+            mode="lines",
+            name="Nivel Gatún simulado",
+            line=dict(width=3),
+            yaxis="y",
+        ))
+        fig2.add_trace(go.Scatter(
+            x=level_daily["Fecha_dia"],
+            y=level_daily["Nivel_observado_ft"],
+            mode="lines+markers",
+            name="Nivel Gatún observado",
+            line=dict(width=2),
+            marker=dict(size=5),
+            connectgaps=False,
+            yaxis="y",
+        ))
+        fig2.add_trace(go.Scatter(
+            x=level_daily["Fecha_dia"],
+            y=level_daily["Calado_NPX_ft"],
+            mode="lines",
+            line_shape="hv",
+            name="Calado NPX",
+            line=dict(width=2, dash="dot"),
+            yaxis="y2",
+        ))
+        fig2.update_layout(
+            title="Nivel de Gatún simulado/observado y calado NPX programado",
+            xaxis=dict(title="Fecha", showgrid=True),
+            yaxis=dict(title="Nivel Gatún (ft PLD)", showgrid=True),
+            yaxis2=dict(
+                title="Calado NPX (pies)",
+                overlaying="y",
+                side="right",
+                autorange="reversed",
+                showgrid=False,
+            ),
+            hovermode="x unified",
+            height=500,
+            margin=dict(l=20, r=20, t=60, b=20),
+            legend_title_text="Serie",
+        )
+        st.plotly_chart(fig2, width="stretch", key="p95_calado_vs_nivel_gatun")
+
+    with st.expander("Ver serie diaria completa de calado", expanded=False):
+        daily_show = daily[["Fecha_dia", "Calado_NPX_ft", "Nivel_Gatun_ft"]].rename(columns={
+            "Fecha_dia": "Fecha",
+            "Calado_NPX_ft": "Calado NPX (pies)",
+            "Nivel_Gatun_ft": "Nivel Gatún simulado (ft)",
+        })
+        daily_show = daily_show.merge(
+            obs[["Fecha_dia", "Nivel_observado_ft", "Fuente_observada"]].rename(columns={
+                "Fecha_dia": "Fecha",
+                "Nivel_observado_ft": "Nivel Gatún observado (ft)",
+                "Fuente_observada": "Fuente observada",
+            }),
+            on="Fecha",
+            how="left",
+        )
+        st.dataframe(
+            daily_show,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Fecha": st.column_config.DateColumn(format="DD-MM-YYYY"),
+                "Calado NPX (pies)": st.column_config.NumberColumn(format="%.1f"),
+                "Nivel Gatún simulado (ft)": st.column_config.NumberColumn(format="%.3f"),
+                "Nivel Gatún observado (ft)": st.column_config.NumberColumn(format="%.3f"),
+            },
+            height=520,
+        )
 
 
 def tab_instructivo() -> None:
@@ -8078,6 +8366,8 @@ def main() -> None:
         st.sidebar.error(f"Error cargando observados: {exc}")
         obs_gat_nivel = obs_alh_nivel = obs_gat_aporte = obs_alh_aporte = None
 
+    # La pestaña CALADOS NPX se mantiene al final, después de las vistas P95,
+    # conforme al orden operativo solicitado por el usuario.
     tabs = st.tabs([
         "🌊 GATÚN DSS",
         "🏔️ ALHAJUELA DSS",
@@ -8095,6 +8385,7 @@ def main() -> None:
         "📘 Instructivo",
         "📊 P95 GATÚN",
         "📊 P95 ALHAJUELA",
+        "🚢 CALADOS NPX",
     ])
 
     with tabs[0]:
@@ -8139,6 +8430,11 @@ def main() -> None:
         _run_tab(
             "P95 ALHAJUELA", tab_simulacion_p95_embalse,
             "alhajuela", p95_sim_bytes, p95_sim_name, flow_unit, obs_alh_nivel,
+        )
+    with tabs[16]:
+        _run_tab(
+            "CALADOS NPX", tab_calados_npx,
+            p95_sim_bytes, p95_sim_name, obs_gat_nivel,
         )
 
     st.markdown(
