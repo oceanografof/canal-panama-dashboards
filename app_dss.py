@@ -85,6 +85,13 @@ HISTORICAL_9798_NAMES = [
     "Aportes 1997 1998.xlsx", "Serie_1997_1998.xlsx",
 ]
 
+# Simulación operativa P95 entregada para seguimiento separado por embalse.
+# Se busca con nombre exacto para evitar confundirla con el Excel DSS principal.
+P95_SIMULATION_NAMES = [
+    "P95_DSS.xlsx", "P95 DSS.xlsx", "Simulacion_P95_DSS.xlsx",
+    "Simulación_P95_DSS.xlsx", "Escenario_P95_DSS.xlsx",
+]
+
 # Carpeta estándar de datos del proyecto.
 # La app busca primero en ./data y, como respaldo, en la carpeta donde está el script.
 DATA_DIR_NAME = "data"
@@ -568,6 +575,167 @@ def load_historical_9798(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, obj
         ),
     }
     return work, meta
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Simulación operativa P95 (archivo Resumen)
+# ─────────────────────────────────────────────────────────────────────
+def _norm_p95_header(value: object) -> str:
+    """Normaliza encabezados del resumen P95 sin depender de tildes o símbolos."""
+    s = str(value or "").strip().lower()
+    s = s.translate(str.maketrans("áéíóúüñ", "aeiouun"))
+    return re.sub(r"[^a-z0-9]+", "_", s).strip("_")
+
+
+@st.cache_data(show_spinner="Cargando simulación P95…")
+def load_p95_simulation(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """Lee los valores calculados de la hoja resumen de la simulación P95.
+
+    El Excel contiene fórmulas vinculadas a libros externos. Por eso se abre con
+    ``data_only=True`` y se utilizan únicamente los resultados almacenados por
+    Excel; la app no recalcula ni altera las premisas de la simulación.
+    """
+    if not file_bytes:
+        raise ValueError("Archivo de simulación P95 vacío.")
+
+    try:
+        wb = load_workbook(
+            BytesIO(file_bytes), read_only=True, data_only=True, keep_links=False
+        )
+    except Exception as exc:
+        raise ValueError(f"No se pudo abrir la simulación P95: {exc}")
+
+    try:
+        sheet_name = next(
+            (name for name in wb.sheetnames if "resumen" in _norm_p95_header(name)),
+            wb.sheetnames[0] if wb.sheetnames else None,
+        )
+        if not sheet_name:
+            raise ValueError("El Excel P95 no contiene hojas.")
+        ws = wb[sheet_name]
+
+        header_row = None
+        headers: List[object] = []
+        for row_num in range(1, min(int(ws.max_row or 1), 45) + 1):
+            row_headers = [ws.cell(row_num, col).value for col in range(1, int(ws.max_column or 1) + 1)]
+            norms = [_norm_p95_header(v) for v in row_headers]
+            if (
+                any("fecha_hora" in n for n in norms)
+                and any("elev_gatun" in n for n in norms)
+                and any("elev_alha" in n for n in norms)
+            ):
+                header_row = row_num
+                headers = row_headers
+                break
+        if header_row is None:
+            raise ValueError("No se encontró la fila de encabezados del resumen P95.")
+
+        def find_col(*tokens: str) -> Optional[int]:
+            for idx, value in enumerate(headers, start=1):
+                n = _norm_p95_header(value)
+                parts = set(n.split("_"))
+                if all(token in parts for token in tokens):
+                    return idx
+            return None
+
+        columns = {
+            "Fecha_dia": find_col("fecha", "hora"),
+            "Nivel_Alhajuela_ft": find_col("elev", "alha"),
+            "Nivel_Gatun_ft": find_col("elev", "gatun"),
+            "Aporte_Alhajuela_m3s": find_col("at", "alha"),
+            "Aporte_Gatun_m3s": find_col("at", "gatun"),
+            "Hidro_Alhajuela_MW": find_col("hidro", "alha"),
+            "Hidro_Gatun_MW": find_col("hidro", "gatun"),
+            "Vertido_Alhajuela_m3s": find_col("vert", "alha"),
+            "Vertido_Gatun_m3s": find_col("vert", "gatun"),
+            "Cantidad_PMX": find_col("cant", "pmx"),
+            "Ahorro_PMX": find_col("ahorro", "pmx"),
+            "Cantidad_NPX": find_col("cant", "npx"),
+            "Ahorro_NPX": find_col("ahorro", "npx"),
+            "Volumen_Transito_hm3_d": find_col("vol", "transito"),
+            "Evaporacion_Alhajuela_m3s": find_col("evap", "alha"),
+            "Evaporacion_Gatun_m3s": find_col("evap", "gatun"),
+            "Salida_Neta_Alhajuela_m3s": find_col("sn", "alha"),
+            "Salida_Neta_Gatun_m3s": find_col("sn", "gat"),
+        }
+
+        required = [
+            "Fecha_dia", "Nivel_Alhajuela_ft", "Nivel_Gatun_ft",
+            "Aporte_Alhajuela_m3s", "Aporte_Gatun_m3s",
+        ]
+        missing = [name for name in required if columns.get(name) is None]
+        if missing:
+            raise ValueError(
+                "Faltan columnas requeridas en el resumen P95: " + ", ".join(missing)
+            )
+
+        rows: List[Dict[str, object]] = []
+        started = False
+        blank_dates = 0
+        max_col = max(int(c) for c in columns.values() if c is not None)
+        for values in ws.iter_rows(
+            min_row=header_row + 1,
+            max_row=int(ws.max_row or header_row),
+            min_col=1,
+            max_col=max_col,
+            values_only=True,
+        ):
+            date_col = int(columns["Fecha_dia"] or 1)
+            raw_date = values[date_col - 1] if len(values) >= date_col else None
+            date_val = pd.to_datetime(raw_date, errors="coerce")
+            if pd.isna(date_val):
+                if started:
+                    blank_dates += 1
+                    if blank_dates >= 25:
+                        break
+                continue
+            started = True
+            blank_dates = 0
+            item: Dict[str, object] = {"Fecha_dia": pd.to_datetime(date_val).normalize()}
+            for name, col_idx in columns.items():
+                if name == "Fecha_dia" or col_idx is None:
+                    continue
+                item[name] = values[int(col_idx) - 1] if len(values) >= int(col_idx) else None
+            rows.append(item)
+
+        if not rows:
+            raise ValueError("La hoja resumen P95 no contiene valores diarios calculados.")
+
+        df = pd.DataFrame(rows)
+        numeric_cols = [
+            c for c in df.columns
+            if c not in {"Fecha_dia", "Ahorro_PMX", "Ahorro_NPX"}
+        ]
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        for col in ("Ahorro_PMX", "Ahorro_NPX"):
+            if col in df.columns:
+                df[col] = df[col].fillna("—").astype(str).str.strip().replace("", "—")
+
+        df = (
+            df.dropna(subset=["Fecha_dia", "Nivel_Alhajuela_ft", "Nivel_Gatun_ft"])
+            .sort_values("Fecha_dia")
+            .drop_duplicates("Fecha_dia", keep="last")
+            .reset_index(drop=True)
+        )
+        if df.empty:
+            raise ValueError("No quedaron registros válidos de nivel en la simulación P95.")
+
+        description = ws["C2"].value if int(ws.max_row or 0) >= 2 else None
+        title = ws["C6"].value if int(ws.max_row or 0) >= 6 else None
+        scenario = ws["C7"].value if int(ws.max_row or 0) >= 7 else None
+        meta: Dict[str, object] = {
+            "sheet": sheet_name,
+            "title": str(title).strip() if title not in (None, "") else "Modelo GLR",
+            "scenario": str(scenario).strip() if scenario not in (None, "") else "Escenario P95",
+            "description": str(description).strip() if description not in (None, "") else "",
+            "start": pd.to_datetime(df["Fecha_dia"].min()),
+            "end": pd.to_datetime(df["Fecha_dia"].max()),
+            "rows": int(len(df)),
+        }
+        return df, meta
+    finally:
+        wb.close()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1970,6 +2138,27 @@ def sidebar() -> Dict:
 
     st.sidebar.caption(f"DSS: **{dss_name}** · búsqueda local: `data/` → carpeta del app")
 
+    st.sidebar.header("📊 Simulación P95 operativa")
+    p95_sim_up = st.sidebar.file_uploader(
+        "Resumen P95 (P95_DSS.xlsx)",
+        type=["xlsx", "xlsm"],
+        key="p95_sim_up",
+        help=(
+            "Archivo independiente con niveles, aportes y usos diarios del escenario. "
+            "Se mostrará en dos pestañas nuevas al final del dashboard."
+        ),
+    )
+    if p95_sim_up:
+        p95_sim_bytes = p95_sim_up.getvalue()
+        p95_sim_name = p95_sim_up.name
+    else:
+        p95_sim_bytes, p95_sim_path = read_first_local_exact(P95_SIMULATION_NAMES)
+        p95_sim_name = p95_sim_path.name if p95_sim_path else "—"
+    if p95_sim_bytes:
+        st.sidebar.caption(f"Simulación P95: **{p95_sim_name}** · carga automática o manual")
+    else:
+        st.sidebar.caption("Simulación P95 no cargada. Coloque `P95_DSS.xlsx` en `data/` o cárguela aquí.")
+
     st.sidebar.header("🕰️ Serie histórica 1997-1998")
     hist_9798_up = st.sidebar.file_uploader(
         "Aportes diarios 1997-1998 (Excel)",
@@ -2151,6 +2340,8 @@ def sidebar() -> Dict:
 
     return {
         "dss_bytes": dss_bytes,
+        "p95_sim_bytes": p95_sim_bytes,
+        "p95_sim_name": p95_sim_name,
         "hist_9798_bytes": hist_9798_bytes,
         "hist_9798_name": hist_9798_name,
         "flow_unit": flow_unit,
@@ -7207,6 +7398,328 @@ def tab_hp_semanal(dss_bytes: bytes) -> None:
             fig.update_xaxes(title="Inicio de semana")
             st.plotly_chart(fig, width="stretch", key=f"hpw_plot_{week_start}")
 
+def _p95_flow_from_m3s(values: pd.Series, flow_unit: str) -> pd.Series:
+    """Convierte una serie de m³/s a la unidad de caudal seleccionada en la app."""
+    m3s = pd.to_numeric(values, errors="coerce")
+    return convert_flow(m3s * M3S_TO_CFS, flow_unit)
+
+
+def _p95_flow_from_hm3_day(values: pd.Series, flow_unit: str) -> pd.Series:
+    """Convierte hm³/día a la unidad de caudal seleccionada."""
+    hm3_day = pd.to_numeric(values, errors="coerce")
+    cfs = hm3_day / CFS_TO_HM3_DAY
+    return convert_flow(cfs, flow_unit)
+
+
+def _p95_observed_level(
+    obs_level: Optional[pd.DataFrame],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Normaliza el nivel observado y restringe el seguimiento al período visible."""
+    empty = pd.DataFrame(columns=["Fecha_dia", "Nivel_observado_ft"])
+    if obs_level is None or not isinstance(obs_level, pd.DataFrame) or obs_level.empty:
+        return empty
+    if "Fecha_dia" not in obs_level.columns or "Valor" not in obs_level.columns:
+        return empty
+    obs = clamp_observed_future_dates(obs_level, "Fecha_dia").copy()
+    obs["Fecha_dia"] = pd.to_datetime(obs["Fecha_dia"], errors="coerce").dt.normalize()
+    obs["Nivel_observado_ft"] = pd.to_numeric(obs["Valor"], errors="coerce")
+    obs = obs.dropna(subset=["Fecha_dia", "Nivel_observado_ft"])
+    obs = obs.loc[(obs["Fecha_dia"] >= start) & (obs["Fecha_dia"] <= end)]
+    if obs.empty:
+        return empty
+    return (
+        obs.groupby("Fecha_dia", as_index=False)
+        .agg(Nivel_observado_ft=("Nivel_observado_ft", "last"))
+        .sort_values("Fecha_dia")
+    )
+
+
+def _p95_plot_lines(
+    plot_df: pd.DataFrame,
+    y_columns: List[str],
+    labels: Dict[str, str],
+    title: str,
+    y_title: str,
+    key: str,
+) -> None:
+    """Gráfico de líneas consistente para las pestañas del escenario P95."""
+    valid = [c for c in y_columns if c in plot_df.columns and pd.to_numeric(plot_df[c], errors="coerce").notna().any()]
+    if not valid:
+        st.info("No hay datos válidos para esta gráfica en el período seleccionado.")
+        return
+
+    if not PLOTLY_OK:
+        fallback = plot_df.set_index("Fecha_dia")[valid].rename(columns=labels)
+        st.line_chart(fallback)
+        return
+
+    fig = go.Figure()
+    for col in valid:
+        mode = "lines+markers" if "observado" in col.lower() else "lines"
+        width = 3.0 if "nivel_simulado" in col.lower() else 2.2
+        fig.add_trace(go.Scatter(
+            x=plot_df["Fecha_dia"],
+            y=pd.to_numeric(plot_df[col], errors="coerce"),
+            mode=mode,
+            name=labels.get(col, col),
+            line=dict(width=width),
+            marker=dict(size=5),
+            connectgaps=False,
+            hovertemplate=(
+                "%{x|%d-%m-%Y}<br>" + labels.get(col, col) + ": %{y:,.3f}<extra></extra>"
+            ),
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Fecha",
+        yaxis_title=y_title,
+        hovermode="x unified",
+        legend_title_text="Serie",
+        margin=dict(l=20, r=20, t=60, b=20),
+        height=455,
+    )
+    fig.update_xaxes(showgrid=True)
+    fig.update_yaxes(showgrid=True)
+    st.plotly_chart(fig, width="stretch", key=key)
+
+
+def tab_simulacion_p95_embalse(
+    res_key: str,
+    p95_sim_bytes: Optional[bytes],
+    p95_sim_name: str,
+    flow_unit: str,
+    obs_level: Optional[pd.DataFrame],
+) -> None:
+    """Pestaña metodológica de la simulación P95 para un embalse."""
+    cfg = RESERVOIR_CONFIG[res_key]
+    name = cfg["name"]
+    st.subheader(f"📊 Simulación P95 · {name}")
+    st.caption(
+        "Panel independiente del DSS percentilado principal. Presenta los valores diarios "
+        "calculados en el Excel P95 y superpone el nivel observado disponible para seguimiento."
+    )
+
+    if not p95_sim_bytes:
+        st.warning(
+            "No se cargó `P95_DSS.xlsx`. Cárguelo en la barra lateral o colóquelo en la carpeta `data/`."
+        )
+        return
+
+    sim, meta = load_p95_simulation(p95_sim_bytes)
+    if sim.empty:
+        st.warning("La simulación P95 no contiene registros utilizables.")
+        return
+
+    is_gatun = res_key == "gatun"
+    level_col = "Nivel_Gatun_ft" if is_gatun else "Nivel_Alhajuela_ft"
+    inflow_col = "Aporte_Gatun_m3s" if is_gatun else "Aporte_Alhajuela_m3s"
+    hydro_col = "Hidro_Gatun_MW" if is_gatun else "Hidro_Alhajuela_MW"
+    spill_col = "Vertido_Gatun_m3s" if is_gatun else "Vertido_Alhajuela_m3s"
+    evap_col = "Evaporacion_Gatun_m3s" if is_gatun else "Evaporacion_Alhajuela_m3s"
+    net_col = "Salida_Neta_Gatun_m3s" if is_gatun else "Salida_Neta_Alhajuela_m3s"
+
+    description = str(meta.get("description", "")).strip()
+    if description:
+        compact_desc = " · ".join(part.strip() for part in description.splitlines() if part.strip())
+        st.info(f"**Premisas del archivo:** {compact_desc}")
+    st.caption(
+        f"Archivo: {p95_sim_name or 'P95_DSS.xlsx'} · Hoja: {meta.get('sheet', '—')} · "
+        f"Período completo: {pd.to_datetime(meta['start']):%d-%m-%Y} a {pd.to_datetime(meta['end']):%d-%m-%Y} · "
+        f"{int(meta.get('rows', len(sim)))} días."
+    )
+
+    filtered = date_filter(sim, key=f"p95_sim_{res_key}", default_days=0)
+    if filtered.empty:
+        st.warning("No hay datos de simulación en el período seleccionado.")
+        return
+    filtered = filtered.sort_values("Fecha_dia").copy()
+    start = pd.to_datetime(filtered["Fecha_dia"].min()).normalize()
+    end = pd.to_datetime(filtered["Fecha_dia"].max()).normalize()
+    obs = _p95_observed_level(obs_level, start, end)
+
+    level_follow = filtered[["Fecha_dia", level_col]].rename(columns={level_col: "Nivel_simulado_ft"})
+    level_follow = level_follow.merge(obs, on="Fecha_dia", how="left")
+    level_follow["Diferencia_obs_menos_sim_ft"] = (
+        level_follow["Nivel_observado_ft"] - level_follow["Nivel_simulado_ft"]
+    )
+
+    latest_sim = filtered.iloc[-1]
+    final_sim = sim.sort_values("Fecha_dia").iloc[-1]
+    latest_obs_row = level_follow.dropna(subset=["Nivel_observado_ft"]).tail(1)
+    if not latest_obs_row.empty:
+        obs_date = pd.to_datetime(latest_obs_row.iloc[0]["Fecha_dia"])
+        obs_value = float(latest_obs_row.iloc[0]["Nivel_observado_ft"])
+        sim_same_date = float(latest_obs_row.iloc[0]["Nivel_simulado_ft"])
+        diff_value = float(latest_obs_row.iloc[0]["Diferencia_obs_menos_sim_ft"])
+    else:
+        obs_date = None
+        obs_value = sim_same_date = diff_value = np.nan
+
+    inflow_selected = _p95_flow_from_m3s(filtered[inflow_col], flow_unit)
+    net_selected = _p95_flow_from_m3s(filtered[net_col], flow_unit)
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric(
+        "Nivel simulado último día visible",
+        f"{float(latest_sim[level_col]):,.3f} ft",
+        help=f"Fecha: {pd.to_datetime(latest_sim['Fecha_dia']):%d-%m-%Y}",
+    )
+    m2.metric(
+        "Último nivel observado",
+        f"{obs_value:,.3f} ft" if pd.notna(obs_value) else "—",
+        help=f"Fecha: {obs_date:%d-%m-%Y}" if obs_date is not None else "Sin nivel observado dentro del período visible.",
+    )
+    m3.metric(
+        "Obs. − sim. en igual fecha",
+        f"{diff_value:+,.3f} ft" if pd.notna(diff_value) else "—",
+        delta=(f"Simulado: {sim_same_date:,.3f} ft" if pd.notna(sim_same_date) else None),
+        delta_color="inverse",
+    )
+    m4.metric(
+        "Nivel final del escenario",
+        f"{float(final_sim[level_col]):,.3f} ft",
+        help=f"Fecha final: {pd.to_datetime(final_sim['Fecha_dia']):%d-%m-%Y}",
+    )
+    m5.metric(
+        f"Aporte promedio ({unit_label(flow_unit)})",
+        f"{float(inflow_selected.mean()):,.2f}" if inflow_selected.notna().any() else "—",
+    )
+    m6.metric(
+        f"Salida neta promedio ({unit_label(flow_unit)})",
+        f"{float(net_selected.mean()):,.2f}" if net_selected.notna().any() else "—",
+    )
+
+    _p95_plot_lines(
+        level_follow,
+        ["Nivel_simulado_ft", "Nivel_observado_ft"],
+        {
+            "Nivel_simulado_ft": "Nivel simulado P95",
+            "Nivel_observado_ft": "Nivel observado",
+        },
+        f"Seguimiento de nivel · {name}",
+        "Nivel (ft PLD)",
+        key=f"p95_level_{res_key}",
+    )
+
+    st.markdown("#### 🌧️ Aportes utilizados en la simulación")
+    st.caption(
+        "La curva corresponde directamente a la columna de aporte AT del archivo P95; "
+        "no se sustituye por el percentil seleccionado en la barra lateral del DSS principal."
+    )
+    inflow_plot = pd.DataFrame({
+        "Fecha_dia": filtered["Fecha_dia"],
+        "Aporte_simulacion": inflow_selected,
+    })
+    _p95_plot_lines(
+        inflow_plot,
+        ["Aporte_simulacion"],
+        {"Aporte_simulacion": "Aporte usado por la simulación"},
+        f"Aportes diarios utilizados · {name}",
+        f"Caudal ({unit_label(flow_unit)})",
+        key=f"p95_inflow_{res_key}_{flow_unit}",
+    )
+
+    st.markdown("#### 💧 Usos y salidas del embalse")
+    uses_plot = pd.DataFrame({
+        "Fecha_dia": filtered["Fecha_dia"],
+        "Vertido": _p95_flow_from_m3s(filtered[spill_col], flow_unit),
+        "Evaporacion": _p95_flow_from_m3s(filtered[evap_col], flow_unit),
+        "Salida_neta": net_selected,
+    })
+    if is_gatun and "Volumen_Transito_hm3_d" in filtered.columns:
+        uses_plot["Transitos_equivalentes"] = _p95_flow_from_hm3_day(
+            filtered["Volumen_Transito_hm3_d"], flow_unit
+        )
+    labels = {
+        "Vertido": "Vertido",
+        "Evaporacion": "Evaporación",
+        "Salida_neta": "Salida neta",
+        "Transitos_equivalentes": "Volumen por tránsitos",
+    }
+    _p95_plot_lines(
+        uses_plot,
+        ["Vertido", "Evaporacion", "Salida_neta", "Transitos_equivalentes"],
+        labels,
+        f"Usos y salidas diarias · {name}",
+        f"Flujo equivalente ({unit_label(flow_unit)})",
+        key=f"p95_uses_{res_key}_{flow_unit}",
+    )
+    st.caption(
+        "Las series se muestran como variables individuales del Excel para trazabilidad; "
+        "el panel no las suma ni modifica, porque la salida neta puede integrar varios componentes del balance."
+    )
+
+    hydro_plot = pd.DataFrame({
+        "Fecha_dia": filtered["Fecha_dia"],
+        "Hidrogeneracion": pd.to_numeric(filtered[hydro_col], errors="coerce"),
+    })
+    _p95_plot_lines(
+        hydro_plot,
+        ["Hidrogeneracion"],
+        {"Hidrogeneracion": "Hidrogeneración"},
+        f"Hidrogeneración diaria · {name}",
+        "Potencia (MW)",
+        key=f"p95_hydro_{res_key}",
+    )
+
+    st.markdown("#### 📋 Detalle diario y seguimiento")
+    table = pd.DataFrame({
+        "Fecha": filtered["Fecha_dia"],
+        "Nivel simulado (ft)": pd.to_numeric(filtered[level_col], errors="coerce"),
+        "Aporte usado": inflow_selected,
+        "Hidrogeneración (MW)": pd.to_numeric(filtered[hydro_col], errors="coerce"),
+        "Vertido": _p95_flow_from_m3s(filtered[spill_col], flow_unit),
+        "Evaporación": _p95_flow_from_m3s(filtered[evap_col], flow_unit),
+        "Salida neta": net_selected,
+    })
+    table = table.merge(
+        level_follow[["Fecha_dia", "Nivel_observado_ft", "Diferencia_obs_menos_sim_ft"]]
+        .rename(columns={
+            "Fecha_dia": "Fecha",
+            "Nivel_observado_ft": "Nivel observado (ft)",
+            "Diferencia_obs_menos_sim_ft": "Obs. − sim. (ft)",
+        }),
+        on="Fecha",
+        how="left",
+    )
+    if is_gatun:
+        table["Tránsitos (hm³/d)"] = pd.to_numeric(
+            filtered["Volumen_Transito_hm3_d"], errors="coerce"
+        ).to_numpy()
+        table["PMX"] = pd.to_numeric(filtered["Cantidad_PMX"], errors="coerce").to_numpy()
+        table["Ahorro PMX"] = filtered["Ahorro_PMX"].astype(str).to_numpy()
+        table["NPX"] = pd.to_numeric(filtered["Cantidad_NPX"], errors="coerce").to_numpy()
+        table["Ahorro NPX"] = filtered["Ahorro_NPX"].astype(str).to_numpy()
+
+    flow_cols = ["Aporte usado", "Vertido", "Evaporación", "Salida neta"]
+    table = table.rename(columns={c: f"{c} ({unit_label(flow_unit)})" for c in flow_cols})
+    table = table.sort_values("Fecha").reset_index(drop=True)
+    table_config = {
+        "Fecha": st.column_config.DateColumn("Fecha", format="DD-MM-YYYY"),
+        "Nivel simulado (ft)": st.column_config.NumberColumn(format="%.3f"),
+        "Nivel observado (ft)": st.column_config.NumberColumn(format="%.3f"),
+        "Obs. − sim. (ft)": st.column_config.NumberColumn(format="%+.3f"),
+        "Hidrogeneración (MW)": st.column_config.NumberColumn(format="%.2f"),
+        f"Aporte usado ({unit_label(flow_unit)})": st.column_config.NumberColumn(format="%.2f"),
+        f"Vertido ({unit_label(flow_unit)})": st.column_config.NumberColumn(format="%.2f"),
+        f"Evaporación ({unit_label(flow_unit)})": st.column_config.NumberColumn(format="%.2f"),
+        f"Salida neta ({unit_label(flow_unit)})": st.column_config.NumberColumn(format="%.2f"),
+    }
+    if is_gatun:
+        table_config["Tránsitos (hm³/d)"] = st.column_config.NumberColumn(format="%.3f")
+        table_config["PMX"] = st.column_config.NumberColumn(format="%d")
+        table_config["NPX"] = st.column_config.NumberColumn(format="%d")
+    st.dataframe(
+        table,
+        width="stretch",
+        hide_index=True,
+        column_config=table_config,
+        height=min(720, 115 + 31 * len(table)),
+    )
+
+
 def tab_instructivo() -> None:
     st.subheader("📘 Instructivo operativo del dashboard DSS")
     st.markdown("""
@@ -7540,6 +8053,8 @@ def main() -> None:
 
     cfg = sidebar()
     dss_bytes = cfg["dss_bytes"]
+    p95_sim_bytes = cfg.get("p95_sim_bytes")
+    p95_sim_name = str(cfg.get("p95_sim_name", "—"))
     hist_9798_bytes = cfg.get("hist_9798_bytes")
     hist_9798_name = str(cfg.get("hist_9798_name", "—"))
     flow_unit = cfg["flow_unit"]
@@ -7578,6 +8093,8 @@ def main() -> None:
         "⚡ Aporte instantáneo",
         "⬇️ Exportar",
         "📘 Instructivo",
+        "📊 P95 GATÚN",
+        "📊 P95 ALHAJUELA",
     ])
 
     with tabs[0]:
@@ -7613,6 +8130,16 @@ def main() -> None:
         _run_tab("Exportar", tab_exportar_percentil, dss_bytes, flow_unit, pct_ref_gat, pct_ref_alh, evap_gat_cfs, evap_alh_cfs, obs_gat_aporte, obs_alh_aporte)
     with tabs[13]:
         _run_tab("Instructivo", tab_instructivo)
+    with tabs[14]:
+        _run_tab(
+            "P95 GATÚN", tab_simulacion_p95_embalse,
+            "gatun", p95_sim_bytes, p95_sim_name, flow_unit, obs_gat_nivel,
+        )
+    with tabs[15]:
+        _run_tab(
+            "P95 ALHAJUELA", tab_simulacion_p95_embalse,
+            "alhajuela", p95_sim_bytes, p95_sim_name, flow_unit, obs_alh_nivel,
+        )
 
     st.markdown(
         f"<div class='footer'>{SIMULATION_NOTE} · {AUTHOR_NOTE} · Vistas acumuladas: {view_count:,}</div>",
