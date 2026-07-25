@@ -571,6 +571,141 @@ def run_git(repo_dir: Path, *cmd: str, env: dict | None = None) -> tuple[int, st
     return result.returncode, stdout, stderr
 
 
+# Opciones conservadoras para reintentar operaciones de red cuando Git para
+# Windows no puede mapear (mmap) algún archivo auxiliar del repositorio.
+# Estas opciones solo desactivan aceleradores/cachés; no alteran el contenido.
+GIT_MMAP_RETRY_CONFIG = (
+    "-c", "core.preloadIndex=false",
+    "-c", "core.untrackedCache=false",
+    "-c", "core.fsmonitor=false",
+    "-c", "core.multiPackIndex=false",
+    "-c", "fetch.writeCommitGraph=false",
+)
+
+
+def is_git_mmap_error(*parts: str) -> bool:
+    message = "\n".join(part for part in parts if part).lower()
+    return "mmap failed" in message or "cannot mmap" in message or "could not mmap" in message
+
+
+def is_probably_onedrive_path(path: Path) -> bool:
+    normalized = str(path.resolve()).replace("/", "\\").lower()
+    return "\\onedrive" in normalized or "onedrive - " in normalized
+
+
+def _move_git_cache_to_backup(path: Path, backup_root: Path) -> bool:
+    """Mueve un caché opcional de Git a respaldo, sin borrar objetos reales."""
+    if not path.exists():
+        return False
+    backup_root.mkdir(parents=True, exist_ok=True)
+    target = backup_root / path.name
+    suffix = 1
+    while target.exists():
+        target = backup_root / f"{path.name}-{suffix}"
+        suffix += 1
+    shutil.move(str(path), str(target))
+    return True
+
+
+def backup_optional_git_mmap_caches(repo_dir: Path) -> bool:
+    """Respalda metadatos regenerables que pueden causar mmap en OneDrive.
+
+    Nunca mueve .pack, .idx, refs, HEAD, index ni archivos de trabajo. Solo
+    retira temporalmente commit-graph, multi-pack-index, bitmaps y reverse index,
+    que Git puede regenerar automáticamente.
+    """
+    git_dir = git_dir_path(repo_dir)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_root = git_dir / f"mmap-cache-backup-{stamp}"
+
+    candidates: list[Path] = [
+        git_dir / "objects" / "info" / "commit-graph",
+        git_dir / "objects" / "info" / "commit-graphs",
+        git_dir / "objects" / "pack" / "multi-pack-index",
+    ]
+    pack_dir = git_dir / "objects" / "pack"
+    if pack_dir.exists():
+        candidates.extend(sorted(pack_dir.glob("multi-pack-index-*.bitmap")))
+        candidates.extend(sorted(pack_dir.glob("*.bitmap")))
+        candidates.extend(sorted(pack_dir.glob("*.rev")))
+
+    moved: list[str] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            if _move_git_cache_to_backup(candidate, backup_root):
+                moved.append(candidate.name)
+        except OSError as exc:
+            print(f"  ⚠️ No se pudo respaldar caché opcional {candidate.name}: {sanitize_text(str(exc))}")
+
+    if moved:
+        print(f"  ✅ Metadatos opcionales de Git respaldados en .git/{backup_root.name}")
+        for name in moved:
+            print(f"    · {name}")
+        return True
+    return False
+
+
+def git_mmap_action_message(repo_dir: Path) -> str:
+    lines = [
+        "Git continúa mostrando 'mmap failed: Invalid argument'.",
+        "Esto apunta a un problema local de lectura/mapeo dentro de .git, no a Aquarius ni a las credenciales.",
+    ]
+    if is_probably_onedrive_path(repo_dir):
+        lines.extend([
+            "El repositorio está dentro de OneDrive.",
+            "Marque la carpeta completa del repositorio como 'Mantener siempre en este dispositivo' y espere el círculo verde.",
+            "La solución más estable es clonar o mover el repositorio a una carpeta local fuera de OneDrive, por ejemplo C:\\Git\\TuRepo.",
+        ])
+    lines.extend([
+        "Actualice Git para Windows y pruebe manualmente desde la raíz: git fetch origin --prune",
+        "No borre archivos .pack o .idx manualmente.",
+    ])
+    return " ".join(lines)
+
+
+def run_git_network(repo_dir: Path, *git_args: str, env: dict | None = None) -> tuple[int, str, str]:
+    """Ejecuta fetch/pull/push y aplica una recuperación limitada ante mmap.
+
+    Flujo:
+    1) comando normal;
+    2) reintento sin cachés/aceleradores opcionales;
+    3) respaldo de metadatos regenerables y último reintento.
+    """
+    code, out, err = run_git(repo_dir, "git", *git_args, env=env)
+    if code == 0 or not is_git_mmap_error(out, err):
+        return code, out, err
+
+    print("  ⚠️ Git reportó mmap failed; reintentando sin precarga ni cachés opcionales...")
+    code, out, err = run_git(repo_dir, "git", *GIT_MMAP_RETRY_CONFIG, *git_args, env=env)
+    if code == 0:
+        print("  ✅ Operación Git completada con el modo conservador.")
+        return code, out, err
+    if not is_git_mmap_error(out, err):
+        return code, out, err
+
+    print("  ⚠️ El error mmap persiste; se respaldarán solo metadatos regenerables de Git.")
+    moved = backup_optional_git_mmap_caches(repo_dir)
+    if moved:
+        code, out, err = run_git(repo_dir, "git", *GIT_MMAP_RETRY_CONFIG, *git_args, env=env)
+        if code == 0:
+            print("  ✅ Operación Git completada después de regenerar metadatos opcionales.")
+            return code, out, err
+
+    if is_git_mmap_error(out, err):
+        detail = (err or out).rstrip()
+        help_text = git_mmap_action_message(repo_dir)
+        err = f"{detail}\n{help_text}" if detail else help_text
+    return code, out, err
+
+
 # ── Reparación segura de rebases interrumpidos ─────────────────────────────
 def git_dir_path(repo_dir: Path) -> Path:
     """Devuelve la carpeta real .git, compatible con worktrees y .git tipo archivo."""
@@ -1003,20 +1138,20 @@ def pull_rebase_with_generated_resolution(repo_dir: Path, branch: str, *, precom
     if precommit:
         commit_auto_changes(repo_dir, f"Cambios seguros antes de pull {datetime.now():%Y-%m-%d %H:%M}")
 
-    code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "--autostash", "origin", branch)
+    code, out, err = run_git_network(repo_dir, "pull", "--rebase", "--autostash", "origin", branch)
     if code == 0:
         return
 
     msg0 = (out + " " + err).strip()
     if "unknown option" in msg0.lower() or "autostash" in msg0.lower():
-        code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "origin", branch)
+        code, out, err = run_git_network(repo_dir, "pull", "--rebase", "origin", branch)
         if code == 0:
             return
 
     msg_pull = (out + " " + err).strip()
     if "rebase-merge" in msg_pull or "rebase-apply" in msg_pull or "rebase in progress" in msg_pull.lower():
         repair_interrupted_rebase_state(repo_dir)
-        code, out, err = run_git(repo_dir, "git", "pull", "--rebase", "--autostash", "origin", branch)
+        code, out, err = run_git_network(repo_dir, "pull", "--rebase", "--autostash", "origin", branch)
         if code == 0:
             return
         msg_pull = (out + " " + err).strip()
@@ -1070,7 +1205,7 @@ def ensure_default_branch(repo_dir: Path) -> str:
 
     warn_remote_credentials(repo_dir)
 
-    code, out, err = run_git(repo_dir, "git", "fetch", "origin", "--prune")
+    code, out, err = run_git_network(repo_dir, "fetch", "origin", "--prune")
     if code != 0:
         raise RuntimeError(f"No se pudo hacer git fetch origin: {(err or out).strip()}")
 
@@ -1711,7 +1846,7 @@ def git_push(repo_dir: Path, branch: str) -> bool:
         print(f"  ❌ git commit bloqueado: {sanitize_text(str(e))}")
         return False
 
-    code, out, err = run_git(repo_dir, "git", "push", "origin", branch)
+    code, out, err = run_git_network(repo_dir, "push", "origin", branch)
     if code != 0:
         print(f"  ⚠️ git push falló inicialmente:\n    {err or out}")
         print("  → Intentando pull --rebase y nuevo push...")
@@ -1720,7 +1855,7 @@ def git_push(repo_dir: Path, branch: str) -> bool:
         except Exception as e:
             print(f"  ❌ No se pudo sincronizar automáticamente: {sanitize_text(str(e))}")
             return False
-        code, out, err = run_git(repo_dir, "git", "push", "origin", branch)
+        code, out, err = run_git_network(repo_dir, "push", "origin", branch)
         if code != 0:
             print(f"  ❌ git push falló:\n    {err or out}")
             print("  → Revise permisos, Git Credential Manager, token/SSH o protección de rama.")
