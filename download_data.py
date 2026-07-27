@@ -546,13 +546,37 @@ def validate_download_url(url: str) -> None:
         raise ValueError(f"URL bloqueada: dominio no permitido ({parsed.hostname}).")
 
 
+# Compatibilidad de Git para repositorios alojados en OneDrive sobre Windows.
+# Git for Windows puede fallar al anexar el reflog con:
+#   invalid write operation detected
+#   unable to append to .git/logs/refs/heads/...: Invalid argument
+# La opción recomendada por Git evita esa operación de append atómico. Se pasa
+# por comando para que también proteja fetch, rebase, commit y push, sin depender
+# de que la configuración local se haya guardado previamente.
+GIT_WINDOWS_APPEND_CONFIG = ("-c", "windows.appendAtomically=false")
+
+
+def prepare_git_command(cmd: tuple[str, ...]) -> list[str]:
+    command = list(cmd)
+    if not command:
+        return command
+
+    executable = Path(command[0]).name.lower()
+    is_git_command = executable in {"git", "git.exe"}
+    has_override = any("windows.appendatomically" in part.lower() for part in command)
+
+    if os.name == "nt" and is_git_command and not has_override:
+        command = [command[0], *GIT_WINDOWS_APPEND_CONFIG, *command[1:]]
+    return command
+
+
 def run_git(repo_dir: Path, *cmd: str, env: dict | None = None) -> tuple[int, str, str]:
     full_env = os.environ.copy()
     full_env.setdefault("GIT_TERMINAL_PROMPT", "0")
     if env:
         full_env.update(env)
     result = subprocess.run(
-        list(cmd),
+        prepare_git_command(cmd),
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
@@ -591,6 +615,47 @@ def is_git_mmap_error(*parts: str) -> bool:
 def is_probably_onedrive_path(path: Path) -> bool:
     normalized = str(path.resolve()).replace("/", "\\").lower()
     return "\\onedrive" in normalized or "onedrive - " in normalized
+
+
+def is_git_windows_append_error(*parts: str) -> bool:
+    """Reconoce el fallo de reflog/ref típico de Git for Windows + OneDrive."""
+    message = "\n".join(part for part in parts if part).lower()
+    return (
+        "invalid write operation detected" in message
+        or "windows.appendatomically" in message
+        or (
+            "cannot update the ref" in message
+            and "logs/refs/" in message.replace("\\", "/")
+            and "invalid argument" in message
+        )
+    )
+
+
+def ensure_windows_onedrive_git_config(repo_dir: Path, *, force: bool = False) -> bool:
+    """Guarda la corrección solo en este repositorio; nunca cambia Git global."""
+    if os.name != "nt":
+        return False
+    if not force and not is_probably_onedrive_path(repo_dir):
+        return False
+
+    code, current, _ = run_git(
+        repo_dir, "git", "config", "--local", "--get", "windows.appendAtomically"
+    )
+    if code == 0 and current.strip().lower() == "false":
+        return True
+
+    code, out, err = run_git(
+        repo_dir, "git", "config", "--local", "windows.appendAtomically", "false"
+    )
+    if code != 0:
+        print(
+            "  ⚠️ No se pudo guardar la compatibilidad Git/OneDrive en .git/config: "
+            f"{(err or out).strip()}"
+        )
+        return False
+
+    print("  ✅ Compatibilidad Git/OneDrive aplicada: windows.appendAtomically=false")
+    return True
 
 
 def _move_git_cache_to_backup(path: Path, backup_root: Path) -> bool:
@@ -1102,10 +1167,24 @@ def commit_auto_changes(repo_dir: Path, message: str) -> bool:
         print(f"    · {path}")
 
     code, out, err = run_git(repo_dir, "git", "commit", "-m", message)
+    if code != 0 and is_git_windows_append_error(out, err):
+        print("  ⚠️ Git no pudo actualizar el reflog en OneDrive; aplicando corrección local y reintentando...")
+        ensure_windows_onedrive_git_config(repo_dir, force=True)
+        time.sleep(1)
+        code, out, err = run_git(repo_dir, "git", "commit", "-m", message)
+
     if code != 0:
         msg = (out + " " + err).strip()
         if "nothing to commit" in msg or "nada para hacer commit" in msg:
             return False
+        if is_git_windows_append_error(msg):
+            raise RuntimeError(
+                "git commit continuó fallando al actualizar el reflog dentro de OneDrive. "
+                "La corrección windows.appendAtomically=false ya fue aplicada solo a este repositorio. "
+                "Cierre aplicaciones que estén sincronizando o inspeccionando la carpeta y vuelva a ejecutar. "
+                "Si persiste, mueva o clone el repositorio fuera de OneDrive, por ejemplo C:\\Git\\TuRepo. "
+                f"Detalle: {msg}"
+            )
         raise RuntimeError(f"git commit falló: {msg}")
     print(f"  ✅ git commit OK: {message}")
     return True
@@ -1191,6 +1270,10 @@ def ensure_default_branch(repo_dir: Path) -> str:
     code, out, err = run_git(repo_dir, "git", "rev-parse", "--is-inside-work-tree")
     if code != 0 or out.strip().lower() != "true":
         raise RuntimeError("Esta carpeta no parece ser un repositorio Git.")
+
+    # Debe ejecutarse antes de commit/pull. La opción se guarda únicamente en
+    # .git/config del repositorio actual y no modifica la configuración global.
+    ensure_windows_onedrive_git_config(repo_dir)
 
     code, top, err = run_git(repo_dir, "git", "rev-parse", "--show-toplevel")
     if code == 0:

@@ -42,6 +42,17 @@ if not exist "%PY_SCRIPT%" (
     goto ERROR_FINAL
 )
 
+REM Compatibilidad local para Git for Windows cuando .git esta dentro de OneDrive.
+REM Evita: invalid write operation / unable to append al reflog de la rama.
+REM Se aplica solo a este repositorio; no modifica la configuracion global de Git.
+git config --local windows.appendAtomically false >nul 2>&1
+if errorlevel 1 (
+    echo ADVERTENCIA: no se pudo guardar la compatibilidad Git/OneDrive desde el BAT.
+    echo El script Python intentara aplicarla nuevamente antes del commit.
+) else (
+    echo Compatibilidad Git/OneDrive verificada.
+)
+
 set "PYTHON_CMD="
 where py >nul 2>&1
 if not errorlevel 1 set "PYTHON_CMD=py -3 -u"
