@@ -75,6 +75,7 @@ except Exception: # pragma: no cover
 
 
 APP_TITLE = "Evaluación Hidrológica Modelo GLR"
+SYSTEM_LABEL = "GLR / FEWS"
 SUBTITLE = "Basado en pronóstico meteorológico - próximos 10 días"
 
 # Paleta inspirada en la plantilla GLR, con mayor contraste.
@@ -288,7 +289,7 @@ def load_glr_excel(excel_file) -> Tuple[pd.DataFrame, List[str], str]:
     resumen = _prepare_dataframe(_normalize_resumen(pd.read_excel(excel_file, sheet_name="Resumen Simulación")))
 
   if not host.empty and not resumen.empty:
-    # HostFolder conserva curvas guía, observados y salidas totales.
+    # HostFolder conserva niveles observados/proyectados, aportes y salidas totales.
     # Resumen Simulación aporta hidrogeneración, vertidos y esclusajes.
     ops = resumen[["fecha", "hidro_alha", "hidro_gat", "vert_alha", "vert_gat", "esclusajes"]].copy()
     df = host.drop(columns=["hidro_alha", "hidro_gat", "vert_alha", "vert_gat", "esclusajes"], errors="ignore")
@@ -349,6 +350,8 @@ def report_metrics(df: pd.DataFrame) -> Dict[str, float]:
     "sal_alha_prom": _safe_mean(df, "salidas_alha"),
     "sal_gat_prom": _safe_mean(df, "salidas_gat"),
     "consumo_prom": _safe_mean(df, "esclusajes"),
+    "vol_esclusajes_dia": (_safe_mean(df, "esclusajes") * 86400.0 / 1_000_000.0) if pd.notna(_safe_mean(df, "esclusajes")) else np.nan,
+    "vol_esclusajes_horizonte": (_safe_mean(df, "esclusajes") * float((df["fecha"].max() - df["fecha"].min()).total_seconds() + 3600.0) / 1_000_000.0) if ("fecha" in df and not df.empty and pd.notna(_safe_mean(df, "esclusajes"))) else np.nan,
     "hidro_alha_prom": _safe_mean(df, "hidro_alha"),
     "hidro_gat_prom": _safe_mean(df, "hidro_gat"),
     "vert_alha_prom": _safe_mean(df, "vert_alha"),
@@ -373,9 +376,11 @@ def automatic_narrative(df: pd.DataFrame, premisas: List[str], meta: ReportMeta)
     f"{_fmt(m.get('alha_ini'))} a {_fmt(m.get('alha_fin'))} pies "
     f"(variación {_fmt(da)} pies). Gatún {vg} de {_fmt(m.get('gat_ini'))} a "
     f"{_fmt(m.get('gat_fin'))} pies (variación {_fmt(dg)} pies). "
-    f"Los aportes medios son {_fmt(m.get('ap_alha_prom'))} m³/s en Alhajuela y "
-    f"{_fmt(m.get('ap_gat_prom'))} m³/s en Gatún. El promedio de esclusajes es "
-    f"{_fmt(m.get('consumo_prom'))} m³/s. La hidrogeneración promedio es "
+    f"Los aportes promedio son {_fmt(m.get('ap_alha_prom'))} m³/s en Alhajuela y "
+    f"{_fmt(m.get('ap_gat_prom'))} m³/s en Gatún. El caudal promedio de esclusajes es "
+    f"{_fmt(m.get('consumo_prom'))} m³/s, equivalente a un volumen promedio de "
+    f"{_fmt(m.get('vol_esclusajes_dia'))} hm³/día y {_fmt(m.get('vol_esclusajes_horizonte'))} hm³ durante el horizonte. "
+    f"La hidrogeneración promedio es "
     f"{_fmt(m.get('hidro_alha_prom'))} MW en Alhajuela/Madden y "
     f"{_fmt(m.get('hidro_gat_prom'))} MW en Gatún."
   )
@@ -483,8 +488,29 @@ def _setup_dark_axis(ax, title: str, ylabel: str):
   ax.grid(True, color=GRID, alpha=0.24, linestyle="--", linewidth=0.75)
   for sp in ax.spines.values():
     sp.set_color(GRID)
-  ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-  ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
+
+
+def _apply_time_axis(ax, x_values, labelsize: float = 10.0):
+  x = pd.to_datetime(pd.Series(x_values)).dropna()
+  if x.empty:
+    return
+  span_hours = max(1.0, (x.max() - x.min()).total_seconds() / 3600.0)
+  if span_hours <= 48:
+    locator = mdates.HourLocator(interval=3)
+  elif span_hours <= 120:
+    locator = mdates.HourLocator(interval=6)
+  elif span_hours <= 240:
+    locator = mdates.HourLocator(interval=12)
+  else:
+    locator = mdates.DayLocator(interval=1)
+  ax.xaxis.set_major_locator(locator)
+  ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b\n%H:%M"))
+  pad_hours = 2 if span_hours > 72 else 1
+  ax.set_xlim(x.min() - pd.Timedelta(hours=pad_hours), x.max() + pd.Timedelta(hours=pad_hours))
+  ax.tick_params(axis="x", colors=MUTED, labelsize=labelsize, pad=7)
+  for label in ax.get_xticklabels():
+    label.set_rotation(0)
+    label.set_ha("center")
 
 
 def _legend(ax, ncol: int = 3, y: float = 1.015):
@@ -553,7 +579,10 @@ def plot_reservoir(df: pd.DataFrame, reservoir: str, output_path: str) -> str:
   )
   fig.subplots_adjust(top=0.89, bottom=0.13, left=0.080, right=0.975)
   x = pd.to_datetime(df["fecha"])
-  fig.suptitle(title, color=WHITE, fontsize=19, fontweight="bold", y=0.965)
+  fig.suptitle(title, color=WHITE, fontsize=19, fontweight="bold", y=0.972)
+  if not x.empty:
+    fig.text(0.975, 0.942, f"Periodo: {x.min():%d/%m/%Y %H:%M} a {x.max():%d/%m/%Y %H:%M}",
+             ha="right", va="center", color=MUTED, fontsize=9.2)
 
   # Panel 1: niveles, con límite ajustado a la serie principal.
   _setup_dark_axis(ax1, "Niveles proyectados y observados", "Nivel (pies)")
@@ -636,11 +665,10 @@ def plot_reservoir(df: pd.DataFrame, reservoir: str, output_path: str) -> str:
   ax2.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f"))
   _legend(ax2, 3)
 
-  ax2.set_xlabel("Fecha", color=WHITE, fontsize=12.5, fontweight="bold", labelpad=10)
-  for label in ax2.get_xticklabels():
-    label.set_rotation(0)
-    label.set_ha("center")
-  plt.setp(ax1.get_xticklabels(), visible=False)
+  _apply_time_axis(ax1, x, labelsize=9.2)
+  _apply_time_axis(ax2, x, labelsize=10.0)
+  ax1.tick_params(axis="x", labelbottom=True)
+  ax2.set_xlabel("Fecha / hora", color=WHITE, fontsize=12.5, fontweight="bold", labelpad=10)
   fig.savefig(output_path, dpi=200, facecolor=BG, bbox_inches="tight")
   plt.close(fig)
   return output_path
@@ -728,7 +756,8 @@ def _ppt_header(slide, meta: ReportMeta, title: str):
     slide.shapes.add_picture(meta.logo_path, Inches(0.25), Inches(0.10), width=Inches(0.50))
   _ppt_text(slide, "CANAL DE PANAMÁ", 0.88, 0.14, 2.05, 0.30, 13.5, True)
   _ppt_text(slide, "HIMH - SECCIÓN DE HIDROLOGÍA", 0.88, 0.45, 2.40, 0.20, 8.2, True, (220, 224, 230))
-  _ppt_text(slide, title, 3.25, 0.12, 6.85, 0.54, 16.5, True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
+  _ppt_text(slide, SYSTEM_LABEL, 5.35, 0.05, 2.65, 0.18, 7.8, True, (142, 200, 239), align=PP_ALIGN.CENTER)
+  _ppt_text(slide, title, 3.25, 0.21, 6.85, 0.45, 16.0, True, align=PP_ALIGN.CENTER, valign=MSO_ANCHOR.MIDDLE)
   _ppt_text(slide, "Última actualización\n" + meta.actualizacion.strftime("%d/%m/%Y %H:%M"), 10.45, 0.12, 2.55, 0.52, 8.2, False, (215, 218, 224), align=PP_ALIGN.RIGHT)
   line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.25), Inches(0.76), Inches(12.78), Inches(0.025))
   line.fill.solid(); line.fill.fore_color.rgb = RGBColor(45, 96, 124); line.line.fill.background()
@@ -786,7 +815,7 @@ def generate_pptx(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, outpu
       ("Alhajuela fin.", _fmt(m.get("alha_fin"), 2, " pies")),
       ("Gatún ini.", _fmt(m.get("gat_ini"), 2, " pies")),
       ("Gatún fin.", _fmt(m.get("gat_fin"), 2, " pies")),
-      ("Esclusajes prom.", _fmt(m.get("consumo_prom"), 2, " m³/s")),
+      ("Vol. esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día")),
     ]
     xs = [0.55, 3.05, 5.55, 8.05, 10.55]
     for (lab, val), x in zip(labels, xs):
@@ -891,14 +920,19 @@ def generate_docx(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, outpu
       run_logo.add_picture(meta.logo_path, width=DocxInches(0.60))
 
     m = report_metrics(df)
+    sys_p = doc.add_paragraph(SYSTEM_LABEL)
+    sys_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in sys_p.runs:
+      run.bold = True
+      run.font.size = DocxPt(10)
     title = doc.add_heading(meta.titulo, level=0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p = doc.add_paragraph(meta.subtitulo); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph(f"Última actualización: {meta.actualizacion:%d/%m/%Y %H:%M} | Hidrólogo de turno: {meta.hidrologo}")
     tmet = doc.add_table(rows=2, cols=5)
     tmet.style = "Table Grid"
-    headers = ["Alhajuela inicial", "Alhajuela final", "Gatún inicial", "Gatún final", "Esclusajes prom."]
-    vals = [_fmt(m.get("alha_ini"),2," pies"), _fmt(m.get("alha_fin"),2," pies"), _fmt(m.get("gat_ini"),2," pies"), _fmt(m.get("gat_fin"),2," pies"), _fmt(m.get("consumo_prom"),2," m³/s")]
+    headers = ["Alhajuela inicial", "Alhajuela final", "Gatún inicial", "Gatún final", "Vol. esclusajes"]
+    vals = [_fmt(m.get("alha_ini"),2," pies"), _fmt(m.get("alha_fin"),2," pies"), _fmt(m.get("gat_ini"),2," pies"), _fmt(m.get("gat_fin"),2," pies"), _fmt(m.get("vol_esclusajes_dia"),2," hm³/día")]
     for i, h in enumerate(headers): tmet.cell(0,i).text = h
     for i, v in enumerate(vals): tmet.cell(1,i).text = v
     doc.add_heading("Premisas operativas", level=1)
@@ -960,6 +994,9 @@ def generate_pdf(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, output
       canvas_obj.setFillColor(colors.white)
       canvas_obj.setFont("Helvetica-Bold", 10)
       canvas_obj.drawString(0.92 * inch, page_h - 0.48 * inch, "CANAL DE PANAMÁ | HIMH - SECCIÓN DE HIDROLOGÍA")
+      canvas_obj.setFont("Helvetica-Bold", 8)
+      canvas_obj.setFillColor(colors.HexColor(LIGHT_BLUE))
+      canvas_obj.drawCentredString(page_w / 2.0, page_h - 0.48 * inch, SYSTEM_LABEL)
       if meta.logo_path and os.path.exists(meta.logo_path):
         try:
           canvas_obj.drawImage(meta.logo_path, 0.45 * inch, page_h - 0.69 * inch, width=0.34 * inch, height=0.34 * inch, preserveAspectRatio=True, mask='auto')
@@ -972,10 +1009,10 @@ def generate_pdf(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, output
       canvas_obj.restoreState()
 
     m = report_metrics(df)
-    story = [Paragraph(meta.titulo, title_style), Paragraph(meta.subtitulo, body), Spacer(1, 0.06 * inch)]
+    story = [Paragraph(SYSTEM_LABEL, ParagraphStyle("SystemLabel", parent=body, textColor=colors.HexColor(LIGHT_BLUE), fontName="Helvetica-Bold", fontSize=9, alignment=TA_CENTER, spaceAfter=3)), Paragraph(meta.titulo, title_style), Paragraph(meta.subtitulo, body), Spacer(1, 0.06 * inch)]
     metric_table = Table([
-      ["Alhajuela inicial", "Alhajuela final", "Gatún inicial", "Gatún final", "Esclusajes prom."],
-      [_fmt(m.get("alha_ini"),2," pies"), _fmt(m.get("alha_fin"),2," pies"), _fmt(m.get("gat_ini"),2," pies"), _fmt(m.get("gat_fin"),2," pies"), _fmt(m.get("consumo_prom"),2," m³/s")],
+      ["Alhajuela inicial", "Alhajuela final", "Gatún inicial", "Gatún final", "Vol. esclusajes"],
+      [_fmt(m.get("alha_ini"),2," pies"), _fmt(m.get("alha_fin"),2," pies"), _fmt(m.get("gat_ini"),2," pies"), _fmt(m.get("gat_fin"),2," pies"), _fmt(m.get("vol_esclusajes_dia"),2," hm³/día")],
     ], colWidths=[2.0*inch]*5)
     metric_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor(BLUE)),("BACKGROUND",(0,1),(-1,1),colors.HexColor(PANEL)),("TEXTCOLOR",(0,0),(-1,-1),colors.white),("GRID",(0,0),(-1,-1),0.35,colors.HexColor('#70757D')),("ALIGN",(0,0),(-1,-1),'CENTER')]))
     story += [metric_table, Spacer(1,0.10*inch), Paragraph("Premisas operativas", h1)]
@@ -1043,7 +1080,8 @@ def generate_html(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, outpu
       ("Alhajuela final", _fmt(m.get("alha_fin"), 2, " pies")),
       ("Gatún inicial", _fmt(m.get("gat_ini"), 2, " pies")),
       ("Gatún final", _fmt(m.get("gat_fin"), 2, " pies")),
-      ("Esclusajes promedio", _fmt(m.get("consumo_prom"), 2, " m³/s")),
+      ("Aportes promedio Gatún", _fmt(m.get("ap_gat_prom"), 2, " m³/s")),
+      ("Volumen promedio de esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día")),
     ]
     cards_html = "".join(f'<div class="card"><span>{html.escape(k)}</span><strong>{html.escape(v)}</strong></div>' for k, v in cards)
     prem_html = "".join(f"<li>{html.escape(p)}</li>" for p in (premisas if premisas else ["Sin premisas cargadas."]))
@@ -1059,6 +1097,7 @@ def generate_html(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, outpu
 *{{box-sizing:border-box}} body{{margin:0;background:var(--bg);color:var(--text);font-family:Arial,Helvetica,sans-serif;line-height:1.42}}
 .container{{max-width:1450px;margin:auto;padding:24px}} header{{border-bottom:3px solid var(--blue);padding-bottom:18px;margin-bottom:24px}}
 .header-top{{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}} .header-copy{{flex:1}} .logo-mini{{width:62px;max-width:62px;height:auto;opacity:.96;flex:0 0 auto}}
+.system-label{{text-align:center;color:var(--light-blue,#8ec8ef);font-weight:700;letter-spacing:1.2px;font-size:14px;margin-bottom:4px}}
 h1{{font-size:30px;margin:0 0 6px;text-align:center}} .subtitle{{text-align:center;color:var(--muted);margin:0}}
 .meta{{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:16px;color:var(--muted);font-size:13px}}
 .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:22px 0}}
@@ -1076,14 +1115,14 @@ button{{position:fixed;right:18px;bottom:18px;background:var(--blue);color:white
 <body>
 <div class="container">
 <div class="page">
-<header><div class="header-top"><div class="header-copy"><h1>{html.escape(meta.titulo)}</h1><p class="subtitle">{html.escape(meta.subtitulo)}</p><div class="meta"><span>Hidrólogo de turno: {html.escape(meta.hidrologo)}</span><span>Actualización: {meta.actualizacion:%d/%m/%Y %H:%M}</span></div></div>{logo_tag}</div></header>
+<header><div class="header-top"><div class="header-copy"><div class="system-label">{SYSTEM_LABEL}</div><h1>{html.escape(meta.titulo)}</h1><p class="subtitle">{html.escape(meta.subtitulo)}</p><div class="meta"><span>Hidrólogo de turno: {html.escape(meta.hidrologo)}</span><span>Actualización: {meta.actualizacion:%d/%m/%Y %H:%M}</span></div></div>{logo_tag}</div></header>
 <div class="cards">{cards_html}</div>
 <section><h2>Resumen ejecutivo</h2><div class="narrative">{html.escape(automatic_narrative(df, premisas, meta))}</div></section>
 <section><h2>Premisas operativas</h2><ul>{prem_html}</ul><p>{html.escape(meta.descripcion)}</p></section>
 </div>
 <div class="page"><section><h2>Embalse Alhajuela</h2><img class="chart" src="{_img_data_uri(charts['alha'])}" alt="Gráficas de Alhajuela"></section></div>
 <div class="page"><section><h2>Embalse Gatún</h2><img class="chart" src="{_img_data_uri(charts['gatun'])}" alt="Gráficas de Gatún"></section></div>
-<div class="page"><section><h2>Resumen consolidado de 10 días</h2><p><strong>Escenario:</strong> {meta.horizonte_dias} días - GLR</p><div class="table-wrap">{table_html}</div></section><footer>Reporte GLR autocontenido - estructura compacta en 4 hojas.</footer></div>
+<div class="page"><section><h2>Resumen consolidado de 10 días</h2><p><strong>Escenario:</strong> {meta.horizonte_dias} días - GLR</p><div class="table-wrap">{table_html}</div></section><footer>Actualización: {meta.actualizacion:%d/%m/%Y %H:%M}</footer></div>
 </div><button onclick="window.print()">Imprimir / Guardar PDF</button>
 </body></html>"""
     Path(output_path).write_text(doc_html, encoding="utf-8")
@@ -1120,6 +1159,7 @@ def run_streamlit():
   </style>
   """, unsafe_allow_html=True)
 
+  st.markdown(f"<div style='text-align:center;color:{LIGHT_BLUE};font-weight:700;letter-spacing:1.2px'>{SYSTEM_LABEL}</div>", unsafe_allow_html=True)
   st.title(APP_TITLE)
   st.caption("Dashboard integral separado por embalse y exportación a PowerPoint, Word, PDF y HTML")
 
@@ -1176,13 +1216,14 @@ def run_streamlit():
 
   with tabs[0]:
     st.subheader("Indicadores principales")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     da = m.get("alha_fin", np.nan) - m.get("alha_ini", np.nan)
     dg = m.get("gat_fin", np.nan) - m.get("gat_ini", np.nan)
     c1.metric("Alhajuela final", _fmt(m.get("alha_fin"), 2, " pies"), _fmt(da, 2, " pies"))
     c2.metric("Gatún final", _fmt(m.get("gat_fin"), 2, " pies"), _fmt(dg, 2, " pies"))
-    c3.metric("Esclusajes promedio", _fmt(m.get("consumo_prom"), 2, " m³/s"))
-    c4.metric("Hidro Alhajuela promedio", _fmt(m.get("hidro_alha_prom"), 2, " MW"))
+    c3.metric("Aportes promedio Gatún", _fmt(m.get("ap_gat_prom"), 2, " m³/s"))
+    c4.metric("Volumen esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día"))
+    c5.metric("Hidro Alhajuela promedio", _fmt(m.get("hidro_alha_prom"), 2, " MW"))
     st.subheader("Resumen ejecutivo automático")
     st.info(automatic_narrative(view, premisas, meta))
 
@@ -1192,7 +1233,7 @@ def run_streamlit():
       op1, op2, op3, op4 = st.columns(4)
       op1.metric("Hidro Alhajuela promedio", _fmt(pd.to_numeric(d.get("hidro_alha"), errors="coerce").mean(), 2, " MW"))
       op2.metric("Hidro Gatún promedio", _fmt(pd.to_numeric(d.get("hidro_gat"), errors="coerce").mean(), 2, " MW"))
-      op3.metric("Esclusajes promedio", _fmt(pd.to_numeric(d.get("esclusajes"), errors="coerce").mean(), 2, " m³/s"))
+      op3.metric("Volumen promedio de esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día"))
       op4.metric("Vertido total promedio", _fmt((pd.to_numeric(d.get("vert_alha"), errors="coerce").fillna(0) + pd.to_numeric(d.get("vert_gat"), errors="coerce").fillna(0)).mean(), 2, " m³/s"))
 
       op_table = pd.DataFrame({
