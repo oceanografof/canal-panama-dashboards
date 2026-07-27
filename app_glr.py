@@ -74,8 +74,8 @@ except Exception: # pragma: no cover
   SimpleDocTemplate = None
 
 
-APP_TITLE = "Evaluación Hidrológica Modelo GLR"
-SYSTEM_LABEL = "GLR / FEWS"
+APP_TITLE = "Evaluación Hidrológica Modelo GLR / FEWS"
+SYSTEM_LABEL = "Simulacion"
 SUBTITLE = "Basado en pronóstico meteorológico - próximos 10 días"
 
 # Paleta inspirada en la plantilla GLR, con mayor contraste.
@@ -366,27 +366,50 @@ def _fmt(v: float, nd: int = 2, suffix: str = "") -> str:
 
 
 def automatic_narrative(df: pd.DataFrame, premisas: List[str], meta: ReportMeta) -> str:
+  """Interpreta el escenario sin repetir los valores mostrados en las tarjetas."""
   m = report_metrics(df)
   da = m.get("alha_fin", np.nan) - m.get("alha_ini", np.nan)
   dg = m.get("gat_fin", np.nan) - m.get("gat_ini", np.nan)
-  va = "aumenta" if da > 0 else "disminuye" if da < 0 else "permanece estable"
-  vg = "aumenta" if dg > 0 else "disminuye" if dg < 0 else "permanece estable"
-  txt = (
-    f"Durante los próximos {meta.horizonte_dias} días, el nivel de Alhajuela {va} de "
-    f"{_fmt(m.get('alha_ini'))} a {_fmt(m.get('alha_fin'))} pies "
-    f"(variación {_fmt(da)} pies). Gatún {vg} de {_fmt(m.get('gat_ini'))} a "
-    f"{_fmt(m.get('gat_fin'))} pies (variación {_fmt(dg)} pies). "
-    f"Los aportes promedio son {_fmt(m.get('ap_alha_prom'))} m³/s en Alhajuela y "
-    f"{_fmt(m.get('ap_gat_prom'))} m³/s en Gatún. El caudal promedio de esclusajes es "
-    f"{_fmt(m.get('consumo_prom'))} m³/s, equivalente a un volumen promedio de "
-    f"{_fmt(m.get('vol_esclusajes_dia'))} hm³/día y {_fmt(m.get('vol_esclusajes_horizonte'))} hm³ durante el horizonte. "
-    f"La hidrogeneración promedio es "
-    f"{_fmt(m.get('hidro_alha_prom'))} MW en Alhajuela/Madden y "
-    f"{_fmt(m.get('hidro_gat_prom'))} MW en Gatún."
+
+  def nivel_frase(nombre: str, variacion: float) -> str:
+    if pd.isna(variacion):
+      return f"Para {nombre} no hay información suficiente para establecer la tendencia del nivel"
+    if abs(variacion) < 0.10:
+      return f"{nombre} se mantiene prácticamente estable, con una variación de {variacion:+.2f} pies"
+    if variacion > 0:
+      return f"{nombre} presenta una tendencia ascendente, con una recuperación de {variacion:.2f} pies"
+    return f"{nombre} presenta una tendencia descendente, con una reducción de {abs(variacion):.2f} pies"
+
+  ap_alha = m.get("ap_alha_prom", np.nan)
+  ap_gat = m.get("ap_gat_prom", np.nan)
+  if pd.notna(ap_alha) and pd.notna(ap_gat):
+    if abs(ap_alha - ap_gat) < 0.5:
+      aporte_txt = "Los aportes previstos son similares en ambos embalses"
+    elif ap_gat > ap_alha:
+      aporte_txt = "Los aportes previstos son mayores en Gatún que en Alhajuela"
+    else:
+      aporte_txt = "Los aportes previstos son mayores en Alhajuela que en Gatún"
+  else:
+    aporte_txt = "No hay información completa para comparar los aportes de ambos embalses"
+
+  hidro_alha = m.get("hidro_alha_prom", np.nan)
+  hidro_gat = m.get("hidro_gat_prom", np.nan)
+  if pd.notna(hidro_alha) and pd.notna(hidro_gat):
+    if hidro_alha > 0.01 and hidro_gat <= 0.01:
+      hidro_txt = "La hidrogeneración prevista se concentra en Alhajuela/Madden, sin generación en Gatún"
+    elif hidro_gat > 0.01 and hidro_alha <= 0.01:
+      hidro_txt = "La hidrogeneración prevista se concentra en Gatún, sin generación en Alhajuela/Madden"
+    elif hidro_alha > 0.01 and hidro_gat > 0.01:
+      hidro_txt = "Se prevé hidrogeneración en ambos embalses"
+    else:
+      hidro_txt = "No se prevé hidrogeneración en los embalses durante el horizonte evaluado"
+  else:
+    hidro_txt = "La información de hidrogeneración está incompleta para el horizonte evaluado"
+
+  return (
+    f"Para los próximos {meta.horizonte_dias} días, {nivel_frase('Alhajuela', da)}. "
+    f"{nivel_frase('Gatún', dg)}. {aporte_txt}. {hidro_txt}."
   )
-  if premisas:
-    txt += " Premisa destacada: " + premisas[0]
-  return txt
 
 
 def _daily_base(df: pd.DataFrame) -> pd.DataFrame:
@@ -810,20 +833,26 @@ def generate_pptx(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, outpu
     # 1. Portada / premisas / resumen
     slide = prs.slides.add_slide(blank); _ppt_add_bg(slide); _ppt_header(slide, meta, meta.titulo.upper())
     _ppt_text(slide, meta.subtitulo.upper(), 3.10, 0.95, 7.2, 0.36, 11.5, False, (220, 224, 230), PP_ALIGN.CENTER)
-    labels = [
-      ("Alhajuela ini.", _fmt(m.get("alha_ini"), 2, " pies")),
-      ("Alhajuela fin.", _fmt(m.get("alha_fin"), 2, " pies")),
-      ("Gatún ini.", _fmt(m.get("gat_ini"), 2, " pies")),
-      ("Gatún fin.", _fmt(m.get("gat_fin"), 2, " pies")),
-      ("Vol. esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día")),
+    level_cards = [
+      ("Alhajuela inicial", _fmt(m.get("alha_ini"), 2, " pies")),
+      ("Alhajuela final", _fmt(m.get("alha_fin"), 2, " pies")),
+      ("Gatún inicial", _fmt(m.get("gat_ini"), 2, " pies")),
+      ("Gatún final", _fmt(m.get("gat_fin"), 2, " pies")),
     ]
-    xs = [0.55, 3.05, 5.55, 8.05, 10.55]
-    for (lab, val), x in zip(labels, xs):
-      _ppt_metric_card(slide, lab, val, x, 1.18, 2.2)
+    for (lab, val), x in zip(level_cards, [0.65, 3.75, 6.85, 9.95]):
+      _ppt_metric_card(slide, lab, val, x, 1.12, 2.75)
 
-    _ppt_text(slide, "PREMISAS OPERATIVAS", 0.70, 2.15, 4.0, 0.32, 13, True)
+    flow_cards = [
+      ("Aporte prom. Alhajuela", _fmt(m.get("ap_alha_prom"), 2, " m³/s")),
+      ("Aporte prom. Gatún", _fmt(m.get("ap_gat_prom"), 2, " m³/s")),
+      ("Volumen prom. esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día")),
+    ]
+    for (lab, val), x in zip(flow_cards, [1.85, 5.30, 8.75]):
+      _ppt_metric_card(slide, lab, val, x, 2.06, 2.75)
+
+    _ppt_text(slide, "PREMISAS OPERATIVAS", 0.70, 3.05, 4.0, 0.32, 13, True)
     items = premisas if premisas else ["Sin premisas cargadas desde la hoja Premisas."]
-    y = 2.52
+    y = 3.42
     for item in items[:6]:
       lines = max(1, int(np.ceil(len(item) / 95)))
       h = 0.24 + 0.14 * (lines - 1)
@@ -834,12 +863,12 @@ def generate_pptx(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, outpu
       if y > 5.65:
         break
 
-    _ppt_text(slide, "RESUMEN DEL ESCENARIO", 6.90, 2.15, 4.2, 0.32, 13, True)
-    box = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(6.82), Inches(2.52), Inches(5.75), Inches(2.55))
+    _ppt_text(slide, "INTERPRETACIÓN DEL ESCENARIO", 6.90, 3.05, 4.8, 0.32, 13, True)
+    box = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(6.82), Inches(3.42), Inches(5.75), Inches(2.10))
     box.fill.solid(); box.fill.fore_color.rgb = RGBColor(58, 61, 66); box.line.color.rgb = RGBColor(75, 80, 88)
-    _ppt_text(slide, automatic_narrative(df, premisas, meta), 7.02, 2.70, 5.35, 2.15, 9.7, False)
-    _ppt_text(slide, "Descripción del escenario", 6.90, 5.28, 3.2, 0.25, 10.5, True)
-    _ppt_text(slide, meta.descripcion, 6.90, 5.55, 5.55, 0.58, 9.3, False, (225, 228, 233))
+    _ppt_text(slide, automatic_narrative(df, premisas, meta), 7.02, 3.60, 5.35, 1.72, 9.7, False)
+    _ppt_text(slide, "Descripción del escenario", 6.90, 5.72, 3.2, 0.25, 10.5, True)
+    _ppt_text(slide, meta.descripcion, 6.90, 5.98, 5.55, 0.48, 9.0, False, (225, 228, 233))
     _ppt_text(slide, "HIDRÓLOGO DE TURNO: " + meta.hidrologo, 3.8, 6.72, 5.7, 0.22, 8.6, False, (190, 196, 204), PP_ALIGN.CENTER)
 
     # 2 y 3. Gráficas por embalse
@@ -929,16 +958,16 @@ def generate_docx(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, outpu
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p = doc.add_paragraph(meta.subtitulo); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph(f"Última actualización: {meta.actualizacion:%d/%m/%Y %H:%M} | Hidrólogo de turno: {meta.hidrologo}")
-    tmet = doc.add_table(rows=2, cols=5)
+    tmet = doc.add_table(rows=2, cols=7)
     tmet.style = "Table Grid"
-    headers = ["Alhajuela inicial", "Alhajuela final", "Gatún inicial", "Gatún final", "Vol. esclusajes"]
-    vals = [_fmt(m.get("alha_ini"),2," pies"), _fmt(m.get("alha_fin"),2," pies"), _fmt(m.get("gat_ini"),2," pies"), _fmt(m.get("gat_fin"),2," pies"), _fmt(m.get("vol_esclusajes_dia"),2," hm³/día")]
+    headers = ["Alhajuela inicial", "Alhajuela final", "Gatún inicial", "Gatún final", "Aporte prom. Alhajuela", "Aporte prom. Gatún", "Vol. esclusajes"]
+    vals = [_fmt(m.get("alha_ini"),2," pies"), _fmt(m.get("alha_fin"),2," pies"), _fmt(m.get("gat_ini"),2," pies"), _fmt(m.get("gat_fin"),2," pies"), _fmt(m.get("ap_alha_prom"),2," m³/s"), _fmt(m.get("ap_gat_prom"),2," m³/s"), _fmt(m.get("vol_esclusajes_dia"),2," hm³/día")]
     for i, h in enumerate(headers): tmet.cell(0,i).text = h
     for i, v in enumerate(vals): tmet.cell(1,i).text = v
     doc.add_heading("Premisas operativas", level=1)
     for item in premisas if premisas else ["Sin premisas cargadas."]:
       doc.add_paragraph(item, style="List Bullet")
-    doc.add_heading("Resumen ejecutivo", level=1)
+    doc.add_heading("Interpretación del escenario", level=1)
     doc.add_paragraph(automatic_narrative(df, premisas, meta))
 
     doc.add_page_break()
@@ -1011,14 +1040,14 @@ def generate_pdf(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, output
     m = report_metrics(df)
     story = [Paragraph(SYSTEM_LABEL, ParagraphStyle("SystemLabel", parent=body, textColor=colors.HexColor(LIGHT_BLUE), fontName="Helvetica-Bold", fontSize=9, alignment=TA_CENTER, spaceAfter=3)), Paragraph(meta.titulo, title_style), Paragraph(meta.subtitulo, body), Spacer(1, 0.06 * inch)]
     metric_table = Table([
-      ["Alhajuela inicial", "Alhajuela final", "Gatún inicial", "Gatún final", "Vol. esclusajes"],
-      [_fmt(m.get("alha_ini"),2," pies"), _fmt(m.get("alha_fin"),2," pies"), _fmt(m.get("gat_ini"),2," pies"), _fmt(m.get("gat_fin"),2," pies"), _fmt(m.get("vol_esclusajes_dia"),2," hm³/día")],
-    ], colWidths=[2.0*inch]*5)
+      ["Alhajuela inicial", "Alhajuela final", "Gatún inicial", "Gatún final", "Aporte prom. Alhajuela", "Aporte prom. Gatún", "Vol. esclusajes"],
+      [_fmt(m.get("alha_ini"),2," pies"), _fmt(m.get("alha_fin"),2," pies"), _fmt(m.get("gat_ini"),2," pies"), _fmt(m.get("gat_fin"),2," pies"), _fmt(m.get("ap_alha_prom"),2," m³/s"), _fmt(m.get("ap_gat_prom"),2," m³/s"), _fmt(m.get("vol_esclusajes_dia"),2," hm³/día")],
+    ], colWidths=[1.47*inch]*7)
     metric_table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor(BLUE)),("BACKGROUND",(0,1),(-1,1),colors.HexColor(PANEL)),("TEXTCOLOR",(0,0),(-1,-1),colors.white),("GRID",(0,0),(-1,-1),0.35,colors.HexColor('#70757D')),("ALIGN",(0,0),(-1,-1),'CENTER')]))
     story += [metric_table, Spacer(1,0.10*inch), Paragraph("Premisas operativas", h1)]
     for item in premisas if premisas else ["Sin premisas cargadas desde la hoja Premisas."]:
       story.append(Paragraph("• " + html.escape(item), bullet))
-    story += [Spacer(1,0.08*inch), Paragraph("Resumen ejecutivo", h1), Paragraph(html.escape(automatic_narrative(df, premisas, meta)), body)]
+    story += [Spacer(1,0.08*inch), Paragraph("Interpretación del escenario", h1), Paragraph(html.escape(automatic_narrative(df, premisas, meta)), body)]
 
     story.extend([PageBreak(), Paragraph("Proyección hidrológica - Embalse Alhajuela", h1), RLImage(charts["alha"], width=10.65 * inch, height=6.15 * inch)])
     story.extend([PageBreak(), Paragraph("Proyección hidrológica - Embalse Gatún", h1), RLImage(charts["gatun"], width=10.65 * inch, height=6.15 * inch)])
@@ -1080,7 +1109,8 @@ def generate_html(df: pd.DataFrame, premisas: List[str], meta: ReportMeta, outpu
       ("Alhajuela final", _fmt(m.get("alha_fin"), 2, " pies")),
       ("Gatún inicial", _fmt(m.get("gat_ini"), 2, " pies")),
       ("Gatún final", _fmt(m.get("gat_fin"), 2, " pies")),
-      ("Aportes promedio Gatún", _fmt(m.get("ap_gat_prom"), 2, " m³/s")),
+      ("Aporte promedio de Alhajuela", _fmt(m.get("ap_alha_prom"), 2, " m³/s")),
+      ("Aporte promedio de Gatún", _fmt(m.get("ap_gat_prom"), 2, " m³/s")),
       ("Volumen promedio de esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día")),
     ]
     cards_html = "".join(f'<div class="card"><span>{html.escape(k)}</span><strong>{html.escape(v)}</strong></div>' for k, v in cards)
@@ -1117,7 +1147,7 @@ button{{position:fixed;right:18px;bottom:18px;background:var(--blue);color:white
 <div class="page">
 <header><div class="header-top"><div class="header-copy"><div class="system-label">{SYSTEM_LABEL}</div><h1>{html.escape(meta.titulo)}</h1><p class="subtitle">{html.escape(meta.subtitulo)}</p><div class="meta"><span>Hidrólogo de turno: {html.escape(meta.hidrologo)}</span><span>Actualización: {meta.actualizacion:%d/%m/%Y %H:%M}</span></div></div>{logo_tag}</div></header>
 <div class="cards">{cards_html}</div>
-<section><h2>Resumen ejecutivo</h2><div class="narrative">{html.escape(automatic_narrative(df, premisas, meta))}</div></section>
+<section><h2>Interpretación del escenario</h2><div class="narrative">{html.escape(automatic_narrative(df, premisas, meta))}</div></section>
 <section><h2>Premisas operativas</h2><ul>{prem_html}</ul><p>{html.escape(meta.descripcion)}</p></section>
 </div>
 <div class="page"><section><h2>Embalse Alhajuela</h2><img class="chart" src="{_img_data_uri(charts['alha'])}" alt="Gráficas de Alhajuela"></section></div>
@@ -1216,25 +1246,30 @@ def run_streamlit():
 
   with tabs[0]:
     st.subheader("Indicadores principales")
-    c1, c2, c3, c4, c5 = st.columns(5)
     da = m.get("alha_fin", np.nan) - m.get("alha_ini", np.nan)
     dg = m.get("gat_fin", np.nan) - m.get("gat_ini", np.nan)
-    c1.metric("Alhajuela final", _fmt(m.get("alha_fin"), 2, " pies"), _fmt(da, 2, " pies"))
-    c2.metric("Gatún final", _fmt(m.get("gat_fin"), 2, " pies"), _fmt(dg, 2, " pies"))
-    c3.metric("Aportes promedio Gatún", _fmt(m.get("ap_gat_prom"), 2, " m³/s"))
-    c4.metric("Volumen esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día"))
-    c5.metric("Hidro Alhajuela promedio", _fmt(m.get("hidro_alha_prom"), 2, " MW"))
-    st.subheader("Resumen ejecutivo automático")
+
+    n1, n2, n3, n4 = st.columns(4)
+    n1.metric("Alhajuela inicial", _fmt(m.get("alha_ini"), 2, " pies"))
+    n2.metric("Alhajuela final", _fmt(m.get("alha_fin"), 2, " pies"), _fmt(da, 2, " pies"))
+    n3.metric("Gatún inicial", _fmt(m.get("gat_ini"), 2, " pies"))
+    n4.metric("Gatún final", _fmt(m.get("gat_fin"), 2, " pies"), _fmt(dg, 2, " pies"))
+
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Aporte promedio de Alhajuela", _fmt(m.get("ap_alha_prom"), 2, " m³/s"))
+    a2.metric("Aporte promedio de Gatún", _fmt(m.get("ap_gat_prom"), 2, " m³/s"))
+    a3.metric("Volumen promedio de esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día"))
+
+    st.subheader("Interpretación del escenario")
     st.info(automatic_narrative(view, premisas, meta))
 
-    st.subheader("Operación prevista: hidrogeneración, vertidos y esclusajes")
+    st.subheader("Operación prevista: hidrogeneración y vertidos")
     d = _daily_base(view)
     if not d.empty:
-      op1, op2, op3, op4 = st.columns(4)
-      op1.metric("Hidro Alhajuela promedio", _fmt(pd.to_numeric(d.get("hidro_alha"), errors="coerce").mean(), 2, " MW"))
-      op2.metric("Hidro Gatún promedio", _fmt(pd.to_numeric(d.get("hidro_gat"), errors="coerce").mean(), 2, " MW"))
-      op3.metric("Volumen promedio de esclusajes", _fmt(m.get("vol_esclusajes_dia"), 2, " hm³/día"))
-      op4.metric("Vertido total promedio", _fmt((pd.to_numeric(d.get("vert_alha"), errors="coerce").fillna(0) + pd.to_numeric(d.get("vert_gat"), errors="coerce").fillna(0)).mean(), 2, " m³/s"))
+      op1, op2, op3 = st.columns(3)
+      op1.metric("Hidrogeneración promedio en Alhajuela", _fmt(pd.to_numeric(d.get("hidro_alha"), errors="coerce").mean(), 2, " MW"))
+      op2.metric("Hidrogeneración promedio en Gatún", _fmt(pd.to_numeric(d.get("hidro_gat"), errors="coerce").mean(), 2, " MW"))
+      op3.metric("Vertido promedio total", _fmt((pd.to_numeric(d.get("vert_alha"), errors="coerce").fillna(0) + pd.to_numeric(d.get("vert_gat"), errors="coerce").fillna(0)).mean(), 2, " m³/s"))
 
       op_table = pd.DataFrame({
         "Fecha": pd.to_datetime(d["fecha"]),
