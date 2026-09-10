@@ -1900,6 +1900,8 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                 # Totales y datos auxiliares para los KPI superiores.
                 "total_consumo_hm3": _find(header_l, exact=["agua_consumida_ala_gat_hm3"]),
                 "usos_hm3": _find(header_l, exact=["usos_hm3"]),
+                # LakeHouse entrega ccl_zz_flush y acl_zz_flush en m³/día.
+                # Se conservan estas claves internas por compatibilidad y se convierten a hm³ al usarlas.
                 "zz_ccl_hm3": _find(header_l, exact=["ccl_zz_flush"]),
                 "zz_acl_hm3": _find(header_l, exact=["acl_zz_flush"]),
                 "mad_mwh": _find(header_l, exact=["madmwh"]),
@@ -2046,6 +2048,11 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                         vals_rows.append(sum(vals))
                 return _mean(vals_rows)
 
+            def _mean_row_sum_m3_to_hm3(keys):
+                """Promedia columnas LakeHouse en m³/día y las devuelve en hm³/día."""
+                val_m3 = _mean_row_sum(keys)
+                return (val_m3 / 1_000_000.0) if val_m3 is not None else None
+
             def _mean_row_pair(keys):
                 vals_rows = []
                 for r in ult:
@@ -2110,7 +2117,8 @@ def _leer_balance_detallado_lkh(path_o_bytes, source_id, n_dias=5):
                 # Total oficial del LakeHouse (incluye evaporación cuando está disponible).
                 "total_consumo_hm3": _mean([_num(r.get("total_consumo_hm3")) for r in ult]),
                 "usos_hm3": _mean([_num(r.get("usos_hm3")) for r in ult]),
-                "zz_flush_hm3": _mean_row_sum(["zz_ccl_hm3", "zz_acl_hm3"]),
+                # ZZ-Flush viene del LakeHouse en m³/día; 1 hm³ = 1,000,000 m³.
+                "zz_flush_hm3": _mean_row_sum_m3_to_hm3(["zz_ccl_hm3", "zz_acl_hm3"]),
                 # Potencia media del período: MWh/día ÷ 24 = MW medios.
                 "mad_mw": (_mad_mwh_prom / 24.0) if _mad_mwh_prom is not None else None,
                 "gat_mw": (_gat_mwh_prom / 24.0) if _gat_mwh_prom is not None else None,
@@ -2209,7 +2217,9 @@ def _leer_alertas_saltos_lkh(path_o_bytes, source_id, umbral_pct=35.0, umbral_hm
             gat_pot = _hm3_prefer_mcf(row, idx, ("pot_g_mcf",), ("pot_g_hm3",))
             gat_fug = _hm3_prefer_mcf(row, idx, ("fug_g_mcf",), ("fug_g_hm3",))
             gat_ver = _hm3_mcf(row, idx, "vert_g_mcf")
-            gat_flush = _hm3_direct(row, idx, "zz_ccl_hm3", "zz_acl_hm3")
+            # ZZ-Flush del LakeHouse está en m³/día; convertir antes de incorporarlo a totales/alertas en hm³/día.
+            _gat_flush_m3 = _hm3_direct(row, idx, "zz_ccl_hm3", "zz_acl_hm3")
+            gat_flush = (_gat_flush_m3 / 1_000_000.0) if _gat_flush_m3 is not None else None
             gat_evap = _hm3_direct(row, idx, "evap_g_hm3")
 
             aporte_alh_gat = _sum_valid([alh_gen, alh_fug, alh_ver])
@@ -2277,6 +2287,8 @@ def _leer_alertas_saltos_lkh(path_o_bytes, source_id, umbral_pct=35.0, umbral_hm
                 "evap_m_hm3": _find(header_l, exact=["vol_evap_ala_hm3"]),
                 "evap_g_hm3": _find(header_l, exact=["vol_evap_gat_hm3"]),
                 "total_consumo_hm3": _find(header_l, exact=["agua_consumida_ala_gat_hm3"]),
+                # LakeHouse entrega ccl_zz_flush y acl_zz_flush en m³/día.
+                # Se conservan estas claves internas por compatibilidad y se convierten a hm³ al usarlas.
                 "zz_ccl_hm3": _find(header_l, exact=["ccl_zz_flush"]),
                 "zz_acl_hm3": _find(header_l, exact=["acl_zz_flush"]),
             }
