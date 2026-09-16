@@ -3834,6 +3834,429 @@ if alertas_lkh_activas:
 st.markdown("---")
 
 
+# ═══ EXPORTACIÓN HISTÓRICA POR PERÍODO — CAPA NO INVASIVA ════════════════════
+# Lee la misma fuente LakeHouse usada por el app y prepara reportes por pestaña.
+# No modifica balances, controles, gráficos ni fórmulas operativas existentes.
+@st.cache_data(show_spinner=False)
+def _leer_historico_export_lkh(path_o_bytes, source_id, sheet_name=""):
+    """Carga el histórico LakeHouse y normaliza solo campos necesarios para exportación."""
+    try:
+        from io import BytesIO
+        src = BytesIO(path_o_bytes) if isinstance(path_o_bytes, (bytes, bytearray)) else path_o_bytes
+        xls = pd.ExcelFile(src)
+        hojas_validas = [x for x in xls.sheet_names if x not in ["Sheet1", "Para BalanceH"]] or xls.sheet_names
+        hoja = sheet_name if sheet_name in hojas_validas else hojas_validas[0]
+        df = pd.read_excel(xls, sheet_name=hoja)
+        if df is None or df.empty:
+            return pd.DataFrame(), hoja
+
+        # Fecha: conservar la lógica del app (primera columna que contenga "date").
+        col_fecha = next((c for c in df.columns if "date" in str(c).lower()), None)
+        if col_fecha is None:
+            col_fecha = next((c for c in df.columns if "fecha" in str(c).lower()), None)
+        if col_fecha is None:
+            return pd.DataFrame(), hoja
+        df["fecha"] = pd.to_datetime(df[col_fecha], errors="coerce")
+        df = df.dropna(subset=["fecha"]).sort_values("fecha").reset_index(drop=True)
+        if df.empty:
+            return df, hoja
+
+        # Renombrado compatible con la pestaña Datos Lake House y el lector de balance.
+        rn, usados = {}, set()
+        def _set(col, dest):
+            if dest not in usados:
+                rn[col] = dest
+                usados.add(dest)
+
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            cn = _norm_lkh_col(cl)
+            if c == "fecha":
+                continue
+            if "madel" in cl: _set(c, "nv_a")
+            elif "gatel" in cl: _set(c, "nv_g")
+            elif cl == "numlockgat": _set(c, "n_g")
+            elif cl == "numlockpm": _set(c, "n_p")
+            elif cl in ("numlockac", "numlockacl"): _set(c, "n_a")
+            elif cl == "numlockccl": _set(c, "n_c")
+            elif cl == "gatlockhm3": _set(c, "gat_hm3")
+            elif cl == "pmlockhm3": _set(c, "pm_hm3")
+            elif cl == "aclockhm3": _set(c, "acl_hm3")
+            elif cl == "ccllockhm3": _set(c, "ccl_hm3")
+            elif cl == "gatlockporlockhec": _set(c, "gat_unit_hm3")
+            elif cl == "pmlockporlockhec": _set(c, "pm_unit_hm3")
+            elif cl in ("aclocporlockhec", "aclockporlockhec"): _set(c, "acl_unit_hm3")
+            elif cl == "ccllockporlockhec": _set(c, "ccl_unit_hm3")
+            elif cl == "total pnx": _set(c, "pnx_unit_hm3")
+            elif cl == "total npx": _set(c, "npx_unit_hm3")
+            elif "gatlockmcf" in cl: _set(c, "gat_mcf")
+            elif "pmlockmcf" in cl: _set(c, "pm_mcf")
+            elif "aclockmcf" in cl: _set(c, "acl_mcf")
+            elif "ccllockmcf" in cl: _set(c, "ccl_mcf")
+            elif cl == "gatspill": _set(c, "vert_g_mcf")
+            elif cl == "madspill": _set(c, "vert_m_mcf")
+            elif cl == "munic_mad_hm3": _set(c, "pot_m_hm3")
+            elif cl == "munic_gat_hm3": _set(c, "pot_g_hm3")
+            elif cl == "munic_mad": _set(c, "pot_m_mcf")
+            elif cl == "munic_gat": _set(c, "pot_g_mcf")
+            elif cl == "leak_mad_hm3": _set(c, "fug_m_hm3")
+            elif cl == "leak_gat_hm3": _set(c, "fug_g_hm3")
+            elif cl == "leak_mad": _set(c, "fug_m_mcf")
+            elif cl == "leak_gat": _set(c, "fug_g_mcf")
+            elif cl == "evap_gatun_mm": _set(c, "evap_gat_mm")
+            elif cl == "evap_alaj_mm": _set(c, "evap_alh_mm")
+            elif cl == "vol_evap_gat_hm3": _set(c, "evap_gat_hm3")
+            elif cl == "vol_evap_ala_hm3": _set(c, "evap_alh_hm3")
+            elif cl == "ccl_zz_flush": _set(c, "zz_ccl_m3d")
+            elif cl == "acl_zz_flush": _set(c, "zz_acl_m3d")
+            elif cl == "saving_water_panamax": _set(c, "ahorro_pnx")
+            elif cl == "total_saving_water_neo_hm3": _set(c, "ahorro_npx")
+            elif cl == "saving_water_ac_hm3": _set(c, "ahorro_npx_ac")
+            elif cl == "saving_water_cc_hm3": _set(c, "ahorro_npx_cc")
+            elif cl == "saving_water_ta_ac_hm3": _set(c, "ahorro_npx_ta_ac")
+            elif cl == "saving_water_ta_cc_hm3": _set(c, "ahorro_npx_ta_cc")
+            elif cl == "cca_neo": _set(c, "cca_neo_val")
+            elif ("saving" in cn and "water" in cn and ("neo" in cn or "npx" in cn)
+                  and ("tina" in cn or "basin" in cn or "wsb" in cn)): _set(c, "ahorro_npx_tinas")
+            elif (("neo" in cn or "npx" in cn) and "turn" in cn and "around" in cn): _set(c, "ahorro_npx_turnaround")
+            elif ("saving" in cn and "water" in cn and ("neo" in cn or "npx" in cn)): _set(c, "ahorro_npx")
+            elif cl == "madhm3": _set(c, "gen_mad_hm3")
+            elif cl == "gathm3": _set(c, "gen_gat_hm3")
+            elif cl == "madmwh": _set(c, "mad_mwh")
+            elif cl == "gatmwh": _set(c, "gat_mwh")
+            elif "total todos" in cl and "hec" in cl: _set(c, "total_escl_hm3")
+            elif cl == "capgat_hm3": _set(c, "cap_gat_hm3")
+            elif cl == "capmad_hm3": _set(c, "cap_mad_hm3")
+            elif cl == "usos_hm3": _set(c, "usos_hm3")
+            elif cl == "agua_consumida_ala_gat_hm3": _set(c, "agua_consumida_total_hm3")
+
+        df = df.rename(columns=rn)
+        canon = set(rn.values())
+        for c in canon:
+            if c in df and isinstance(df[c], pd.Series):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        def _sum_cols(cols):
+            cols_ok = [c for c in cols if c in df]
+            if not cols_ok:
+                return pd.Series(np.nan, index=df.index, dtype=float)
+            vals = pd.concat([pd.to_numeric(df[c], errors="coerce") for c in cols_ok], axis=1)
+            return vals.sum(axis=1, min_count=1)
+
+        def _serie(c):
+            return pd.to_numeric(df[c], errors="coerce") if c in df else pd.Series(np.nan, index=df.index, dtype=float)
+
+        def _preferida(c_mcf, c_hm3, max_hm3=None):
+            # Mantiene el mismo criterio operativo: MCF/MPC primero; hm³ como respaldo.
+            s_mcf = _serie(c_mcf) * MPC_TO_HM3
+            if max_hm3 is not None:
+                s_mcf = s_mcf.where(s_mcf <= float(max_hm3))
+            s_hm3 = _serie(c_hm3)
+            if max_hm3 is not None:
+                s_hm3 = s_hm3.where(s_hm3 <= float(max_hm3))
+            return s_mcf.combine_first(s_hm3)
+
+        # Derivados diarios para todos los reportes.
+        df["pnx_hm3_calc"] = _sum_cols(["gat_hm3", "pm_hm3"])
+        if df["pnx_hm3_calc"].notna().sum() == 0:
+            df["pnx_hm3_calc"] = _sum_cols(["gat_mcf", "pm_mcf"]) * MPC_TO_HM3
+        df["npx_hm3_calc"] = _sum_cols(["acl_hm3", "ccl_hm3"])
+        if df["npx_hm3_calc"].notna().sum() == 0:
+            df["npx_hm3_calc"] = _sum_cols(["acl_mcf", "ccl_mcf"]) * MPC_TO_HM3
+        df["esclusajes_hm3_calc"] = pd.concat([df["pnx_hm3_calc"], df["npx_hm3_calc"]], axis=1).sum(axis=1, min_count=1)
+
+        df["n_pnx_calc"] = pd.concat([_serie("n_g"), _serie("n_p")], axis=1).mean(axis=1, skipna=True)
+        df["n_npx_calc"] = pd.concat([_serie("n_a"), _serie("n_c")], axis=1).mean(axis=1, skipna=True)
+        df["n_total_calc"] = pd.concat([df["n_pnx_calc"], df["n_npx_calc"]], axis=1).sum(axis=1, min_count=1)
+
+        df["pot_m_hm3_calc"] = _preferida("pot_m_mcf", "pot_m_hm3", max_hm3=3.0)
+        df["pot_g_hm3_calc"] = _preferida("pot_g_mcf", "pot_g_hm3", max_hm3=3.0)
+        df["fug_m_hm3_calc"] = _preferida("fug_m_mcf", "fug_m_hm3", max_hm3=1.5)
+        df["fug_g_hm3_calc"] = _preferida("fug_g_mcf", "fug_g_hm3", max_hm3=1.5)
+        df["vert_m_hm3_calc"] = _serie("vert_m_mcf") * MPC_TO_HM3
+        df["vert_g_hm3_calc"] = _serie("vert_g_mcf") * MPC_TO_HM3
+        df["zz_flush_hm3_calc"] = _sum_cols(["zz_ccl_m3d", "zz_acl_m3d"]) / 1_000_000.0
+
+        # Evaporación: prioriza volumen LakeHouse; si falta, calcula desde lámina y nivel Daily.
+        evap_g_dir = _serie("evap_gat_hm3")
+        evap_a_dir = _serie("evap_alh_hm3")
+        area_g = _serie("nv_g").apply(lambda x: area_desde_nivel_gat(float(x), daily=True) if pd.notna(x) else np.nan)
+        area_a = _serie("nv_a").apply(lambda x: area_desde_nivel_alh(float(x), daily=True) if pd.notna(x) else np.nan)
+        evap_g_calc = _serie("evap_gat_mm") * area_g * 1e-3 * EVAP_COEF
+        evap_a_calc = _serie("evap_alh_mm") * area_a * 1e-3 * EVAP_COEF
+        df["area_gat_daily_km2"] = area_g
+        df["area_alh_daily_km2"] = area_a
+        df["evap_gat_hm3_calc"] = evap_g_dir.combine_first(evap_g_calc)
+        df["evap_alh_hm3_calc"] = evap_a_dir.combine_first(evap_a_calc)
+
+        # Potencia media horaria = MWh/día ÷ 24, mismo criterio ya usado por el app.
+        df["mad_mw_calc"] = _serie("mad_mwh") / 24.0
+        df["gat_mw_calc"] = _serie("gat_mwh") / 24.0
+        df["total_mwh_calc"] = pd.concat([_serie("mad_mwh"), _serie("gat_mwh")], axis=1).sum(axis=1, min_count=1)
+        df["total_mw_calc"] = pd.concat([df["mad_mw_calc"], df["gat_mw_calc"]], axis=1).sum(axis=1, min_count=1)
+        df["gen_total_hm3_calc"] = _sum_cols(["gen_mad_hm3", "gen_gat_hm3"])
+
+        # Ahorros Neo: construir detalles cuando existan columnas por complejo.
+        if "ahorro_npx_tinas" not in df:
+            df["ahorro_npx_tinas"] = _sum_cols(["ahorro_npx_ac", "ahorro_npx_cc"])
+        if "ahorro_npx_turnaround" not in df:
+            df["ahorro_npx_turnaround"] = _sum_cols(["ahorro_npx_ta_ac", "ahorro_npx_ta_cc"])
+        if "ahorro_npx" not in df:
+            df["ahorro_npx"] = _sum_cols(["ahorro_npx_tinas", "ahorro_npx_turnaround"])
+        df["ahorro_total_calc"] = _sum_cols(["ahorro_pnx", "ahorro_npx"])
+
+        # Totales por embalse para reportes históricos.
+        df["alh_total_componentes_hm3"] = pd.concat([
+            _serie("gen_mad_hm3"), df["pot_m_hm3_calc"], df["fug_m_hm3_calc"],
+            df["vert_m_hm3_calc"], df["evap_alh_hm3_calc"]
+        ], axis=1).sum(axis=1, min_count=1)
+        df["gat_total_componentes_hm3"] = pd.concat([
+            df["pnx_hm3_calc"], df["npx_hm3_calc"], _serie("gen_gat_hm3"),
+            df["pot_g_hm3_calc"], df["fug_g_hm3_calc"], df["vert_g_hm3_calc"],
+            df["zz_flush_hm3_calc"], df["evap_gat_hm3_calc"]
+        ], axis=1).sum(axis=1, min_count=1)
+        df["sistema_componentes_hm3"] = pd.concat([
+            df["alh_total_componentes_hm3"], df["gat_total_componentes_hm3"]
+        ], axis=1).sum(axis=1, min_count=1)
+
+        return df, hoja
+    except Exception:
+        return pd.DataFrame(), sheet_name or ""
+
+
+def _obtener_historico_export_lkh():
+    """Devuelve histórico normalizado + metadatos sin alterar la fuente activa del dashboard."""
+    src, sid = _lkh_sidebar_source()
+    if src is None or not sid:
+        return pd.DataFrame(), {"hoja": "", "fuente": "N/D"}
+    try:
+        if hasattr(src, "getvalue"):
+            src.seek(0)
+            payload = src.getvalue()
+            fuente = getattr(src, "name", "LakeHouse subido")
+        else:
+            payload = src
+            fuente = os.path.basename(str(src))
+        hoja_pref = str(st.session_state.get("lkh_sheet", "") or "")
+        df, hoja = _leer_historico_export_lkh(payload, f"{sid}:export:{hoja_pref}", hoja_pref)
+        return df, {"hoja": hoja, "fuente": fuente}
+    except Exception:
+        return pd.DataFrame(), {"hoja": "", "fuente": "N/D"}
+
+
+def _serie_export(df, col):
+    return pd.to_numeric(df[col], errors="coerce") if col in df else pd.Series(np.nan, index=df.index, dtype=float)
+
+
+def _reporte_historico_seccion(df, seccion):
+    """Construye una tabla limpia y específica para cada pestaña."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame({"Fecha": pd.to_datetime(df["fecha"], errors="coerce")})
+
+    def add(nombre, col, dec=None):
+        if col in df:
+            s = pd.to_numeric(df[col], errors="coerce")
+            if s.notna().sum() > 0:
+                out[nombre] = s.round(dec) if dec is not None else s
+
+    if seccion == "generacion":
+        add("Madden MW promedio", "mad_mw_calc", 3)
+        add("Madden MWh/día", "mad_mwh", 3)
+        add("Madden consumo hm³/d", "gen_mad_hm3", 4)
+        if "gen_mad_hm3" in df:
+            out["Madden consumo cfs"] = (_serie_export(df, "gen_mad_hm3") / CFS2HM3).round(1)
+            out["Madden consumo m³/s"] = (_serie_export(df, "gen_mad_hm3") * HM3D2M3S).round(3)
+        add("Gatún MW promedio", "gat_mw_calc", 3)
+        add("Gatún MWh/día", "gat_mwh", 3)
+        add("Gatún consumo hm³/d", "gen_gat_hm3", 4)
+        if "gen_gat_hm3" in df:
+            out["Gatún consumo cfs"] = (_serie_export(df, "gen_gat_hm3") / CFS2HM3).round(1)
+            out["Gatún consumo m³/s"] = (_serie_export(df, "gen_gat_hm3") * HM3D2M3S).round(3)
+        add("Total MW promedio", "total_mw_calc", 3)
+        add("Total MWh/día", "total_mwh_calc", 3)
+        add("Consumo total hidrogeneración hm³/d", "gen_total_hm3_calc", 4)
+        if "gen_total_hm3_calc" in df:
+            out["Consumo total hidrogeneración cfs"] = (_serie_export(df, "gen_total_hm3_calc") / CFS2HM3).round(1)
+            out["Consumo total hidrogeneración m³/s"] = (_serie_export(df, "gen_total_hm3_calc") * HM3D2M3S).round(3)
+
+    elif seccion == "esclusajes":
+        for nom, col, dec in [
+            ("PNX/día", "n_pnx_calc", 2), ("NPX/día", "n_npx_calc", 2), ("Tránsitos totales/día", "n_total_calc", 2),
+            ("Gatún esclusajes/día", "n_g", 2), ("Pedro Miguel esclusajes/día", "n_p", 2),
+            ("Agua Clara esclusajes/día", "n_a", 2), ("Cocolí esclusajes/día", "n_c", 2),
+            ("Consumo PNX hm³/d", "pnx_hm3_calc", 4), ("Consumo NPX hm³/d", "npx_hm3_calc", 4),
+            ("Consumo total esclusajes hm³/d", "esclusajes_hm3_calc", 4),
+            ("PNX hm³/esclusaje", "pnx_unit_hm3", 4), ("NPX hm³/esclusaje", "npx_unit_hm3", 4),
+        ]: add(nom, col, dec)
+        if "esclusajes_hm3_calc" in df:
+            out["Consumo total esclusajes cfs"] = (_serie_export(df, "esclusajes_hm3_calc") / CFS2HM3).round(1)
+            out["Consumo total esclusajes m³/s"] = (_serie_export(df, "esclusajes_hm3_calc") * HM3D2M3S).round(3)
+
+    elif seccion == "alhajuela":
+        for nom, col, dec in [
+            ("Nivel Alhajuela ft", "nv_a", 2), ("Generación Madden hm³/d", "gen_mad_hm3", 4),
+            ("Madden MW promedio", "mad_mw_calc", 3), ("Potabilización hm³/d", "pot_m_hm3_calc", 4),
+            ("Fugas hm³/d", "fug_m_hm3_calc", 4), ("Vertido Madden hm³/d", "vert_m_hm3_calc", 4),
+            ("Evaporación Alhajuela hm³/d", "evap_alh_hm3_calc", 4),
+            ("Total componentes Alhajuela hm³/d", "alh_total_componentes_hm3", 4),
+        ]: add(nom, col, dec)
+
+    elif seccion == "gatun":
+        for nom, col, dec in [
+            ("Nivel Gatún ft", "nv_g", 2), ("Esclusajes PNX hm³/d", "pnx_hm3_calc", 4),
+            ("Esclusajes NPX hm³/d", "npx_hm3_calc", 4), ("Generación Gatún hm³/d", "gen_gat_hm3", 4),
+            ("Gatún MW promedio", "gat_mw_calc", 3), ("Potabilización hm³/d", "pot_g_hm3_calc", 4),
+            ("Fugas hm³/d", "fug_g_hm3_calc", 4), ("Vertido Gatún hm³/d", "vert_g_hm3_calc", 4),
+            ("ZZ-Flush hm³/d", "zz_flush_hm3_calc", 4), ("Evaporación Gatún hm³/d", "evap_gat_hm3_calc", 4),
+            ("Total componentes Gatún hm³/d", "gat_total_componentes_hm3", 4),
+        ]: add(nom, col, dec)
+
+    elif seccion == "balance":
+        for nom, col, dec in [
+            ("Alhajuela componentes hm³/d", "alh_total_componentes_hm3", 4),
+            ("Gatún componentes hm³/d", "gat_total_componentes_hm3", 4),
+            ("Total componentes sistema hm³/d", "sistema_componentes_hm3", 4),
+            ("Total oficial LakeHouse hm³/d", "agua_consumida_total_hm3", 4),
+            ("Usos LakeHouse hm³/d", "usos_hm3", 4),
+            ("Esclusajes hm³/d", "esclusajes_hm3_calc", 4),
+            ("Generación hm³/d", "gen_total_hm3_calc", 4),
+            ("Potable Alhajuela hm³/d", "pot_m_hm3_calc", 4), ("Potable Gatún hm³/d", "pot_g_hm3_calc", 4),
+            ("Fugas Alhajuela hm³/d", "fug_m_hm3_calc", 4), ("Fugas Gatún hm³/d", "fug_g_hm3_calc", 4),
+            ("Vertido Madden hm³/d", "vert_m_hm3_calc", 4), ("Vertido Gatún hm³/d", "vert_g_hm3_calc", 4),
+            ("ZZ-Flush hm³/d", "zz_flush_hm3_calc", 4),
+            ("Evaporación Alhajuela hm³/d", "evap_alh_hm3_calc", 4), ("Evaporación Gatún hm³/d", "evap_gat_hm3_calc", 4),
+        ]: add(nom, col, dec)
+
+    elif seccion == "ahorros":
+        for nom, col, dec in [
+            ("Ahorro PNX hm³/d", "ahorro_pnx", 4), ("Ahorro NPX total hm³/d", "ahorro_npx", 4),
+            ("Ahorro NPX tinas/WSB hm³/d", "ahorro_npx_tinas", 4),
+            ("Ahorro NPX Turn Around hm³/d", "ahorro_npx_turnaround", 4),
+            ("Ahorro NPX Agua Clara hm³/d", "ahorro_npx_ac", 4), ("Ahorro NPX Cocolí hm³/d", "ahorro_npx_cc", 4),
+            ("Ahorro TA Agua Clara hm³/d", "ahorro_npx_ta_ac", 4), ("Ahorro TA Cocolí hm³/d", "ahorro_npx_ta_cc", 4),
+            ("Ahorro total hm³/d", "ahorro_total_calc", 4), ("CCA Neo", "cca_neo_val", 4),
+        ]: add(nom, col, dec)
+
+    elif seccion == "area":
+        for nom, col, dec in [
+            ("Nivel Gatún ft", "nv_g", 2), ("Área Gatún Daily km²", "area_gat_daily_km2", 4),
+            ("Evaporación Gatún mm/d", "evap_gat_mm", 3), ("Evaporación Gatún hm³/d", "evap_gat_hm3_calc", 5),
+            ("Nivel Alhajuela ft", "nv_a", 2), ("Área Alhajuela Daily km²", "area_alh_daily_km2", 4),
+            ("Evaporación Alhajuela mm/d", "evap_alh_mm", 3), ("Evaporación Alhajuela hm³/d", "evap_alh_hm3_calc", 5),
+        ]: add(nom, col, dec)
+
+    elif seccion == "lakehouse":
+        out = df.copy()
+        out = out.rename(columns={"fecha": "Fecha"})
+
+    # Quitar columnas completamente vacías, pero conservar Fecha.
+    vacias = [c for c in out.columns if c != "Fecha" and out[c].isna().all()]
+    if vacias:
+        out = out.drop(columns=vacias)
+    return out
+
+
+def _filtrar_periodo_export(df, key_prefix, fecha_col="fecha"):
+    """Selector común: períodos rápidos o rango personalizado."""
+    if df is None or df.empty or fecha_col not in df:
+        return pd.DataFrame(), None, None
+    fechas = pd.to_datetime(df[fecha_col], errors="coerce")
+    ok = fechas.notna()
+    base = df.loc[ok].copy()
+    base[fecha_col] = fechas.loc[ok]
+    if base.empty:
+        return pd.DataFrame(), None, None
+    fmin = base[fecha_col].min().date(); fmax = base[fecha_col].max().date()
+    opciones = ["Último día", "Últimos 5 días", "Últimos 7 días", "Últimos 10 días", "Últimos 30 días", "Últimos 90 días", "Rango personalizado", "Todo disponible"]
+    periodo = st.selectbox("Período del reporte", opciones, index=2, key=f"{key_prefix}_periodo")
+    if periodo == "Rango personalizado":
+        c1, c2 = st.columns(2)
+        default_ini = max(fmin, fmax - datetime.timedelta(days=6))
+        inicio = c1.date_input("Desde", value=default_ini, min_value=fmin, max_value=fmax, key=f"{key_prefix}_desde")
+        fin = c2.date_input("Hasta", value=fmax, min_value=fmin, max_value=fmax, key=f"{key_prefix}_hasta")
+        if inicio > fin:
+            st.warning("La fecha inicial debe ser menor o igual que la fecha final.")
+            return pd.DataFrame(), inicio, fin
+    elif periodo == "Todo disponible":
+        inicio, fin = fmin, fmax
+    else:
+        nd = 1 if periodo == "Último día" else int(periodo.split()[1])
+        fin = fmax
+        inicio = max(fmin, fmax - datetime.timedelta(days=max(nd - 1, 0)))
+    mask = (base[fecha_col].dt.date >= inicio) & (base[fecha_col].dt.date <= fin)
+    return base.loc[mask].sort_values(fecha_col).copy(), inicio, fin
+
+
+def _excel_reporte_periodo(detalle, titulo, inicio, fin, fuente="", hoja=""):
+    """Crea Excel con Detalle + Resumen sin tocar el compilado general existente."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        detalle.to_excel(writer, sheet_name="Detalle", index=False)
+        resumen_meta = pd.DataFrame([
+            {"Parámetro": "Reporte", "Valor": titulo},
+            {"Parámetro": "Desde", "Valor": str(inicio) if inicio else ""},
+            {"Parámetro": "Hasta", "Valor": str(fin) if fin else ""},
+            {"Parámetro": "Registros", "Valor": int(len(detalle))},
+            {"Parámetro": "Fuente", "Valor": fuente},
+            {"Parámetro": "Hoja", "Valor": hoja},
+            {"Parámetro": "Generado", "Valor": AHORA},
+        ])
+        resumen_meta.to_excel(writer, sheet_name="Resumen", index=False, startrow=0)
+        numericas = detalle.select_dtypes(include=[np.number])
+        if not numericas.empty:
+            def _acumulado_si_aplica(c):
+                nombre = str(c).lower()
+                # Evita sumar potencia instantánea/promedio, niveles, áreas o caudales equivalentes.
+                acumulable = ("hm³/d" in nombre or "mwh/d" in nombre or nombre.endswith("/día"))
+                return numericas[c].sum(min_count=1) if acumulable else np.nan
+            stats = pd.DataFrame({
+                "Variable": numericas.columns,
+                "Promedio": [numericas[c].mean() for c in numericas.columns],
+                "Mínimo": [numericas[c].min() for c in numericas.columns],
+                "Máximo": [numericas[c].max() for c in numericas.columns],
+                "Acumulado del período*": [_acumulado_si_aplica(c) for c in numericas.columns],
+            })
+            stats.to_excel(writer, sheet_name="Resumen", index=False, startrow=len(resumen_meta) + 2)
+    return buf.getvalue()
+
+
+def _render_exportador_historico_lkh(seccion, titulo, key_prefix, expanded=False):
+    """UI común de exportación histórica para pestañas basadas en LakeHouse."""
+    st.markdown("---")
+    with st.expander(f"📤 Exportar {titulo} por período", expanded=expanded):
+        hist, meta = _obtener_historico_export_lkh()
+        if hist is None or hist.empty:
+            st.info("No hay histórico LakeHouse disponible para exportar. Cargue/ubique el LakeHouse en 📂 Datos Lake House.")
+            return
+        rango, inicio, fin = _filtrar_periodo_export(hist, key_prefix, "fecha")
+        if rango.empty:
+            st.info("No hay registros en el período seleccionado.")
+            return
+        reporte = _reporte_historico_seccion(rango, seccion)
+        if reporte.empty or len(reporte.columns) <= 1:
+            st.info("El LakeHouse no contiene columnas suficientes para este reporte en el período seleccionado.")
+            return
+        st.caption(
+            f"{len(reporte):,} registros · {inicio} → {fin} · fuente: {meta.get('fuente','')} · hoja: {meta.get('hoja','')}"
+        )
+        st.dataframe(reporte.tail(12), use_container_width=True, hide_index=True)
+        excel = _excel_reporte_periodo(reporte, titulo, inicio, fin, meta.get("fuente", ""), meta.get("hoja", ""))
+        base_name = "".join(ch if ch.isalnum() else "_" for ch in titulo.lower()).strip("_")
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            "⬇️ Descargar Excel (.xlsx)", excel,
+            file_name=f"{base_name}_{inicio}_{fin}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, key=f"{key_prefix}_xlsx"
+        )
+        d2.download_button(
+            "⬇️ Descargar CSV", reporte.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{base_name}_{inicio}_{fin}.csv", mime="text/csv",
+            use_container_width=True, key=f"{key_prefix}_csv"
+        )
+
+
 # ═══ TABS ═══
 tabs = st.tabs(["📊 Balance", "🏔️ Alhajuela", "🌊 Gatún",
                 "🚢 Esclusajes", "⚡ Generación",
@@ -3969,6 +4392,9 @@ with tabs[0]:
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+    _render_exportador_historico_lkh("balance", "Balance", "exp_balance")
+
+
 # ═══ TAB 1 — ALHAJUELA ═══
 with tabs[1]:
     st.subheader("🏔️ Embalse Alhajuela"); st.metric("Total", f3u(alh_total))
@@ -3994,6 +4420,9 @@ with tabs[1]:
     st.dataframe(tbl(alh_usos,alh_total,"Alhajuela",dem_total), use_container_width=True, hide_index=True)
 
 
+    _render_exportador_historico_lkh("alhajuela", "Alhajuela", "exp_alh")
+
+
 # ═══ TAB 2 — GATÚN ═══
 with tabs[2]:
     st.subheader("🌊 Embalse Gatún"); st.metric("Total", f3u(gat_total))
@@ -4016,6 +4445,9 @@ with tabs[2]:
             margin=dict(l=10,r=20,t=20,b=50))
         st.plotly_chart(fig_g2, use_container_width=True)
     st.dataframe(tbl(gat_usos,gat_total,"Gatún",dem_total), use_container_width=True, hide_index=True)
+
+
+    _render_exportador_historico_lkh("gatun", "Gatún", "exp_gat")
 
 
 # ═══ TAB 3 — ESCLUSAJES ═══
@@ -4087,6 +4519,9 @@ with tabs[3]:
     pr1.metric("Diario",     f"{dem_escl:.2f} hm³ · {dem_escl/CFS2HM3:.0f} cfs")
     pr2.metric("Mensual (30d)", f"{dem_escl*30:.1f} hm³")
     pr3.metric("Anual (365d)",  f"{dem_escl*365:.0f} hm³")
+
+
+    _render_exportador_historico_lkh("esclusajes", "Esclusajes", "exp_escl")
 
 
 # ═══ TAB 4 — GENERACIÓN ═══
@@ -4177,6 +4612,9 @@ with tabs[4]:
     st.caption("📊 Fuente: Tablas_Hidrogeneracion_Madden_Alhajuela.xlsx · 66 niveles (190–255 ft) · datos oficiales ACP")
     if mw_madden!=100.00 and metodo_madden=="Manual":
         st.warning(f"⚠️ Factor Manual modificado a {mw_madden:.2f} cfs/MW (inicial: 100.0)")
+
+
+    _render_exportador_historico_lkh("generacion", "Hidrogeneración", "exp_gen", expanded=True)
 
 
 # ═══ TAB 5 — AHORRO DE AGUA ═══
@@ -4527,6 +4965,9 @@ with tabs[5]:
     st.dataframe(tbl_fis, use_container_width=True, hide_index=True)
 
 
+    _render_exportador_historico_lkh("ahorros", "Ahorro de Agua", "exp_ahorros")
+
+
 # ═══ TAB 6 — ÁREA ESPEJO ═══
 with tabs[6]:
     st.subheader("📐 Área Espejo · Evaporación por Nivel")
@@ -4787,6 +5228,9 @@ with tabs[6]:
         "mientras que las columnas CZL/PMG son medición bruta de bandeja evaporimétrica. "
         "Para replicar exactamente la referencia: Vol = Lámina_banda × 0.84 × Área × 10⁻³")
     st.dataframe(_df_aud, use_container_width=True, hide_index=True, height=400)
+
+    _render_exportador_historico_lkh("area", "Área Espejo y Evaporación", "exp_area")
+
 
 # ═══ TAB 7 — CONVERSOR ═══
 with tabs[7]:
@@ -5731,6 +6175,9 @@ with tabs[9]:
         st.info("Sube **LakeHouse_Data.xlsx** o **LakeHouse_NEW.xlsx**, o colócalo en la carpeta.")
 
 
+    _render_exportador_historico_lkh("lakehouse", "Datos Lake House", "exp_lakehouse")
+
+
 # ═══ TAB 10 — INSTRUCTIVO ═══
 with tabs[10]:
     st.subheader("📘 Instructivo operativo fácil")
@@ -6124,6 +6571,52 @@ with tabs[11]:
             st.dataframe(_tabla[_cols].round(3), use_container_width=True, hide_index=True)
     else:
         st.info("No se encontraron archivos de aportes observados. Coloque los CSV en `data` o junto al app.")
+
+
+    # ── Exportación de aportes observados por período ─────────────────────────
+    st.markdown("---")
+    with st.expander("📤 Exportar Aportes observados por período", expanded=False):
+        _exp_aportes = None
+        if not _gat_df.empty and not _alh_df.empty:
+            _eg = _gat_df[["fecha", "cfs", "hm3_d", "m3s"]].rename(columns={
+                "cfs": "Gatún p³/s", "hm3_d": "Gatún hm³/d", "m3s": "Gatún m³/s"})
+            _ea = _alh_df[["fecha", "cfs", "hm3_d", "m3s"]].rename(columns={
+                "cfs": "Alhajuela p³/s", "hm3_d": "Alhajuela hm³/d", "m3s": "Alhajuela m³/s"})
+            _exp_aportes = pd.merge(_eg, _ea, on="fecha", how="outer").sort_values("fecha")
+            _exp_aportes["Total p³/s"] = _exp_aportes["Gatún p³/s"].fillna(0) + _exp_aportes["Alhajuela p³/s"].fillna(0)
+            _exp_aportes["Total hm³/d"] = _exp_aportes["Gatún hm³/d"].fillna(0) + _exp_aportes["Alhajuela hm³/d"].fillna(0)
+            _exp_aportes["Total m³/s"] = _exp_aportes["Gatún m³/s"].fillna(0) + _exp_aportes["Alhajuela m³/s"].fillna(0)
+        elif not _gat_df.empty:
+            _exp_aportes = _gat_df[["fecha", "cfs", "hm3_d", "m3s"]].rename(columns={
+                "cfs": "Gatún p³/s", "hm3_d": "Gatún hm³/d", "m3s": "Gatún m³/s"})
+        elif not _alh_df.empty:
+            _exp_aportes = _alh_df[["fecha", "cfs", "hm3_d", "m3s"]].rename(columns={
+                "cfs": "Alhajuela p³/s", "hm3_d": "Alhajuela hm³/d", "m3s": "Alhajuela m³/s"})
+
+        if _exp_aportes is None or _exp_aportes.empty:
+            st.info("No hay aportes observados disponibles para exportar.")
+        else:
+            _r_ap, _ini_ap, _fin_ap = _filtrar_periodo_export(_exp_aportes, "exp_aportes", "fecha")
+            if not _r_ap.empty:
+                _rep_ap = _r_ap.rename(columns={"fecha": "Fecha"}).copy()
+                st.caption(f"{len(_rep_ap):,} registros · {_ini_ap} → {_fin_ap}")
+                st.dataframe(_rep_ap.tail(12).round(4), use_container_width=True, hide_index=True)
+                _excel_ap = _excel_reporte_periodo(
+                    _rep_ap, "Aportes observados", _ini_ap, _fin_ap,
+                    fuente="Aquarius Discharge AT · CSV locales", hoja=""
+                )
+                _c_ap1, _c_ap2 = st.columns(2)
+                _c_ap1.download_button(
+                    "⬇️ Descargar Excel (.xlsx)", _excel_ap,
+                    file_name=f"aportes_observados_{_ini_ap}_{_fin_ap}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True, key="exp_aportes_xlsx"
+                )
+                _c_ap2.download_button(
+                    "⬇️ Descargar CSV", _rep_ap.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"aportes_observados_{_ini_ap}_{_fin_ap}.csv",
+                    mime="text/csv", use_container_width=True, key="exp_aportes_csv"
+                )
 
 # ═══ FOOTER ═══
 st.markdown("---")
