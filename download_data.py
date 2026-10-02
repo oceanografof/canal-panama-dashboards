@@ -612,6 +612,148 @@ def is_git_mmap_error(*parts: str) -> bool:
     return "mmap failed" in message or "cannot mmap" in message or "could not mmap" in message
 
 
+def is_git_commit_graph_corruption(*parts: str) -> bool:
+    """Detecta un commit-graph que referencia objetos ausentes del object database."""
+    message = "\n".join(part for part in parts if part).lower()
+    return (
+        "commit graph file" in message
+        and "not in the object database" in message
+    ) or (
+        "commit-graph" in message
+        and "missing" in message
+        and "object" in message
+    )
+
+
+def extract_git_bad_object_refs(*parts: str) -> list[str]:
+    """Extrae refs mencionadas por errores `fatal: bad object refs/...`."""
+    message = "\n".join(part for part in parts if part)
+    refs = re.findall(r"bad object\s+(refs/[A-Za-z0-9._/\-]+)", message, flags=re.IGNORECASE)
+    return sorted({ref.rstrip(".,:;") for ref in refs})
+
+
+def is_suspicious_onedrive_conflict_ref(ref_name: str) -> bool:
+    """Limita la autorreparación a refs con aspecto de copia/conflicto de sincronización.
+
+    Ejemplo observado: refs/heads/main-O-381552-NHIBAL. Una rama normal no se
+    elimina automáticamente aunque apunte a un objeto ausente.
+    """
+    if not ref_name.startswith("refs/heads/"):
+        return False
+    short = ref_name[len("refs/heads/"):]
+    if "/" in short or short in {"main", "master"}:
+        return False
+    return bool(re.search(r"-[A-Za-z]-\d{4,}-[A-Za-z0-9_-]{3,}$", short))
+
+
+def backup_broken_loose_ref(repo_dir: Path, ref_name: str) -> bool:
+    """Aparta una ref *suelta* dañada solo tras comprobaciones estrictas.
+
+    Casos automáticos permitidos:
+    - copias/conflictos de sincronización con nombre anómalo;
+    - ``refs/heads/master`` únicamente cuando HEAD está en ``main``, ``main``
+      resuelve a un objeto válido y ``master`` apunta a un objeto inexistente.
+
+    Nunca modifica packed-refs ni la rama activa. Todo lo aislado se mueve a un
+    respaldo dentro de .git para poder restaurarlo manualmente.
+    """
+    code, head_ref, _ = run_git(repo_dir, "git", "symbolic-ref", "-q", "HEAD")
+    active_ref = head_ref.strip() if code == 0 else ""
+    if active_ref == ref_name:
+        return False
+
+    git_dir = git_dir_path(repo_dir)
+    ref_path = (git_dir / Path(ref_name)).resolve()
+    refs_root = (git_dir / "refs").resolve()
+    try:
+        ref_path.relative_to(refs_root)
+    except ValueError:
+        return False
+
+    # Solo refs sueltas. No se edita packed-refs automáticamente.
+    if not ref_path.is_file():
+        return False
+
+    try:
+        raw = ref_path.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        return False
+
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", raw):
+        return False
+
+    # La ref candidata debe apuntar realmente a un objeto ausente.
+    code_obj, _, _ = run_git(repo_dir, "git", "cat-file", "-e", f"{raw}^{{object}}")
+    if code_obj == 0:
+        return False
+
+    allowed = is_suspicious_onedrive_conflict_ref(ref_name)
+
+    # Caso observado después de reparar una copia conflictiva: queda un master
+    # histórico roto aunque el repositorio opera sobre main. Se permite aislarlo
+    # solo si main es la rama activa y su objeto existe localmente.
+    if ref_name == "refs/heads/master":
+        if active_ref != "refs/heads/main":
+            return False
+        code_main, main_sha, _ = run_git(repo_dir, "git", "rev-parse", "--verify", "refs/heads/main")
+        if code_main != 0 or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", main_sha.strip()):
+            return False
+        code_main_obj, _, _ = run_git(repo_dir, "git", "cat-file", "-e", f"{main_sha.strip()}^{{commit}}")
+        if code_main_obj != 0:
+            return False
+        allowed = True
+
+    if not allowed:
+        return False
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_root = git_dir / f"broken-ref-backup-{stamp}"
+    target = backup_root / Path(ref_name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(ref_path), str(target))
+    print(f"  ✅ Ref local dañada aislada de forma segura: {ref_name}")
+    print(f"     Respaldo: .git/{backup_root.name}/{ref_name}")
+    return True
+
+
+def repair_bad_loose_refs_and_refetch(
+    repo_dir: Path,
+    refs: list[str],
+    *,
+    env: dict | None = None,
+) -> tuple[int, str, str]:
+    """Aísla únicamente refs sueltas claramente sospechosas y vuelve a obtener origin."""
+    if not refs:
+        return 1, "", "Git reportó bad object pero no se pudo identificar la referencia dañada."
+
+    repaired: list[str] = []
+    refused: list[str] = []
+    for ref_name in refs:
+        if backup_broken_loose_ref(repo_dir, ref_name):
+            repaired.append(ref_name)
+        else:
+            refused.append(ref_name)
+
+    if refused:
+        return 1, "", (
+            "Git tiene una referencia dañada, pero no cumple los criterios estrictos para repararla "
+            "automáticamente (podría ser una rama legítima o estar en packed-refs): "
+            + ", ".join(refused)
+        )
+
+    if not repaired:
+        return 1, "", "No se encontró ninguna ref suelta que pudiera repararse de forma segura."
+
+    print("  ⚠️ Reintentando fetch completo después de aislar la ref dañada...")
+    code, out, err = run_git(
+        repo_dir, "git", "-c", "fetch.writeCommitGraph=false",
+        "fetch", "--refetch", "origin", "--prune", env=env
+    )
+    if code == 0:
+        print("  ✅ Referencias remotas recuperadas correctamente desde origin.")
+    return code, out, err
+
+
 def is_probably_onedrive_path(path: Path) -> bool:
     normalized = str(path.resolve()).replace("/", "\\").lower()
     return "\\onedrive" in normalized or "onedrive - " in normalized
@@ -718,6 +860,104 @@ def backup_optional_git_mmap_caches(repo_dir: Path) -> bool:
     return False
 
 
+def backup_commit_graph_metadata(repo_dir: Path) -> bool:
+    """Aparta únicamente commit-graph/commit-graphs; son índices regenerables.
+
+    No toca objetos Git, packs, índices de packs, refs, HEAD, index ni archivos
+    de trabajo. El respaldo queda dentro de .git para diagnóstico/recuperación.
+    """
+    git_dir = git_dir_path(repo_dir)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_root = git_dir / f"commit-graph-backup-{stamp}"
+    candidates = [
+        git_dir / "objects" / "info" / "commit-graph",
+        git_dir / "objects" / "info" / "commit-graphs",
+    ]
+
+    moved: list[str] = []
+    for candidate in candidates:
+        try:
+            if _move_git_cache_to_backup(candidate, backup_root):
+                moved.append(candidate.name)
+        except OSError as exc:
+            raise RuntimeError(
+                "No se pudo respaldar el commit-graph corrupto: "
+                + sanitize_text(str(exc))
+            ) from exc
+
+    if moved:
+        print(f"  ✅ Commit-graph anterior respaldado en .git/{backup_root.name}")
+        for name in moved:
+            print(f"    · {name}")
+        return True
+    return False
+
+
+def repair_commit_graph_and_refetch(
+    repo_dir: Path,
+    *,
+    env: dict | None = None,
+) -> tuple[int, str, str]:
+    """Repara de forma conservadora un commit-graph inconsistente.
+
+    Estrategia:
+    1) apartar solo commit-graph/commit-graphs;
+    2) refetch completo del remoto con commitGraph deshabilitado;
+    3) validar objetos con git fsck --full;
+    4) reconstruir commit-graph si la base de objetos está íntegra;
+    5) confirmar con un fetch normal.
+    """
+    print("  ⚠️ Git detectó un commit-graph inconsistente; iniciando reparación segura...")
+    backup_commit_graph_metadata(repo_dir)
+
+    repair_cfg = (
+        "-c", "core.commitGraph=false",
+        "-c", "fetch.writeCommitGraph=false",
+        "-c", "core.multiPackIndex=false",
+    )
+
+    code, out, err = run_git(
+        repo_dir, "git", *repair_cfg, "fetch", "--refetch", "origin", "--prune", env=env
+    )
+    if code != 0:
+        detail = (err or out).strip()
+        return code, out, (
+            "La reparación del commit-graph no pudo completar 'git fetch --refetch origin --prune'. "
+            f"Detalle: {detail}"
+        )
+
+    print("  ✅ Refetch completo realizado; validando la base de objetos Git...")
+    code_fsck, out_fsck, err_fsck = run_git(
+        repo_dir, "git", "-c", "core.commitGraph=false", "fsck", "--full", env=env
+    )
+    if code_fsck != 0:
+        detail = (err_fsck or out_fsck).strip()
+        return code_fsck, out_fsck, (
+            "git fsck detectó objetos faltantes o corrupción que no es seguro reparar automáticamente. "
+            "No se borraron objetos ni archivos locales. "
+            f"Detalle: {detail}"
+        )
+
+    # Reconstrucción opcional: si falla, el repo puede seguir operando sin commit-graph.
+    code_cg, out_cg, err_cg = run_git(
+        repo_dir, "git", "-c", "core.commitGraph=false", "commit-graph", "write", "--reachable"
+    )
+    if code_cg == 0:
+        print("  ✅ Commit-graph reconstruido correctamente.")
+    else:
+        print(
+            "  ⚠️ Los objetos Git están íntegros, pero no se pudo reconstruir commit-graph; "
+            "se continuará sin depender de ese índice."
+        )
+
+    code_check, out_check, err_check = run_git(
+        repo_dir, "git", "-c", "fetch.writeCommitGraph=false", "fetch", "origin", "--prune", env=env
+    )
+    if code_check == 0:
+        print("  ✅ Reparación del repositorio verificada con git fetch origin.")
+    return code_check, out_check, err_check
+
+
 def git_mmap_action_message(repo_dir: Path) -> str:
     lines = [
         "Git continúa mostrando 'mmap failed: Invalid argument'.",
@@ -741,11 +981,44 @@ def run_git_network(repo_dir: Path, *git_args: str, env: dict | None = None) -> 
 
     Flujo:
     1) comando normal;
-    2) reintento sin cachés/aceleradores opcionales;
-    3) respaldo de metadatos regenerables y último reintento.
+    2) si una ref suelta sospechosa apunta a un objeto ausente, la respalda y refetch;
+    3) si hay corrupción de commit-graph, respaldo + refetch + fsck + reconstrucción;
+    4) si hay mmap, reintento sin cachés/aceleradores opcionales;
+    5) respaldo de metadatos regenerables y último reintento.
     """
     code, out, err = run_git(repo_dir, "git", *git_args, env=env)
-    if code == 0 or not is_git_mmap_error(out, err):
+    if code == 0:
+        return code, out, err
+
+    # Casos de corrupción local observados en repositorios sincronizados por OneDrive.
+    # Solo se intentan reparaciones conservadoras para fetch/pull, nunca durante push.
+    operation = git_args[0].lower() if git_args else ""
+
+    if operation in {"fetch", "pull"}:
+        bad_refs = extract_git_bad_object_refs(out, err)
+        if bad_refs:
+            print("  ⚠️ Git detectó una referencia local que apunta a un objeto inexistente.")
+            repair_code, repair_out, repair_err = repair_bad_loose_refs_and_refetch(
+                repo_dir, bad_refs, env=env
+            )
+            if repair_code != 0:
+                return repair_code, repair_out, repair_err
+            # Si la operación original era pull, todavía hay que ejecutar el pull.
+            code, out, err = run_git(repo_dir, "git", *git_args, env=env)
+            if code == 0:
+                return code, out, err
+
+    if operation in {"fetch", "pull"} and is_git_commit_graph_corruption(out, err):
+        repair_code, repair_out, repair_err = repair_commit_graph_and_refetch(repo_dir, env=env)
+        if repair_code != 0:
+            return repair_code, repair_out, repair_err
+        # La reparación sincroniza objetos, pero si la operación original era pull
+        # todavía debemos ejecutar exactamente el pull solicitado por el flujo normal.
+        code, out, err = run_git(repo_dir, "git", *git_args, env=env)
+        if code == 0:
+            return code, out, err
+
+    if not is_git_mmap_error(out, err):
         return code, out, err
 
     print("  ⚠️ Git reportó mmap failed; reintentando sin precarga ni cachés opcionales...")
